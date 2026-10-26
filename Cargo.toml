@@ -1,0 +1,17 @@
+[package]
+name = "asura"
+version = "0.1.0"
+edition = "2024"
+description = "Asura chess engine"
+build = "build/build.rs"
+publish = false
+
+[dependencies]
+
+[profile.dev]
+opt-level = 3
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

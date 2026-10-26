@@ -1,0 +1,45 @@
+pub mod bitboard;
+pub mod castling;
+pub mod color;
+pub mod keys;
+pub mod movelist;
+pub mod moves;
+pub mod piece;
+pub mod square;
+pub mod zobrist;
+
+pub use bitboard::*;
+pub use castling::*;
+pub use color::*;
+pub use keys::*;
+pub use movelist::*;
+pub use moves::*;
+pub use piece::*;
+pub use square::*;
+pub use zobrist::*;
+
+/// Fixed move-list capacity, with room above the maximum 218 legal moves.
+pub const MAX_MOVES: usize = 256;
+
+#[rustfmt::skip]
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum Rank { R1, R2, R3, R4, R5, R6, R7, R8 }
+
+pub const PROMO_RANK: [Rank; 2] = [Rank::R8, Rank::R1];
+pub const HOME_RANK: [Rank; 2] = [Rank::R1, Rank::R8];
+pub const PAWN_HOME_RANK: [Rank; 2] = [Rank::R2, Rank::R7];
+
+#[rustfmt::skip]
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum File { A, B, C, D, E, F, G, H }
+
+pub const KING_TO_FILE: [File; 2] = [File::C, File::G];
+pub const ROOK_TO_FILE: [File; 2] = [File::D, File::F];
+
+impl File {
+    pub fn is_kingside(&self) -> bool {
+        *self >= File::E
+    }
+}
