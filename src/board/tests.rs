@@ -9,8 +9,10 @@ macro_rules! assert_perft {
         #[test]
         fn $name() {
             let mut board = Board::from_fen($fen).unwrap();
+            let original = board.clone();
             for (depth, &nodes) in [$($nodes),*].iter().enumerate() {
                 assert_eq!(perft(&mut board, depth + 1), nodes, "depth {}", depth + 1);
+                assert!(board == original, "perft changed board state at depth {}", depth + 1);
             }
         }
     )*};
@@ -68,15 +70,13 @@ fn hash_perft(board: &mut Board, depth: usize) {
         return;
     }
 
-    let fen = board.to_fen();
-    let hash = board.hash();
+    let original = board.clone();
     for &mv in board.generate_all_moves().iter() {
         assert!(board.is_legal(mv), "illegal generated move: {mv:?}\n{board}");
         board.make_move(mv);
         hash_perft(board, depth - 1);
         board.undo_move(mv);
-        assert_eq!(board.to_fen(), fen, "undo failed for {mv:?}");
-        assert_eq!(board.hash(), hash);
+        assert!(*board == original, "undo failed to restore all state for {mv:?}");
         assert_hash_consistent(board);
     }
 }

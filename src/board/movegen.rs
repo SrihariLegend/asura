@@ -37,6 +37,18 @@ impl super::Board {
         self.generate_moves(list, MovegenKind::Noisy);
     }
 
+    /// Append legal non-capturing, non-promoting checks, including discoveries
+    /// and checking castles. Search calls this only when it reaches that stage.
+    pub fn append_quiet_checks(&self, list: &mut MoveList) {
+        let mut quiet = MoveList::new();
+        self.append_quiet_moves(&mut quiet);
+        for &mv in quiet.iter() {
+            if self.gives_check(mv) {
+                list.push(mv.from(), mv.to(), mv.kind());
+            }
+        }
+    }
+
     fn generate_moves(&self, list: &mut MoveList, mgkind: MovegenKind) {
         let stm = self.side_to_move();
         let occupancies = self.occupancies();
@@ -132,13 +144,12 @@ impl super::Board {
 
             list.push_pawns_setwise(up, single_pushes & target, MoveKind::Normal);
             list.push_pawns_setwise(up * 2, double_pushes & target, MoveKind::DoublePush);
-            list.push_pawns_setwise(up, promotions, MoveKind::PromotionR);
-            list.push_pawns_setwise(up, promotions, MoveKind::PromotionB);
-            list.push_pawns_setwise(up, promotions, MoveKind::PromotionN);
         }
 
         if mgkind == MovegenKind::Noisy {
-            list.push_pawns_setwise(up, promotions & target, MoveKind::PromotionQ);
+            for kind in [MoveKind::PromotionQ, MoveKind::PromotionR, MoveKind::PromotionB, MoveKind::PromotionN] {
+                list.push_pawns_setwise(up, promotions, kind);
+            }
 
             let target = target & self.colors(!stm);
 

@@ -39,7 +39,7 @@ impl<T> IndexMut<CastlingKind> for [T] {
     }
 }
 
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Default, Eq, PartialEq)]
 pub struct Castling {
     pub raw: u8,
 }

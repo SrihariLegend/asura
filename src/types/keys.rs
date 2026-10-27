@@ -1,6 +1,6 @@
 use crate::types::{Castling, Color, Piece, PieceType, Square, ZOBRIST};
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub struct Keys {
     pub full: u64,
     pub pawn: u64,

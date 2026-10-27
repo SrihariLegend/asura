@@ -3,7 +3,11 @@ use std::{
     io::{self, BufRead, Write},
 };
 
-use crate::{board::Board, tools};
+use crate::{
+    board::Board,
+    search::{MATE_SCORE, MATE_THRESHOLD, search},
+    tools,
+};
 
 pub fn message_loop(mut commands: VecDeque<String>, mut input: impl BufRead, mut output: impl Write) -> io::Result<()> {
     let mut board = Board::starting_position();
@@ -56,18 +60,35 @@ pub fn message_loop(mut commands: VecDeque<String>, mut input: impl BufRead, mut
             },
             ["perft", ..] => writeln!(output, "info string Usage: perft <depth>")?,
             ["d"] => writeln!(output, "{board}")?,
-            ["go", ..] => {
-                writeln!(output, "info string Search is not implemented")?;
-                writeln!(output, "bestmove 0000")?;
-            }
+            ["go", "depth", depth] => match depth.parse::<u8>().ok().filter(|&depth| depth > 0) {
+                Some(depth) => go(&board, depth, &mut output)?,
+                None => writeln!(output, "info string depth must be an integer from 1 to 255")?,
+            },
+            ["go", ..] => writeln!(output, "info string Usage: go depth <1..=255>")?,
             ["quit"] => break,
-            // No active search to stop. Unknown commands are ignored per UCI.
+            // Commands run synchronously; there is no background search to stop.
             ["stop"] | [] => (),
             _ => (),
         }
         output.flush()?;
     }
     output.flush()
+}
+
+fn go(board: &Board, depth: u8, output: &mut impl Write) -> io::Result<()> {
+    let result = search(board, depth);
+    let score = if result.score.abs() >= MATE_THRESHOLD {
+        let plies = MATE_SCORE - result.score.abs();
+        let moves = (plies + i32::from(result.score > 0)) / 2;
+        let mate = if result.score < 0 { -moves } else { moves };
+        format!("mate {mate}")
+    } else {
+        format!("cp {}", result.score)
+    };
+    writeln!(output, "info depth {depth} score {score} nodes {}", result.nodes)?;
+
+    let best_move = result.best_move.map(|mv| mv.to_uci(board)).unwrap_or_else(|| "0000".to_string());
+    writeln!(output, "bestmove {best_move}")
 }
 
 /// Construct a new position before replacing the live board, so a malformed FEN

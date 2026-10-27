@@ -1,8 +1,12 @@
 use crate::{
-    lookup::{attacks, between, bishop_attacks, king_attacks, knight_attacks, pawn_attacks, ray_pass, rook_attacks},
+    lookup::{
+        attacks, between, bishop_attacks, cuckoo, cuckoo_a, cuckoo_b, h1, h2, initialize as init_lookup, king_attacks,
+        knight_attacks, pawn_attacks, ray_pass, rook_attacks,
+    },
     setwise::{bishop_attacks_setwise, knight_attacks_setwise, pawn_attacks_setwise, rook_attacks_setwise},
     types::{
-        Bitboard, Castling, CastlingKind, Color, File, Keys, Move, PAWN_HOME_RANK, PROMO_RANK, Piece, PieceType, Square,
+        Bitboard, Castling, CastlingKind, Color, File, Keys, Move, PAWN_HOME_RANK, PROMO_RANK, Piece, PieceType,
+        Square, ZOBRIST,
     },
 };
 
@@ -12,6 +16,7 @@ mod tests;
 mod makemove;
 mod movegen;
 mod parser;
+mod see;
 
 pub use parser::ParseFenError;
 
@@ -19,12 +24,14 @@ pub use parser::ParseFenError;
 /// a previous position after making a move.
 ///
 /// Implements the `Copy` trait for efficient memory duplication via bitwise copying.
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Default, Eq, PartialEq)]
 struct InternalState {
     keys: Keys,
     en_passant: Square,
     castling: Castling,
     fiftymove_clock: u8,
+    plies_from_null: usize,
+    repetition: i32,
     captured: Piece,
     piece_threats: [Bitboard; PieceType::NUM],
     all_threats: Bitboard,
@@ -32,7 +39,9 @@ struct InternalState {
     checkers: Bitboard,
 }
 
-#[derive(Clone)]
+/// A position and its reversible history. Equality compares all saved state,
+/// not just piece placement, FEN, or the position hash.
+#[derive(Clone, Eq, PartialEq)]
 pub struct Board {
     pieces: [Bitboard; PieceType::NUM],
     colors: [Bitboard; Color::NUM],
@@ -185,6 +194,100 @@ impl Board {
         self.state.keys.toggle(piece, square);
     }
 
+    /// Apply the engine's material-draw policy. The caller must check for
+    /// checkmate first; this is a material classification, not a game result.
+    /// With four pieces, one minor per side and two knights versus a bare king
+    /// are draws. Two bishops on one side draw only on the same colour complex.
+    pub fn draw_by_material(&self) -> bool {
+        if !(self.pieces2(PieceType::Queen, PieceType::Rook) | self.pieces(PieceType::Pawn)).is_empty() {
+            return false;
+        }
+
+        let piece_count = self.occupancies().popcount();
+        if piece_count != 4 {
+            return piece_count < 4;
+        }
+
+        let knights = self.pieces(PieceType::Knight);
+        let bishops = self.pieces(PieceType::Bishop);
+        if ((knights | bishops) & self.colors(Color::White)).popcount() == 1 {
+            return true;
+        }
+        if bishops.is_empty() {
+            return true;
+        }
+        if !knights.is_empty() {
+            return false;
+        }
+        (bishops & Bitboard::LIGHT_SQUARES).popcount() != 1
+    }
+
+    /// Checks if the position has repeated once earlier but strictly
+    /// after the root, or repeated twice before or at the root.
+    pub const fn draw_by_repetition(&self, ply: i32) -> bool {
+        self.state.repetition != 0 && self.state.repetition < ply
+    }
+
+    pub fn has_repeated(&self) -> bool {
+        let end = self.state.plies_from_null.min(self.fiftymove_clock() as usize);
+        std::iter::once(&self.state)
+            .chain(self.state_stack.iter().rev())
+            .take(end.saturating_sub(3))
+            .any(|s| s.repetition != 0)
+    }
+
+    pub fn draw_by_fifty_move_rule(&self) -> bool {
+        self.fiftymove_clock() >= 100 && (!self.in_check() || self.has_legal_moves())
+    }
+
+    /// Checks if the position is a known draw by material, fifty-move or repetition.
+    pub fn is_draw(&self, ply: isize) -> bool {
+        self.draw_by_material() || self.draw_by_fifty_move_rule() || self.draw_by_repetition(ply as i32)
+    }
+
+    /// Checks if the current position has a move that leads to a draw by repetition.
+    pub fn upcoming_repetition(&self, ply: usize) -> bool {
+        let half_moves = self.state.plies_from_null.min(self.fiftymove_clock() as usize);
+        if half_moves < 3 {
+            return false;
+        }
+
+        let current_key = self.state.keys.full();
+        let stack = &self.state_stack;
+        let len = stack.len();
+
+        let mut index = len - 1;
+        let mut other = current_key ^ stack[index].keys.full() ^ ZOBRIST.side;
+
+        for compared_ply in (3..=half_moves).step_by(2) {
+            index -= 1;
+            other ^= stack[index].keys.full() ^ stack[index - 1].keys.full() ^ ZOBRIST.side;
+            index -= 1;
+
+            if other != 0 {
+                continue;
+            }
+
+            let diff = current_key ^ stack[index].keys.full();
+            let mut cuckoo_index = h1(diff);
+
+            if cuckoo(cuckoo_index) != diff {
+                cuckoo_index = h2(diff);
+                if cuckoo(cuckoo_index) != diff {
+                    continue;
+                }
+            }
+
+            if (between(cuckoo_a(cuckoo_index), cuckoo_b(cuckoo_index)) & self.occupancies()).is_empty()
+                && (ply > compared_ply || stack[index].repetition != 0)
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
     pub fn attackers_to(&self, square: Square, occupancies: Bitboard) -> Bitboard {
         (rook_attacks(square, occupancies) & self.pieces2(PieceType::Rook, PieceType::Queen))
             | (bishop_attacks(square, occupancies) & self.pieces2(PieceType::Bishop, PieceType::Queen))
@@ -266,6 +369,42 @@ impl Board {
         !mv.is_special()
             && (mv.is_capture() == self.colors(!stm).contains(to))
             && attacks(piece, from, self.occupancies()).contains(to)
+    }
+
+    /// Test a legal move for check using its resulting occupancy, without
+    /// making the move or changing position history. Includes discovered and
+    /// special-move checks, including overlapping Chess960 castling squares.
+    pub fn gives_check(&self, mv: Move) -> bool {
+        debug_assert!(self.is_legal(mv));
+        let side = self.side_to_move();
+        let king = self.king_square(!side);
+        let mut occupied = self.occupancies();
+        let mut remaining = self.colors(side);
+        occupied.clear(mv.from());
+        remaining.clear(mv.from());
+
+        let rook_to = if mv.is_castling() {
+            let (from, to) = self.get_castling_rook(mv.to());
+            occupied.clear(from);
+            remaining.clear(from);
+            occupied.set(to);
+            Some(to)
+        } else {
+            if mv.is_en_passant() {
+                occupied.clear(mv.capture_sq());
+            }
+            None
+        };
+        occupied.set(mv.to());
+
+        let placed = if mv.is_promotion() { mv.promo_piece_type() } else { self.type_on(mv.from()) };
+        if attacks(Piece::new(side, placed), mv.to(), occupied).contains(king) {
+            return true;
+        }
+        if rook_to.is_some_and(|to| rook_attacks(to, occupied).contains(king)) {
+            return true;
+        }
+        !(self.attackers_to(king, occupied) & remaining).is_empty()
     }
 
     fn update_threats(&mut self) {
@@ -386,6 +525,7 @@ impl Board {
 
     // Only the FEN parser constructs an empty board; public constructors have kings.
     fn empty() -> Self {
+        init_lookup();
         Self {
             state: InternalState::default(),
             pieces: [Bitboard::default(); PieceType::NUM],

@@ -6,11 +6,24 @@ impl Board {
         self.halfmove_number += 1;
         self.state_stack.push(self.state);
         self.state.keys.toggle_side();
+        self.state.repetition = 0;
 
         if self.en_passant() != Square::None {
             self.state.keys.toggle_en_passant(self.en_passant());
             self.state.en_passant = Square::None;
         }
+    }
+
+    pub fn make_null_move(&mut self) {
+        self.increment_stack();
+        self.state.plies_from_null = 0;
+        self.state.captured = Piece::None;
+        self.update_threats();
+    }
+
+    pub fn undo_null_move(&mut self) {
+        self.halfmove_number -= 1;
+        self.state = self.state_stack.pop().unwrap();
     }
 
     /// Play a legal move and save the state needed by `undo_move`.
@@ -27,6 +40,7 @@ impl Board {
 
         self.increment_stack();
         self.state.captured = Piece::None;
+        self.state.plies_from_null += 1;
 
         if mv.is_capture() || piece.piece_type() == PieceType::Pawn {
             self.state.fiftymove_clock = 0;
@@ -62,6 +76,26 @@ impl Board {
 
         self.update_threats();
         self.validate_en_passant();
+
+        let end = self.state.plies_from_null.min(self.fiftymove_clock() as usize);
+
+        if end >= 4 {
+            let mut idx = self.state_stack.len() as isize - 4;
+            for i in (4..=end).step_by(2) {
+                if idx < 0 {
+                    break;
+                }
+
+                let stp = &self.state_stack[idx as usize];
+
+                if stp.keys.full() == self.state.keys.full() {
+                    self.state.repetition = if stp.repetition != 0 { -(i as i32) } else { i as i32 };
+                    break;
+                }
+
+                idx -= 2;
+            }
+        }
     }
 
     /// Undo the most recent move. Moves must be undone in reverse order.
