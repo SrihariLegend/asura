@@ -135,14 +135,14 @@ fn draw_jitter_uses_the_search_node_count_and_resets_each_call() {
     // Blocked a-pawns preserve the material balance without adding legal
     // moves, and keep king-only material draws out of this stalemate fixture.
     for (fen, score, nodes, best_move) in
-        [("7k/7P/8/p5K1/P7/8/8/8 w - - 0 1", 2, 15, "g5h6"), ("7k/7P/6K1/p7/P7/8/8/8 w - - 0 1", 2, 12, "g6h6")]
+        [("7k/7P/8/p5K1/P7/8/8/8 w - - 0 1", 2, 45, "g5h6"), ("7k/7P/5K2/p7/P7/8/8/8 w - - 0 1", 2, 37, "f6g6")]
     {
         let board = Board::from_fen(fen).unwrap();
         let original = board.clone();
         let result = search(&board, 2);
 
-        // These stalemates occur at node counts 10 in both fixtures.
-        // Black receives (10 % 5) - 2 = -2; negamax returns +2 to White.
+        // Iterative deepening (depths 1..=2) visits these stalemates at deterministic
+        // node counts where Black receives -2 and negamax returns +2 to White.
         assert_eq!(result.score, score);
         assert_eq!(result.nodes, nodes);
         let mv = result.best_move.unwrap();
@@ -156,4 +156,49 @@ fn draw_jitter_uses_the_search_node_count_and_resets_each_call() {
         assert_eq!(search(&board, 2), result);
         assert!(board == original);
     }
+}
+
+#[test]
+fn iterative_deepening_accumulates_iterations_and_resolves_aspiration_swings() {
+    let start = Board::starting_position();
+    let d1 = search(&start, 1);
+    let d2 = search(&start, 2);
+    let d3 = search(&start, 3);
+    assert_eq!(d1.nodes, 20);
+    assert!(d2.nodes > d1.nodes);
+    assert!(d3.nodes > d2.nodes);
+
+    // Mate-in-2 (3 plies): depth 1 scores +31_997 via QS quiet checks, and
+    // deeper iterations preserve the mate through narrow aspiration windows
+    // without reducing depth on a decisive fail-high.
+    let mate_in_two = Board::from_fen("7k/8/5K2/8/8/8/3Q4/8 w - - 0 1").unwrap();
+    for depth in [1, 2, 3] {
+        let result = search_with_zero_draws(&mate_in_two, depth);
+        assert_eq!(result.score, 31_997, "depth {depth}");
+        assert_eq!(result.best_move.unwrap().to_uci(&mate_in_two), "d2h6");
+        assert_eq!(result.pv()[0].to_uci(&mate_in_two), "d2h6");
+    }
+
+    // Quiet double-attack across iterations: at depth 1 c3d5 is a quiet
+    // non-checking move so Black stands pat in QS at +120; at depth 2 c3d5
+    // forks the pawns on b6 and f4, jumping the score by +100 cp to +220
+    // and exercising aspiration fail-high widening and re-search.
+    let quiet_fork = Board::from_fen("7k/8/1p6/8/5p2/2N5/8/7K w - - 0 1").unwrap();
+    let d1_fork = search_with_zero_draws(&quiet_fork, 1);
+    let d2_fork = search_with_zero_draws(&quiet_fork, 2);
+    assert_eq!(d1_fork.score, 120);
+    assert_eq!(d2_fork.score, 220);
+    assert_eq!(d2_fork.best_move.unwrap().to_uci(&quiet_fork), "c3d5");
+    assert_eq!(d2_fork.pv()[0].to_uci(&quiet_fork), "c3d5");
+
+    // Fail-low across iterations: at depth 1 Black sees only -900 material
+    // (since mate requires a quiet move beyond the two-ply QS check budget),
+    // then at depth 2 drops to -31_996 out of the [-991, -809] aspiration
+    // window when the forced mate enters the horizon.
+    let fail_low = Board::from_fen("7k/8/5K2/8/8/8/3Q4/8 b - - 0 1").unwrap();
+    let d1_low = search_with_zero_draws(&fail_low, 1);
+    let d2_low = search_with_zero_draws(&fail_low, 2);
+    assert_eq!(d1_low.score, -900);
+    assert_eq!(d2_low.score, -31_996);
+    assert!(d2_low.nodes > d1_low.nodes);
 }
