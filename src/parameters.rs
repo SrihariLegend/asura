@@ -112,4 +112,11 @@ define! {
 
     // Quiescence history-backed early fail-high margin on the 100 = 1 pawn scale.
     i32, QS_EARLY_CUTOFF_MARGIN: 225;
+
+    // Quiescence SEE pruning constants on the 100 = 1 pawn and 10_000 = MAX_HISTORY scales.
+    i32, QS_SEE_QUIET_THRESHOLD: 0;
+    i32, QS_SEE_NOISY_FLOOR: -10;
+    i32, QS_SEE_BASE: 75;
+    i32, QS_SEE_EVAL_DIV: 8;
+    i32, QS_SEE_HIST_DIV: 50;
 }

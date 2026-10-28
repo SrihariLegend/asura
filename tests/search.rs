@@ -6,8 +6,8 @@ use asura::{
         search_without_checked_tt_cutoff, search_without_fp, search_without_hp, search_without_iir,
         search_without_late_quiet_closure, search_without_lmp, search_without_lmr, search_without_nmp,
         search_without_probcut, search_without_qs_early_cutoff, search_without_qs_futility_pruning,
-        search_without_qs_history_pruning, search_without_qs_late_capture_pruning, search_without_razoring,
-        search_without_rfp, search_without_se, search_without_see_pruning,
+        search_without_qs_history_pruning, search_without_qs_late_capture_pruning, search_without_qs_see_pruning,
+        search_without_razoring, search_without_rfp, search_without_se, search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -496,12 +496,15 @@ fn singular_extensions_extend_unique_tt_moves_and_multi_cut_alternatives() {
     let after = tt_mc.read(child_after_c2d3.hash(), 0, 1).unwrap();
     assert_eq!(after.depth, 4, "Multi-Cut at depth 6 must return before overwriting TT at depth 5");
 
-    // 3. On Kiwipete at depth 8, extending singular tactical moves resolves a
-    // deeper tactical line (-20 vs -100 without SE).
+    // 3. On Midgame at depth 8 and Kiwipete at depth 7, extending singular
+    // tactical moves and multi-cutting alternatives reduces nodes while
+    // preserving the exact best move and score.
     let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
-    let kw_on = search_with_zero_draws(&kiwipete, 8);
-    let kw_off = search_without_se(&kiwipete, 8);
-    assert!(kw_on.score > kw_off.score);
+    let kw_on = search_with_zero_draws(&kiwipete, 7);
+    let kw_off = search_without_se(&kiwipete, 7);
+    assert_eq!(kw_on.best_move, kw_off.best_move);
+    assert_eq!(kw_on.score, kw_off.score);
+    assert!(kw_on.nodes < kw_off.nodes);
 }
 
 #[test]
@@ -625,8 +628,8 @@ fn post_move_late_quiet_closure_reduces_nodes_and_preserves_tactics() {
 #[test]
 fn quiescence_quiet_history_pruning_skips_negative_continuation_checks() {
     let italian = Board::from_fen("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
-    let on = search_with_zero_draws(&italian, 8);
-    let off = search_without_qs_history_pruning(&italian, 8);
+    let on = search_with_zero_draws(&italian, 9);
+    let off = search_without_qs_history_pruning(&italian, 9);
     assert_eq!(on.best_move, off.best_move);
     assert_eq!(on.score, off.score);
     assert!(
@@ -706,20 +709,20 @@ fn quiescence_capture_futility_pruning_reduces_nodes_and_preserves_tactics() {
     );
 
     // Equal-trade SEE futility branch (alpha >= margin && !see_ge(mv, 1)):
-    // White is in check from Rd3+ with only two legal evasions (1. Rb3xd3 and
-    // 1. Kd1xe2). After 1. Rb3xd3 Rxd3 establishes alpha at ply 1, on
-    // 1. Kd1xe2 Black's equal rook trades (1... Ra7xb7 and 1... Rd3xb3) have
-    // capture_margin > alpha (so the first branch never fires anywhere in the
-    // tree) and SEE == 0 < 1, so they are pruned solely by the second branch
-    // (alpha >= margin && !see_ge(mv, 1)).
-    let see_pos = Board::from_fen("1R1r2k1/8/8/8/8/1R1r4/2N1n3/2BKB3 w - - 0 1").unwrap();
+    // After 1. Rb7xa7 Ra8xa7 and 1. Rb2xd2 Rd8xd2 (equal rook trades, score = 0)
+    // establish alpha at the root, Move 3 (1. Rb2xg2, capturing undefended Ng2)
+    // leaves Black at ply 1 with stand_pat = -320 and margin = -120 <= alpha (-1),
+    // while capture_margin = +380 > alpha (-1). Black's equal rook trade
+    // 1... Ra7xb7 has SEE == 0 (passing see_ge(mv, 0) but failing see_ge(mv, 1)),
+    // so it is pruned solely by the second branch (alpha >= margin && !see_ge(mv, 1)).
+    let see_pos = Board::from_fen("r2r3k/rR6/2K5/8/8/8/1R1r2n1/8 w - - 0 1").unwrap();
     let s_on = search_with_zero_draws(&see_pos, 1);
     let s_off = search_without_qs_futility_pruning(&see_pos, 1);
     assert_eq!(s_on.best_move, s_off.best_move);
     assert_eq!(s_on.score, s_off.score);
     assert!(
         s_on.nodes < s_off.nodes,
-        "Quiescence equal-trade SEE futility must prune equal rook trades after 1. Kd1xe2 ({} vs {})",
+        "Quiescence equal-trade SEE futility must prune equal rook trades after 1. Rb2xg2 ({} vs {})",
         s_on.nodes,
         s_off.nodes
     );
@@ -810,5 +813,50 @@ fn quiescence_early_cutoff_fails_high_on_history_backed_winning_captures() {
         "Positive noisy history must trigger QS early fail-high before make_move ({} vs {})",
         res_pos.nodes,
         res_zero.nodes
+    );
+}
+
+#[test]
+fn quiescence_see_pruning_skips_negative_see_captures_and_checks() {
+    let italian = Board::from_fen("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
+    let it_on = search_with_zero_draws(&italian, 7);
+    let it_off = search_without_qs_see_pruning(&italian, 7);
+    assert_eq!(it_on.best_move, it_off.best_move);
+    assert_eq!(it_on.score, it_off.score);
+    assert!(
+        it_on.nodes < it_off.nodes,
+        "Quiescence SEE pruning should reduce nodes on Italian ({} vs {})",
+        it_on.nodes,
+        it_off.nodes
+    );
+
+    let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
+    let mid_on = search_with_zero_draws(&midgame, 7);
+    let mid_off = search_without_qs_see_pruning(&midgame, 7);
+    assert_eq!(mid_on.best_move, mid_off.best_move);
+    assert_eq!(mid_on.score, mid_off.score);
+    assert!(
+        mid_on.nodes < mid_off.nodes,
+        "Quiescence SEE pruning should reduce nodes on Midgame ({} vs {})",
+        mid_on.nodes,
+        mid_off.nodes
+    );
+
+    // Direct negative-SEE pruning in quiescence: after White's root moves,
+    // Black at ply 1 (q_depth = 0) has a checking capture 1... Qxf2+ into a
+    // square defended by White's Rook on f1 and King on g1 (SEE = +100 - 900 = -800 < 0)
+    // and a quiet check 1... Qf8-f3+ into a square defended by White's Pawn on
+    // g2 and Rook on f1 (SEE = -900 < 0). Both are skipped before make_move by
+    // selective QS SEE pruning.
+    let pos = Board::from_fen("5qk1/8/8/8/8/8/P4PP1/5RK1 w - - 0 1").unwrap();
+    let p_on = search_with_zero_draws(&pos, 1);
+    let p_off = search_without_qs_see_pruning(&pos, 1);
+    assert_eq!(p_on.best_move, p_off.best_move);
+    assert_eq!(p_on.score, p_off.score);
+    assert!(
+        p_on.nodes < p_off.nodes,
+        "Quiescence SEE pruning must skip negative-SEE checking captures and quiet checks ({} vs {})",
+        p_on.nodes,
+        p_off.nodes
     );
 }

@@ -39,6 +39,7 @@ const CFG_QS_HP: u32 = 1 << 15;
 const CFG_QS_FP: u32 = 1 << 16;
 const CFG_QS_LMP: u32 = 1 << 17;
 const CFG_QS_EARLY_CUT: u32 = 1 << 18;
+const CFG_QS_SEE: u32 = 1 << 19;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -56,7 +57,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_QS_HP
     | CFG_QS_FP
     | CFG_QS_LMP
-    | CFG_QS_EARLY_CUT;
+    | CFG_QS_EARLY_CUT
+    | CFG_QS_SEE;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -218,6 +220,8 @@ define_diagnostic_searches! {
     search_without_qs_late_capture_pruning: CFG_ALL_SELECTIVE & !CFG_QS_LMP;
     /// The selective search with quiescence history-backed early fail-high disabled and recognized draws scored zero.
     search_without_qs_early_cutoff: CFG_ALL_SELECTIVE & !CFG_QS_EARLY_CUT;
+    /// The selective search with quiescence SEE pruning disabled and recognized draws scored zero.
+    search_without_qs_see_pruning: CFG_ALL_SELECTIVE & !CFG_QS_SEE;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -1446,6 +1450,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
     let use_qs_fp = (CFG & CFG_QS_FP) != 0;
     let use_qs_lmp = (CFG & CFG_QS_LMP) != 0;
     let use_qs_early_cut = (CFG & CFG_QS_EARLY_CUT) != 0;
+    let use_qs_see = (CFG & CFG_QS_SEE) != 0;
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     debug_assert!(ply <= MAX_PLY && q_depth <= 0);
     td.sel_depth = td.sel_depth.max(ply);
@@ -1561,55 +1566,68 @@ fn quiescence<const CFG: u32, const PV: bool>(
         move_count += 1;
         let moved_piece = td.board.moved_piece(mv);
         let recapture = mv.is_capture() && previous == Some(mv.capture_sq());
-        if selective
-            && !in_check
-            && best_score > -MATE_THRESHOLD
-            && !recapture
-            && !mv.is_promotion()
-            && !td.board.gives_check(mv)
-        {
-            if q_depth <= RECAPTURE_ONLY_DEPTH {
-                continue;
-            }
-            if use_qs_lmp && mv.is_capture() && move_count > QS_LATE_CAPTURE_LIMIT && !td.board.see_ge(mv, 1) {
-                continue;
-            }
-            if mv.is_capture() {
-                let captured_type = td.board.type_on(mv.capture_sq());
-                let victim_val = qs_futility_victim(captured_type);
-                let attacker_val = qs_futility_victim(moved_piece.piece_type());
-                if use_qs_early_cut
-                    && move_count == 1
-                    && !is_decisive(beta)
-                    && raw_eval + victim_val - attacker_val - QS_EARLY_CUTOFF_MARGIN > beta
-                    && td.history.as_deref().is_some_and(|h| {
-                        h.noisy_history.get(td.board.all_threats(), moved_piece, mv.to(), captured_type) > 0
-                    })
-                {
-                    if let Some(t) = td.tt {
-                        t.write(hash, tt_depth, raw_eval, beta, Bound::Lower, mv, ply as isize, tt_pv, false);
-                    }
-                    return (beta, Move::NULL);
+        if selective && !in_check && best_score > -MATE_THRESHOLD {
+            if !recapture && !mv.is_promotion() && !td.board.gives_check(mv) {
+                if q_depth <= RECAPTURE_ONLY_DEPTH {
+                    continue;
                 }
-                if use_qs_fp {
-                    let margin = stand_pat + QS_FUTILITY_MARGIN;
-                    let capture_margin = margin + victim_val;
-                    if alpha >= capture_margin || (alpha >= margin && !td.board.see_ge(mv, 1)) {
-                        continue;
+                if use_qs_lmp && mv.is_capture() && move_count > QS_LATE_CAPTURE_LIMIT && !td.board.see_ge(mv, 1) {
+                    continue;
+                }
+                if mv.is_capture() {
+                    let captured_type = td.board.type_on(mv.capture_sq());
+                    let victim_val = qs_futility_victim(captured_type);
+                    let attacker_val = qs_futility_victim(moved_piece.piece_type());
+                    if use_qs_early_cut
+                        && move_count == 1
+                        && !is_decisive(beta)
+                        && raw_eval + victim_val - attacker_val - QS_EARLY_CUTOFF_MARGIN > beta
+                        && td.history.as_deref().is_some_and(|h| {
+                            h.noisy_history.get(td.board.all_threats(), moved_piece, mv.to(), captured_type) > 0
+                        })
+                    {
+                        if let Some(t) = td.tt {
+                            t.write(hash, tt_depth, raw_eval, beta, Bound::Lower, mv, ply as isize, tt_pv, false);
+                        }
+                        return (beta, Move::NULL);
+                    }
+                    if use_qs_fp {
+                        let margin = stand_pat + QS_FUTILITY_MARGIN;
+                        let capture_margin = margin + victim_val;
+                        if alpha >= capture_margin || (alpha >= margin && !td.board.see_ge(mv, 1)) {
+                            continue;
+                        }
                     }
                 }
             }
-        }
-        if selective
-            && use_qs_hp
-            && best_score > -MATE_THRESHOLD
-            && mv.is_quiet()
-            && td
-                .history
-                .as_deref()
-                .is_some_and(|h| h.conthist(ply as usize, 1, moved_piece, mv.to()) < QS_QUIET_HIST_THRESHOLD)
-        {
-            continue;
+            if use_qs_hp
+                && mv.is_quiet()
+                && td
+                    .history
+                    .as_deref()
+                    .is_some_and(|h| h.conthist(ply as usize, 1, moved_piece, mv.to()) < QS_QUIET_HIST_THRESHOLD)
+            {
+                continue;
+            }
+            if use_qs_see {
+                let threshold = if mv.is_noisy() {
+                    let hist = td.history.as_deref().map_or(0, |h| {
+                        h.noisy_history.get(
+                            td.board.all_threats(),
+                            moved_piece,
+                            mv.to(),
+                            td.board.type_on(mv.capture_sq()),
+                        )
+                    });
+                    ((alpha - stand_pat) / QS_SEE_EVAL_DIV - QS_SEE_BASE - hist / QS_SEE_HIST_DIV)
+                        .max(QS_SEE_NOISY_FLOOR)
+                } else {
+                    QS_SEE_QUIET_THRESHOLD
+                };
+                if !td.board.see_ge(mv, threshold) {
+                    continue;
+                }
+            }
         }
         if let Some(h) = td.history.as_deref_mut() {
             h.continuation_history.remember(ply as usize, in_check, mv, moved_piece);
