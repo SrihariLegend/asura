@@ -36,6 +36,7 @@ pub struct MainMovePicker {
     priority_scores: [i32; 3],
     priority_scored: bool,
     tt_move: Move,
+    see_threshold: Option<i32>,
     stage: MainStage,
     emitted_stage: MainStage,
     noisy_count: usize,
@@ -55,10 +56,34 @@ impl MainMovePicker {
             priority_scores: [i32::MIN; 3],
             priority_scored: false,
             tt_move,
+            see_threshold: None,
             stage: if tt_move.is_present() { MainStage::HashMove } else { MainStage::GenerateNoisy },
             emitted_stage: MainStage::HashMove,
             noisy_count: 0,
             is_root,
+        }
+    }
+
+    /// Construct a ProbCut picker that yields only legal noisy moves passing
+    /// see_ge(mv, see_threshold.max(0)) and stops before quiet or bad-noisy stages.
+    pub const fn new_probcut(tt_move: Move, see_threshold: i32) -> Self {
+        let clamped = if see_threshold > 0 { see_threshold } else { 0 };
+        Self {
+            moves: MoveList::new(),
+            scores: [0; MAX_MOVES],
+            bad_noisy: MoveList::new(),
+            bad_index: 0,
+            deferred_quiets: MoveList::new(),
+            deferred_index: 0,
+            priority_quiets: [Move::NULL; 3],
+            priority_scores: [i32::MIN; 3],
+            priority_scored: true,
+            tt_move,
+            see_threshold: Some(clamped),
+            stage: if tt_move.is_noisy() { MainStage::HashMove } else { MainStage::GenerateNoisy },
+            emitted_stage: MainStage::HashMove,
+            noisy_count: 0,
+            is_root: false,
         }
     }
 
@@ -77,7 +102,9 @@ impl MainMovePicker {
             match self.stage {
                 MainStage::HashMove => {
                     self.stage = MainStage::GenerateNoisy;
-                    if board.is_legal(self.tt_move) {
+                    if board.is_legal(self.tt_move)
+                        && self.see_threshold.is_none_or(|t| self.tt_move.is_noisy() && board.see_ge(self.tt_move, t))
+                    {
                         self.emitted_stage = MainStage::HashMove;
                         return Some(self.tt_move);
                     }
@@ -90,7 +117,9 @@ impl MainMovePicker {
                 }
                 MainStage::GoodNoisy => {
                     if let Some((mv, _score)) = self.take_best() {
-                        let threshold = if self.tt_move.is_quiet() && self.noisy_count > 2 {
+                        let threshold = if let Some(t) = self.see_threshold {
+                            t
+                        } else if self.tt_move.is_quiet() && self.noisy_count > 2 {
                             1
                         } else {
                             let hist = history.map_or(0, |h| {
@@ -104,7 +133,9 @@ impl MainMovePicker {
                             -hist / 100
                         };
                         if !board.see_ge(mv, threshold) {
-                            self.bad_noisy.push(mv.from(), mv.to(), mv.kind());
+                            if self.see_threshold.is_none() {
+                                self.bad_noisy.push(mv.from(), mv.to(), mv.kind());
+                            }
                             continue;
                         }
                         if self.is_root {
@@ -114,7 +145,9 @@ impl MainMovePicker {
                         self.emitted_stage = MainStage::GoodNoisy;
                         return Some(mv);
                     }
-                    self.stage = if skip_quiets {
+                    self.stage = if self.see_threshold.is_some() {
+                        MainStage::Done
+                    } else if skip_quiets {
                         MainStage::BadNoisy
                     } else if board.in_check() {
                         MainStage::GenerateQuiet

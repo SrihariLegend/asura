@@ -1,8 +1,9 @@
 use asura::{
     board::Board,
+    movepick::{MainMovePicker, MainStage},
     search::{
         lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws, search_without_lmr,
-        search_without_nmp, search_without_rfp,
+        search_without_nmp, search_without_probcut, search_without_rfp,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -308,4 +309,45 @@ fn reverse_futility_pruning_reduces_nodes_and_skips_pawn_only_endgames() {
     assert_eq!(kp_on.best_move, kp_off.best_move);
     assert_eq!(kp_on.score, kp_off.score);
     assert_eq!(kp_on.nodes, kp_off.nodes);
+}
+
+#[test]
+fn probcut_prunes_tactical_captures_and_validates_collided_tt_moves() {
+    let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+    let pc_on = search_with_zero_draws(&kiwipete, 6);
+    let pc_off = search_without_probcut(&kiwipete, 6);
+    assert_eq!(pc_on.best_move, pc_off.best_move);
+    assert!(
+        pc_on.nodes < pc_off.nodes,
+        "ProbCut should reduce nodes on tactical positions ({} vs {})",
+        pc_on.nodes,
+        pc_off.nodes
+    );
+
+    // Direct MainMovePicker::new_probcut verification:
+    // 1. Rejects an illegal noisy TT move without panicking in see_ge.
+    // 2. Yields only captures meeting see_threshold (here >= 300, i.e. winning at least a minor piece).
+    // 3. Stops at MainStage::Done without yielding quiet or bad-noisy moves.
+    let illegal_capture = Move::new(Square::A1, Square::H8, MoveKind::Capture);
+    let mut picker = MainMovePicker::new_probcut(illegal_capture, 300);
+    let mut yielded = Vec::new();
+    while let Some(mv) = picker.next(&kiwipete, None, true, 0) {
+        assert!(mv.is_noisy());
+        assert!(kiwipete.is_legal(mv));
+        assert!(kiwipete.see_ge(mv, 300));
+        yielded.push(mv);
+    }
+    assert!(!yielded.is_empty());
+    assert!(picker.stage() == MainStage::Done);
+
+    // Low-SEE legal noisy TT move (e5xf7 loses the knight: SEE < 300) is rejected
+    // in HashMove and not re-emitted in GoodNoisy.
+    let bad_tt_capture = Move::new(Square::E5, Square::F7, MoveKind::Capture);
+    assert!(kiwipete.is_legal(bad_tt_capture));
+    assert!(!kiwipete.see_ge(bad_tt_capture, 300));
+    let mut picker2 = MainMovePicker::new_probcut(bad_tt_capture, 300);
+    while let Some(mv) = picker2.next(&kiwipete, None, true, 0) {
+        assert_ne!(mv, bad_tt_capture);
+        assert!(kiwipete.see_ge(mv, 300));
+    }
 }
