@@ -1,6 +1,11 @@
 use asura::{
     board::Board,
-    search::{lmr_table_term, search, search_reference, search_with_zero_draws, search_without_lmr},
+    search::{
+        lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws, search_without_lmr,
+        search_without_nmp,
+    },
+    transposition::{Bound, TranspositionTable},
+    types::{Move, MoveKind, Square},
 };
 
 #[test]
@@ -237,4 +242,48 @@ fn lmr_table_and_late_move_reductions_preserve_tactics_while_reducing_tree_size(
         lmr_on.nodes,
         lmr_off.nodes
     );
+}
+
+#[test]
+fn null_move_pruning_reduces_nodes_and_skips_pawn_only_zugzwang() {
+    // 1. In a middlegame position with non-pawn material on both sides, NMP
+    // prunes non-PV subtrees where passing the turn still holds beta.
+    let italian = Board::from_fen("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
+    let nmp_on = search_with_zero_draws(&italian, 5);
+    let nmp_off = search_without_nmp(&italian, 5);
+    assert_eq!(nmp_on.score, nmp_off.score);
+    assert!(
+        nmp_on.nodes < nmp_off.nodes,
+        "NMP should reduce nodes in the same selective engine ({} vs {})",
+        nmp_on.nodes,
+        nmp_off.nodes
+    );
+
+    // 2. In a king-and-pawn zugzwang endgame (0 non-pawn pieces), the
+    // non_pawn_count guard disables NMP completely so node counts and moves match.
+    let kp_zugzwang = Board::from_fen("8/8/8/2k5/3pP3/5K2/8/8 w - - 0 1").unwrap();
+    let z_on = search_with_zero_draws(&kp_zugzwang, 4);
+    let z_off = search_without_nmp(&kp_zugzwang, 4);
+    assert_eq!(z_on.best_move, z_off.best_move);
+    assert_eq!(z_on.score, z_off.score);
+    assert_eq!(z_on.nodes, z_off.nodes);
+
+    // 3. A TT collision storing an illegal noisy move (or an illegal quiet move
+    // on a cutoff entry) at a child node where NMP runs must not panic in SEE
+    // or history updates.
+    let tt = TranspositionTable::new(1);
+    let illegal_capture = Move::new(Square::A1, Square::H8, MoveKind::Capture);
+    let illegal_quiet = Move::new(Square::A4, Square::A5, MoveKind::Normal);
+    for &mv in italian.generate_all_moves().iter() {
+        let mut child = italian.clone();
+        child.make_move(mv);
+        tt.write(child.hash(), 1, 200, 200, Bound::Lower, illegal_capture, 1, false, false);
+        for &reply in child.generate_all_moves().iter() {
+            let mut grandchild = child.clone();
+            grandchild.make_move(reply);
+            tt.write(grandchild.hash(), 8, 200, 200, Bound::Lower, illegal_quiet, 2, false, false);
+        }
+    }
+    let res = search_with_tt(&italian, 4, &tt);
+    assert!(res.best_move.is_some());
 }

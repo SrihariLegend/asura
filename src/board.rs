@@ -115,6 +115,10 @@ impl Board {
         self.state.keys.non_pawn(color)
     }
 
+    pub fn non_pawn_count(&self, color: Color) -> u32 {
+        (self.colors(color).0 & !self.pieces(PieceType::King).0 & !self.pieces(PieceType::Pawn).0).count_ones()
+    }
+
     pub const fn pinned(&self, color: Color) -> Bitboard {
         self.state.pinned[color as usize]
     }
