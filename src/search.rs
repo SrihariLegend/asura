@@ -1,12 +1,14 @@
 use std::{cell::RefCell, sync::OnceLock};
 
+pub use crate::thread::PvLine;
 use crate::{
     board::Board,
     evaluation::evaluate,
     history::HistoryTables,
     movepick::{MainMovePicker, MainStage, QuiescenceMovePicker, creates_threat_on_board},
     parameters::*,
-    stack::Stack as SearchStack,
+    stack::Stack,
+    thread::{AspirationKind, AspirationWindow, RootMove, RootMoves, ThreadData},
     transposition::{Bound, TranspositionTable, TtDepth},
     types::{MAX_PLY as MAX_PLY_USIZE, Move, Piece, Score, Square, is_decisive, is_win},
 };
@@ -101,40 +103,6 @@ const fn plan_scout_retry(best_score: i32, score: i32, child_depth: u8, reduced_
     retry_depth
 }
 
-/// Fixed-capacity principal variation buffer stored on the stack without heap allocation.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct PvLine {
-    moves: [Move; MAX_PLY_USIZE + 1],
-    len: usize,
-}
-
-impl PvLine {
-    pub const fn new() -> Self {
-        Self { moves: [Move::NULL; MAX_PLY_USIZE + 1], len: 0 }
-    }
-
-    pub const fn clear(&mut self) {
-        self.len = 0;
-    }
-
-    pub fn as_slice(&self) -> &[Move] {
-        &self.moves[..self.len]
-    }
-
-    fn update(&mut self, mv: Move, child: &Self) {
-        let child_len = child.len.min(MAX_PLY_USIZE);
-        self.moves[0] = mv;
-        self.moves[1..=child_len].copy_from_slice(&child.moves[..child_len]);
-        self.len = child_len + 1;
-    }
-}
-
-impl Default for PvLine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct SearchResult {
     /// No move is selected at depth zero or when no legal move exists.
@@ -156,208 +124,11 @@ impl SearchResult {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct RootScore {
-    last: i32,
-    average: i32,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum AspirationKind {
-    FailHigh,
-    FailLow,
-    Exact,
-}
-
-struct AspirationWindow {
-    alpha: i32,
-    beta: i32,
-    delta: i32,
-}
-
-impl AspirationWindow {
-    fn new(depth: u8, previous: RootScore, eval_stability: i32, pv_stability: i32) -> Self {
-        if depth < ASPIRATION_MIN_DEPTH || previous.average <= -MATE_SCORE {
-            return Self { alpha: -INFINITY, beta: INFINITY, delta: INFINITY };
-        }
-        let stability_shrink = eval_stability.min(pv_stability).min(ASPIRATION_STABILITY_MAX);
-        let volatility = (previous.last - previous.average).abs() * ASPIRATION_VOLATILITY_NUM / ASPIRATION_RATIO_DEN;
-        let magnitude = previous.average * previous.average / ASPIRATION_QUADRATIC_DIV;
-        let delta = (ASPIRATION_BASE_DELTA - stability_shrink) + volatility + magnitude;
-
-        let mut alpha = (previous.average - delta).max(-INFINITY);
-        let mut beta = (previous.average + delta).min(INFINITY);
-        if alpha < -ASPIRATION_INFINITE_BOUND {
-            alpha = -INFINITY;
-        }
-        if beta > ASPIRATION_INFINITE_BOUND {
-            beta = INFINITY;
-        }
-        Self { alpha, beta, delta }
-    }
-
-    fn on_result(&mut self, score: i32) -> AspirationKind {
-        if score >= self.beta {
-            self.beta = (score + self.delta).min(INFINITY);
-            self.delta += self.delta * ASPIRATION_FAIL_HIGH_WIDEN_NUM / ASPIRATION_RATIO_DEN;
-            if self.beta > ASPIRATION_INFINITE_BOUND {
-                self.beta = INFINITY;
-            }
-            return AspirationKind::FailHigh;
-        }
-        if score <= self.alpha {
-            let failed_alpha = self.alpha;
-            self.alpha = (score - self.delta).max(-INFINITY);
-            self.beta = (self.beta + failed_alpha) / 2;
-            self.delta += self.delta * ASPIRATION_FAIL_LOW_WIDEN_NUM / ASPIRATION_RATIO_DEN;
-            if self.alpha < -ASPIRATION_INFINITE_BOUND {
-                self.alpha = -INFINITY;
-            }
-            if self.beta > ASPIRATION_INFINITE_BOUND {
-                self.beta = INFINITY;
-            }
-            return AspirationKind::FailLow;
-        }
-        AspirationKind::Exact
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct IterationResult {
-    score: i32,
-    alpha: i32,
-    beta: i32,
-    depth: u8,
-    upperbound: bool,
-    lowerbound: bool,
-    pv: PvLine,
-}
-
-impl Default for IterationResult {
-    fn default() -> Self {
-        Self {
-            score: -INFINITY,
-            alpha: -INFINITY,
-            beta: INFINITY,
-            depth: 0,
-            upperbound: false,
-            lowerbound: false,
-            pv: PvLine::new(),
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct RootMove {
-    mv: Move,
-    nodes: u64,
-    sel_depth: u16,
-    searched_this_iteration: bool,
-    current: IterationResult,
-    previous: IterationResult,
-    average: i32,
-}
-
-impl RootMove {
-    fn new(mv: Move) -> Self {
-        Self {
-            mv,
-            nodes: 0,
-            sel_depth: 0,
-            searched_this_iteration: false,
-            current: IterationResult::default(),
-            previous: IterationResult::default(),
-            average: -INFINITY,
-        }
-    }
-
-    const fn active_result(&self) -> &IterationResult {
-        if self.searched_this_iteration { &self.current } else { &self.previous }
-    }
-}
-
-struct RootMoves {
-    records: Vec<RootMove>,
-    best_move_changes: usize,
-}
-
-impl RootMoves {
-    fn new(board: &Board) -> Self {
-        let moves = board.generate_all_moves();
-        let records = moves.iter().copied().map(RootMove::new).collect();
-        Self { records, best_move_changes: 0 }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.records.is_empty()
-    }
-
-    fn at(&self, index: usize) -> &RootMove {
-        &self.records[index]
-    }
-
-    fn begin_depth_iteration(&mut self, depth: u8) {
-        self.best_move_changes = 0;
-        for rec in &mut self.records {
-            rec.previous = rec.current;
-            rec.current.depth = depth;
-            rec.searched_this_iteration = false;
-        }
-    }
-
-    fn aspiration_previous_score(&self, pv_idx: usize) -> RootScore {
-        let rec = &self.records[pv_idx];
-        RootScore { last: rec.active_result().score, average: rec.average }
-    }
-
-    fn is_eligible_at_root(&self, pv_idx: usize, mv: Move) -> bool {
-        self.records[pv_idx..].iter().any(|rec| rec.mv == mv)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn record_searched_move(
-        &mut self, pv_idx: usize, mv: Move, score: i32, alpha_before: i32, beta: i32, first_candidate: bool,
-        move_nodes: u64, sel_depth: u16, child_pv: &PvLine,
-    ) {
-        let Some(rec) = self.records.iter_mut().find(|rec| rec.mv == mv) else { return };
-        if pv_idx == 0 {
-            rec.nodes += move_nodes;
-            rec.average = if rec.average == -INFINITY { score } else { (rec.average + score) / 2 };
-        }
-        if !first_candidate && score <= alpha_before {
-            rec.current.score = -INFINITY;
-            return;
-        }
-        rec.searched_this_iteration = true;
-        rec.sel_depth = sel_depth;
-        rec.current.alpha = alpha_before;
-        rec.current.beta = beta;
-        rec.current.score = score;
-        rec.current.upperbound = score <= alpha_before;
-        rec.current.lowerbound = score >= beta;
-        rec.current.pv.update(mv, child_pv);
-        if !first_candidate && pv_idx == 0 {
-            self.best_move_changes += 1;
-        }
-    }
-
-    fn sort_from(&mut self, pv_idx: usize) {
-        if pv_idx >= self.records.len() {
-            return;
-        }
-        // Stable sort preserves the previous iteration's ordering on equal scores.
-        self.records[pv_idx..].sort_by(|a, b| {
-            b.searched_this_iteration
-                .cmp(&a.searched_this_iteration)
-                .then_with(|| b.active_result().score.cmp(&a.active_result().score))
-        });
-    }
-}
-
-/// Iterative-deepening, single-threaded alpha-beta search with aspiration
-/// windows, dedicated root search, principal variation search, late move
-/// reductions, transposition table, history-based move ordering, and hybrid
-/// quiescence leaves.
+/// Fixed-depth alpha-beta search over legal moves with a quiescence tail.
+/// Positive depth means plies to search before dropping into quiescence.
+/// Depth zero evaluates the root directly when not in check and drops into
+/// quiescence when in check; material draws and mates still apply at all
+/// depths and quiescence leaves.
 pub fn search(position: &Board, depth: u8) -> SearchResult {
     LOCAL_TT.with_borrow_mut(|tt| {
         LOCAL_HISTORY.with_borrow_mut(|history| {
@@ -368,7 +139,7 @@ pub fn search(position: &Board, depth: u8) -> SearchResult {
     })
 }
 
-/// Search using a caller-supplied transposition table.
+/// Fixed-depth search using an caller-provided transposition table.
 pub fn search_with_tt(position: &Board, depth: u8, tt: &TranspositionTable) -> SearchResult {
     LOCAL_HISTORY.with_borrow_mut(|history| {
         history.clear();
@@ -376,154 +147,57 @@ pub fn search_with_tt(position: &Board, depth: u8, tt: &TranspositionTable) -> S
     })
 }
 
-/// Search using caller-supplied transposition and history tables (persisting across UCI moves).
+/// Fixed-depth search using caller-provided transposition and history tables.
 pub fn search_with_context(
     position: &Board, depth: u8, tt: &TranspositionTable, history: &mut HistoryTables,
 ) -> SearchResult {
     run_search::<CFG_STANDARD>(position, depth, Some(tt), Some(history))
 }
 
-/// The normal selective search, with recognized draws scored exactly zero.
-pub fn search_with_zero_draws(position: &Board, depth: u8) -> SearchResult {
-    LOCAL_TT.with_borrow_mut(|tt| {
-        LOCAL_HISTORY.with_borrow_mut(|history| {
-            tt.clear(1);
-            history.clear();
-            run_search::<CFG_ALL_SELECTIVE>(position, depth, Some(tt), Some(history))
-        })
-    })
+macro_rules! define_diagnostic_searches {
+    ($($(#[$attr:meta])* $name:ident: $cfg:expr;)*) => {
+        $(
+            $(#[$attr])*
+            pub fn $name(position: &Board, depth: u8) -> SearchResult {
+                LOCAL_TT.with_borrow_mut(|tt| {
+                    LOCAL_HISTORY.with_borrow_mut(|history| {
+                        tt.clear(1);
+                        history.clear();
+                        run_search::<{ $cfg }>(position, depth, Some(tt), Some(history))
+                    })
+                })
+            }
+        )*
+    };
 }
 
-/// The selective search with LMR disabled and recognized draws scored zero.
-pub fn search_without_lmr(position: &Board, depth: u8) -> SearchResult {
-    LOCAL_TT.with_borrow_mut(|tt| {
-        LOCAL_HISTORY.with_borrow_mut(|history| {
-            tt.clear(1);
-            history.clear();
-            run_search::<{ CFG_ALL_SELECTIVE & !CFG_LMR }>(position, depth, Some(tt), Some(history))
-        })
-    })
-}
-
-/// The selective search with NMP disabled and recognized draws scored zero.
-pub fn search_without_nmp(position: &Board, depth: u8) -> SearchResult {
-    LOCAL_TT.with_borrow_mut(|tt| {
-        LOCAL_HISTORY.with_borrow_mut(|history| {
-            tt.clear(1);
-            history.clear();
-            run_search::<{ CFG_ALL_SELECTIVE & !CFG_NMP }>(position, depth, Some(tt), Some(history))
-        })
-    })
-}
-
-/// The selective search with RFP disabled and recognized draws scored zero.
-pub fn search_without_rfp(position: &Board, depth: u8) -> SearchResult {
-    LOCAL_TT.with_borrow_mut(|tt| {
-        LOCAL_HISTORY.with_borrow_mut(|history| {
-            tt.clear(1);
-            history.clear();
-            run_search::<{ CFG_ALL_SELECTIVE & !CFG_RFP }>(position, depth, Some(tt), Some(history))
-        })
-    })
-}
-
-/// The selective search with ProbCut disabled and recognized draws scored zero.
-pub fn search_without_probcut(position: &Board, depth: u8) -> SearchResult {
-    LOCAL_TT.with_borrow_mut(|tt| {
-        LOCAL_HISTORY.with_borrow_mut(|history| {
-            tt.clear(1);
-            history.clear();
-            run_search::<{ CFG_ALL_SELECTIVE & !CFG_PROBCUT }>(position, depth, Some(tt), Some(history))
-        })
-    })
-}
-
-/// The selective search with main-loop SEE pruning disabled and recognized draws scored zero.
-pub fn search_without_see_pruning(position: &Board, depth: u8) -> SearchResult {
-    LOCAL_TT.with_borrow_mut(|tt| {
-        LOCAL_HISTORY.with_borrow_mut(|history| {
-            tt.clear(1);
-            history.clear();
-            run_search::<{ CFG_ALL_SELECTIVE & !CFG_SEE }>(position, depth, Some(tt), Some(history))
-        })
-    })
-}
-
-/// The selective search with Late Move Pruning (LMP) disabled and recognized draws scored zero.
-pub fn search_without_lmp(position: &Board, depth: u8) -> SearchResult {
-    LOCAL_TT.with_borrow_mut(|tt| {
-        LOCAL_HISTORY.with_borrow_mut(|history| {
-            tt.clear(1);
-            history.clear();
-            run_search::<{ CFG_ALL_SELECTIVE & !CFG_LMP }>(position, depth, Some(tt), Some(history))
-        })
-    })
-}
-
-/// The selective search with main-loop Futility Pruning (FP) disabled and recognized draws scored zero.
-pub fn search_without_fp(position: &Board, depth: u8) -> SearchResult {
-    LOCAL_TT.with_borrow_mut(|tt| {
-        LOCAL_HISTORY.with_borrow_mut(|history| {
-            tt.clear(1);
-            history.clear();
-            run_search::<{ CFG_ALL_SELECTIVE & !CFG_FP }>(position, depth, Some(tt), Some(history))
-        })
-    })
-}
-
-/// The selective search with Quiet-History Pruning (HP) disabled and recognized draws scored zero.
-pub fn search_without_hp(position: &Board, depth: u8) -> SearchResult {
-    LOCAL_TT.with_borrow_mut(|tt| {
-        LOCAL_HISTORY.with_borrow_mut(|history| {
-            tt.clear(1);
-            history.clear();
-            run_search::<{ CFG_ALL_SELECTIVE & !CFG_HP }>(position, depth, Some(tt), Some(history))
-        })
-    })
-}
-
-/// The selective search with Internal Iterative Reduction (IIR) disabled and recognized draws scored zero.
-pub fn search_without_iir(position: &Board, depth: u8) -> SearchResult {
-    LOCAL_TT.with_borrow_mut(|tt| {
-        LOCAL_HISTORY.with_borrow_mut(|history| {
-            tt.clear(1);
-            history.clear();
-            run_search::<{ CFG_ALL_SELECTIVE & !CFG_IIR }>(position, depth, Some(tt), Some(history))
-        })
-    })
-}
-
-/// The selective search with Singular Extensions (SE) disabled and recognized draws scored zero.
-pub fn search_without_se(position: &Board, depth: u8) -> SearchResult {
-    LOCAL_TT.with_borrow_mut(|tt| {
-        LOCAL_HISTORY.with_borrow_mut(|history| {
-            tt.clear(1);
-            history.clear();
-            run_search::<{ CFG_ALL_SELECTIVE & !CFG_SE }>(position, depth, Some(tt), Some(history))
-        })
-    })
-}
-
-/// The selective search with Razoring disabled and recognized draws scored zero.
-pub fn search_without_razoring(position: &Board, depth: u8) -> SearchResult {
-    LOCAL_TT.with_borrow_mut(|tt| {
-        LOCAL_HISTORY.with_borrow_mut(|history| {
-            tt.clear(1);
-            history.clear();
-            run_search::<{ CFG_ALL_SELECTIVE & !CFG_RAZOR }>(position, depth, Some(tt), Some(history))
-        })
-    })
-}
-
-/// The selective search with checked TT-capture cutoff disabled and recognized draws scored zero.
-pub fn search_without_checked_tt_cutoff(position: &Board, depth: u8) -> SearchResult {
-    LOCAL_TT.with_borrow_mut(|tt| {
-        LOCAL_HISTORY.with_borrow_mut(|history| {
-            tt.clear(1);
-            history.clear();
-            run_search::<{ CFG_ALL_SELECTIVE & !CFG_CHECKED_TT_CUT }>(position, depth, Some(tt), Some(history))
-        })
-    })
+define_diagnostic_searches! {
+    /// The same selective search with recognized draws scored zero instead of jittered.
+    search_with_zero_draws: CFG_ALL_SELECTIVE;
+    /// The selective search with LMR disabled and recognized draws scored zero.
+    search_without_lmr: CFG_ALL_SELECTIVE & !CFG_LMR;
+    /// The selective search with NMP disabled and recognized draws scored zero.
+    search_without_nmp: CFG_ALL_SELECTIVE & !CFG_NMP;
+    /// The selective search with RFP disabled and recognized draws scored zero.
+    search_without_rfp: CFG_ALL_SELECTIVE & !CFG_RFP;
+    /// The selective search with ProbCut disabled and recognized draws scored zero.
+    search_without_probcut: CFG_ALL_SELECTIVE & !CFG_PROBCUT;
+    /// The selective search with main-loop SEE pruning disabled and recognized draws scored zero.
+    search_without_see_pruning: CFG_ALL_SELECTIVE & !CFG_SEE;
+    /// The selective search with Late Move Pruning (LMP) disabled and recognized draws scored zero.
+    search_without_lmp: CFG_ALL_SELECTIVE & !CFG_LMP;
+    /// The selective search with main-loop Futility Pruning (FP) disabled and recognized draws scored zero.
+    search_without_fp: CFG_ALL_SELECTIVE & !CFG_FP;
+    /// The selective search with Quiet-History Pruning (HP) disabled and recognized draws scored zero.
+    search_without_hp: CFG_ALL_SELECTIVE & !CFG_HP;
+    /// The selective search with Internal Iterative Reduction (IIR) disabled and recognized draws scored zero.
+    search_without_iir: CFG_ALL_SELECTIVE & !CFG_IIR;
+    /// The selective search with Singular Extensions (SE) disabled and recognized draws scored zero.
+    search_without_se: CFG_ALL_SELECTIVE & !CFG_SE;
+    /// The selective search with Razoring disabled and recognized draws scored zero.
+    search_without_razoring: CFG_ALL_SELECTIVE & !CFG_RAZOR;
+    /// The selective search with checked TT-capture cutoff disabled and recognized draws scored zero.
+    search_without_checked_tt_cutoff: CFG_ALL_SELECTIVE & !CFG_CHECKED_TT_CUT;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -533,112 +207,71 @@ pub fn search_reference(position: &Board, depth: u8) -> SearchResult {
 }
 
 fn run_search<const CFG: u32>(
-    position: &Board, depth: u8, tt: Option<&TranspositionTable>, mut history: Option<&mut HistoryTables>,
+    position: &Board, depth: u8, tt: Option<&TranspositionTable>, history: Option<&mut HistoryTables>,
 ) -> SearchResult {
-    let mut board = position.clone();
-    let mut nodes = 0;
+    let mut td = ThreadData::new(position, tt, history);
     let mut pv = PvLine::new();
-    let mut stack = SearchStack::default();
-
-    if let Some(h) = history.as_deref_mut() {
-        h.prepare_search(&board);
-    }
 
     let selective = (CFG & CFG_SELECTIVE) != 0;
     let (score, best_move) = if !selective || depth == 0 {
-        let mut sel_depth = 0;
-        let (score, best_move) = search_node::<CFG, true>(
-            &mut board,
-            &mut stack,
-            depth,
-            0,
-            0,
-            None,
-            Move::NULL,
-            false,
-            TtDepth::NONE_SCORE,
-            0,
-            -INFINITY,
-            INFINITY,
-            &mut pv,
-            &mut nodes,
-            &mut sel_depth,
-            tt,
-            history,
-        );
-        if let Some(mv) = best_move
-            && pv.len == 0
-        {
-            pv.update(mv, &PvLine::new());
+        let (score, best_move) = search_node::<CFG, true>(&mut td, -INFINITY, INFINITY, depth, false, 0, 0);
+        if let Some(mv) = best_move {
+            let line = td.pv_table.line(0);
+            if line.is_empty() {
+                pv.update(mv, &[]);
+            } else {
+                pv.update(line[0], &line[1..]);
+            }
         }
         (score, best_move)
     } else {
-        run_iterative_search::<CFG>(&mut board, &mut stack, depth, &mut nodes, &mut pv, tt.unwrap(), history.unwrap())
+        run_iterative_search::<CFG>(&mut td, depth, &mut pv)
     };
 
-    debug_assert!(board == *position, "search did not undo every move");
-    SearchResult { best_move, score, nodes, pv }
+    debug_assert!(td.board == *position, "search did not undo every move");
+    SearchResult { best_move, score, nodes: td.nodes, pv }
 }
 
 fn run_iterative_search<const CFG: u32>(
-    board: &mut Board, stack: &mut SearchStack, max_depth: u8, nodes: &mut u64, pv: &mut PvLine,
-    tt: &TranspositionTable, history: &mut HistoryTables,
+    td: &mut ThreadData<'_>, max_depth: u8, pv: &mut PvLine,
 ) -> (i32, Option<Move>) {
     let draw_jitter = (CFG & CFG_DRAW_JITTER) != 0;
-    let mut root_moves = RootMoves::new(board);
-    if root_moves.is_empty() {
-        let score = if board.in_check() { -MATE_SCORE } else { draw_score(draw_jitter, *nodes) };
+    td.root_moves = RootMoves::new(&td.board);
+    if td.root_moves.is_empty() {
+        let score = if td.board.in_check() { -MATE_SCORE } else { draw_score(draw_jitter, td.nodes) };
         return (score, None);
     }
-    if board.is_draw(0) {
-        let mv = root_moves.at(0).mv;
-        pv.update(mv, &PvLine::new());
-        return (draw_score(draw_jitter, *nodes), Some(mv));
+    if td.board.is_draw(0) {
+        let mv = td.root_moves.at(0).mv;
+        pv.update(mv, &[]);
+        return (draw_score(draw_jitter, td.nodes), Some(mv));
     }
 
     let mut eval_stability: i32 = 0;
     let mut pv_stability: i32 = 0;
     let mut last_best_rootmove: Option<RootMove> = None;
-    let mut optimism: i32 = 0;
 
     for step in 1..=max_depth {
-        root_moves.begin_depth_iteration(step);
+        td.root_moves.begin_depth_iteration(step);
 
         let pv_idx = 0;
-        let prev_score = root_moves.aspiration_previous_score(pv_idx);
+        let prev_score = td.root_moves.aspiration_previous_score(pv_idx);
         let mut window = AspirationWindow::new(step, prev_score, eval_stability, pv_stability);
         let mut aspiration_depth = step;
-        let mut root_pv_move = root_moves.at(pv_idx).mv;
-
-        if prev_score.average > -MATE_SCORE {
-            optimism = 50 * prev_score.average / (prev_score.average.abs() + 100);
-        }
-        let _ = optimism;
+        let mut root_pv_move = td.root_moves.at(pv_idx).mv;
 
         loop {
-            *stack = SearchStack::default();
+            td.stack = Stack::default();
             let root_effective_depth = aspiration_depth.max(1);
-            let score = search_root::<CFG>(
-                board,
-                stack,
-                window.alpha,
-                window.beta,
-                root_effective_depth,
-                pv_idx,
-                root_pv_move,
-                &mut root_moves,
-                nodes,
-                tt,
-                history,
-            );
-            root_moves.sort_from(pv_idx);
+            let score = search_root::<CFG>(td, window.alpha, window.beta, root_effective_depth, pv_idx, root_pv_move);
+            td.root_moves.sort_from(pv_idx);
 
             match window.on_result(score) {
                 AspirationKind::FailHigh => {
                     if !is_decisive(score) && aspiration_depth > 3 {
                         aspiration_depth -= 1;
                     }
-                    let winning_move = root_moves.at(pv_idx).mv;
+                    let winning_move = td.root_moves.at(pv_idx).mv;
                     if winning_move.is_present() {
                         root_pv_move = winning_move;
                     }
@@ -650,7 +283,7 @@ fn run_iterative_search<const CFG: u32>(
             }
         }
 
-        let top = *root_moves.at(0);
+        let top = *td.root_moves.at(0);
         if (top.current.score - top.average).abs() < EVAL_STABILITY_THRESHOLD {
             eval_stability += 1;
         } else {
@@ -674,36 +307,34 @@ fn run_iterative_search<const CFG: u32>(
 
         if is_forgotten_mate {
             if let Some(last) = last_best_rootmove
-                && let Some(pos) = root_moves.records.iter().position(|rm| rm.mv == last.mv)
+                && let Some(pos) = td.root_moves.records.iter().position(|rm| rm.mv == last.mv)
             {
-                root_moves.records.remove(pos);
-                root_moves.records.insert(0, last);
-                root_moves.records[0].current.upperbound = false;
-                root_moves.records[0].current.lowerbound = false;
+                td.root_moves.records.remove(pos);
+                td.root_moves.records.insert(0, last);
+                td.root_moves.records[0].current.upperbound = false;
+                td.root_moves.records[0].current.lowerbound = false;
             }
         } else {
             last_best_rootmove = Some(top);
         }
     }
 
-    let winner = root_moves.at(0);
+    let winner = td.root_moves.at(0);
     let result = winner.active_result();
     *pv = result.pv;
     (result.score, Some(winner.mv))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn search_root<const CFG: u32>(
-    board: &mut Board, stack: &mut SearchStack, mut alpha: i32, beta: i32, root_effective_depth: u8, pv_idx: usize,
-    work_item: Move, root_moves: &mut RootMoves, nodes: &mut u64, tt: &TranspositionTable, history: &mut HistoryTables,
+    td: &mut ThreadData<'_>, mut alpha: i32, beta: i32, root_effective_depth: u8, pv_idx: usize, work_item: Move,
 ) -> i32 {
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
-    let hash = board.hash();
-    let entry = tt.read(hash, board.fiftymove_clock(), 0);
+    let hash = td.board.hash();
+    let entry = td.tt.and_then(|t| t.read(hash, td.board.fiftymove_clock(), 0));
     let tt_move = entry.map(|e| e.mv).unwrap_or(Move::NULL);
     let priority_move = if work_item.is_present() { work_item } else { tt_move };
 
-    let in_check = board.in_check();
+    let in_check = td.board.in_check();
     let raw_eval = if in_check {
         TtDepth::NONE_SCORE
     } else if let Some(entry) = &entry
@@ -711,18 +342,22 @@ fn search_root<const CFG: u32>(
     {
         entry.raw_eval
     } else {
-        let ev = evaluate(board);
-        if entry.is_none() {
-            tt.write(hash, TtDepth::EVAL_ONLY, ev, TtDepth::NONE_SCORE, Bound::None, Move::NULL, 0, true, false);
+        let ev = evaluate(&td.board);
+        if entry.is_none()
+            && let Some(t) = td.tt
+        {
+            t.write(hash, TtDepth::EVAL_ONLY, ev, TtDepth::NONE_SCORE, Bound::None, Move::NULL, 0, true, false);
         }
         ev
     };
 
-    stack[0].static_eval = raw_eval;
-    stack[0].reduction = 0;
-    stack[0].laterality = 0;
-    stack[2].cutoff_count = 0;
-    history.clear_child_killers(0);
+    td.stack[0].static_eval = raw_eval;
+    td.stack[0].reduction = 0;
+    td.stack[0].laterality = 0;
+    td.stack[2].cutoff_count = 0;
+    if let Some(h) = td.history.as_deref_mut() {
+        h.clear_child_killers(0);
+    }
 
     let node_bias = compute_node_bias(true, in_check, false, true, false, priority_move.is_capture(), 0, 0, 0, 0);
 
@@ -737,56 +372,43 @@ fn search_root<const CFG: u32>(
     let mut noisy_moves = [Move::NULL; 32];
     let mut noisy_len = 0usize;
 
-    while let Some(mv) = picker.next(board, Some(history), false, 0) {
-        if !root_moves.is_eligible_at_root(pv_idx, mv) {
+    while let Some(mv) = picker.next(&td.board, td.history.as_deref(), false, 0) {
+        if !td.root_moves.is_eligible_at_root(pv_idx, mv) {
             continue;
         }
         move_count += 1;
         let child_depth = root_effective_depth - 1;
-        let nodes_before = *nodes;
-        let mut child_pv = PvLine::new();
-        let mut sel_depth = 1u16;
+        let nodes_before = td.nodes;
+        td.sel_depth = 1;
+        td.pv_table.clear(1);
 
-        let moved_piece = board.moved_piece(mv);
+        let moved_piece = td.board.moved_piece(mv);
         let is_quiet = mv.is_quiet();
-        let creates_threat = is_quiet && creates_threat_on_board(board, mv);
-        let hist = if is_quiet {
-            history.quiet_history.get(board.all_threats(), creates_threat, board.side_to_move(), mv)
-                + history.conthist(0, 1, moved_piece, mv.to())
-                + history.conthist(0, 2, moved_piece, mv.to())
-        } else {
-            history.noisy_history.get(board.all_threats(), moved_piece, mv.to(), board.type_on(mv.capture_sq()))
-        };
+        let creates_threat = is_quiet && creates_threat_on_board(&td.board, mv);
+        let hist = td.history.as_deref().map_or(0, |h| {
+            if is_quiet {
+                h.quiet_history.get(td.board.all_threats(), creates_threat, td.board.side_to_move(), mv)
+                    + h.conthist(0, 1, moved_piece, mv.to())
+                    + h.conthist(0, 2, moved_piece, mv.to())
+            } else {
+                h.noisy_history.get(td.board.all_threats(), moved_piece, mv.to(), td.board.type_on(mv.capture_sq()))
+            }
+        });
 
-        history.continuation_history.remember(0, in_check, mv, moved_piece);
-        stack[0].stat_score = hist;
-        stack[0].laterality = if move_count > 1 { (move_count.ilog2() as i32 - 1).max(0) } else { 0 };
-        make_move(board, mv, nodes, Some(tt));
-        let gives_check = board.in_check();
+        if let Some(h) = td.history.as_deref_mut() {
+            h.continuation_history.remember(0, in_check, mv, moved_piece);
+        }
+        td.stack[0].mv = mv;
+        td.stack[0].move_count = move_count as u16;
+        td.stack[0].stat_score = hist;
+        td.stack[0].laterality = if move_count > 1 { (move_count.ilog2() as i32 - 1).max(0) } else { 0 };
+        td.make_move(mv);
+        let gives_check = td.board.in_check();
 
         let use_lmr = (CFG & CFG_LMR) != 0;
         let score = if move_count == 1 {
-            stack[0].reduction = 0;
-            -search_node::<CFG, true>(
-                board,
-                stack,
-                child_depth,
-                1,
-                0,
-                Some(mv.to()),
-                mv,
-                false,
-                raw_eval,
-                move_count,
-                -beta,
-                -alpha,
-                &mut child_pv,
-                nodes,
-                &mut sel_depth,
-                Some(tt),
-                Some(history),
-            )
-            .0
+            td.stack[0].reduction = 0;
+            -search_node::<CFG, true>(td, -beta, -alpha, child_depth, false, 1, 0).0
         } else {
             // At PV/Root nodes, LMR applies only to quiet moves.
             let mut reduced_depth = child_depth;
@@ -797,7 +419,7 @@ fn search_root<const CFG: u32>(
                     - LMR_CHECK_BONUS * gives_check as i32
                     - LMR_THREAT_BONUS * creates_threat as i32
                     + LMR_EXACT_BOUND_PENALTY * (bound == Bound::Exact) as i32
-                    + LMR_CHILD_CUTOFF_PENALTY * (stack[1].cutoff_count > 2) as i32;
+                    + LMR_CHILD_CUTOFF_PENALTY * (td.stack[1].cutoff_count > 2) as i32;
                 if raw_reduction < 0 {
                     raw_reduction = 0;
                 }
@@ -806,29 +428,9 @@ fn search_root<const CFG: u32>(
                 reduced_depth = child_depth - reduction_plies;
             }
 
-            let mut scout_pv = PvLine::new();
-            stack[0].reduction = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
-            let mut scout = -search_node::<CFG, false>(
-                board,
-                stack,
-                reduced_depth,
-                1,
-                1,
-                Some(mv.to()),
-                mv,
-                true,
-                raw_eval,
-                move_count,
-                -alpha - 1,
-                -alpha,
-                &mut scout_pv,
-                nodes,
-                &mut sel_depth,
-                Some(tt),
-                Some(history),
-            )
-            .0;
-            stack[0].reduction = 0;
+            td.stack[0].reduction = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
+            let mut scout = -search_node::<CFG, false>(td, -alpha - 1, -alpha, reduced_depth, true, 1, 1).0;
+            td.stack[0].reduction = 0;
 
             let mut retry_depth = child_depth;
             if quotient > 0 && scout > alpha && reduced_depth < child_depth {
@@ -837,72 +439,41 @@ fn search_root<const CFG: u32>(
                     retry_depth = child_depth.saturating_add(1);
                 }
                 if retry_depth > reduced_depth {
-                    stack[0].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
-                    scout = -search_node::<CFG, false>(
-                        board,
-                        stack,
-                        retry_depth,
-                        1,
-                        1,
-                        Some(mv.to()),
-                        mv,
-                        true,
-                        raw_eval,
-                        move_count,
-                        -alpha - 1,
-                        -alpha,
-                        &mut scout_pv,
-                        nodes,
-                        &mut sel_depth,
-                        Some(tt),
-                        Some(history),
-                    )
-                    .0;
-                    stack[0].reduction = 0;
+                    td.stack[0].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
+                    scout = -search_node::<CFG, false>(td, -alpha - 1, -alpha, retry_depth, true, 1, 1).0;
+                    td.stack[0].reduction = 0;
                 }
             }
 
             if scout > alpha && beta > alpha + 1 {
-                stack[0].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
-                let res = -search_node::<CFG, true>(
-                    board,
-                    stack,
-                    retry_depth,
-                    1,
-                    0,
-                    Some(mv.to()),
-                    mv,
-                    false,
-                    raw_eval,
-                    move_count,
-                    -beta,
-                    -alpha,
-                    &mut child_pv,
-                    nodes,
-                    &mut sel_depth,
-                    Some(tt),
-                    Some(history),
-                )
-                .0;
-                stack[0].reduction = 0;
+                td.stack[0].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
+                let res = -search_node::<CFG, true>(td, -beta, -alpha, retry_depth, false, 1, 0).0;
+                td.stack[0].reduction = 0;
                 res
             } else {
                 scout
             }
         };
 
-        undo_move(board, mv);
+        td.undo_move(mv);
 
-        root_moves.record_searched_move(
+        let move_nodes = td.nodes - nodes_before;
+        let sel_depth = td.sel_depth;
+        let mut child_pv = PvLine::new();
+        let line = td.pv_table.line(1);
+        if !line.is_empty() {
+            child_pv.update(line[0], &line[1..]);
+        }
+        td.root_moves.record_searched_move(
             pv_idx,
             mv,
             score,
             alpha,
             beta,
             move_count == 1,
-            *nodes - nodes_before,
+            move_nodes,
             sel_depth,
-            &child_pv,
+            child_pv.as_slice(),
         );
 
         if score > best_score {
@@ -915,8 +486,11 @@ fn search_root<const CFG: u32>(
                     break;
                 }
                 alpha = score;
-                if pv_idx == 0 && mv != priority_move {
-                    tt.write(hash, root_effective_depth as i32, raw_eval, score, Bound::Lower, mv, 0, true, false);
+                if pv_idx == 0
+                    && mv != priority_move
+                    && let Some(t) = td.tt
+                {
+                    t.write(hash, root_effective_depth as i32, raw_eval, score, Bound::Lower, mv, 0, true, false);
                 }
             }
         }
@@ -932,13 +506,10 @@ fn search_root<const CFG: u32>(
 
     if best_score >= beta && best_move.is_present() {
         update_histories_on_best_move(
-            board,
-            history,
+            td,
             0,
             root_effective_depth as i32,
             false,
-            Move::NULL,
-            0,
             best_move,
             best_score,
             beta,
@@ -947,21 +518,19 @@ fn search_root<const CFG: u32>(
         );
     }
 
-    if pv_idx == 0 {
+    if pv_idx == 0
+        && let Some(t) = td.tt
+    {
         let store_mv = if bound == Bound::Upper { Move::NULL } else { best_move };
         let store_depth = (root_effective_depth as i32 - i32::from(bound == Bound::Lower)).max(1);
-        tt.write(hash, store_depth, raw_eval, best_score, bound, store_mv, 0, true, true);
+        t.write(hash, store_depth, raw_eval, best_score, bound, store_mv, 0, true, true);
     }
 
     best_score
 }
 
-#[allow(clippy::too_many_arguments)]
 fn search_node<const CFG: u32, const PV: bool>(
-    board: &mut Board, stack: &mut SearchStack, mut depth: u8, ply: u16, last_critical_ply: u16,
-    previous: Option<Square>, prior_move: Move, cut_node: bool, parent_eval: i32, parent_move_count: usize,
-    mut alpha: i32, beta: i32, pv: &mut PvLine, nodes: &mut u64, sel_depth: &mut u16, tt: Option<&TranspositionTable>,
-    mut history: Option<&mut HistoryTables>,
+    td: &mut ThreadData<'_>, mut alpha: i32, beta: i32, mut depth: u8, cut_node: bool, ply: u16, last_critical_ply: u16,
 ) -> (i32, Option<Move>) {
     let draw_jitter = (CFG & CFG_DRAW_JITTER) != 0;
     let selective = (CFG & CFG_SELECTIVE) != 0;
@@ -978,50 +547,63 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_razoring = (CFG & CFG_RAZOR) != 0;
     let use_checked_tt_cut = (CFG & CFG_CHECKED_TT_CUT) != 0;
 
+    let ply_idx = ply as usize;
+    let prior_move = if ply_idx > 0 { td.stack[ply_idx - 1].mv } else { Move::NULL };
+    let previous = prior_move.is_present().then(|| prior_move.to());
+    let parent_eval = if ply_idx > 0 { td.stack[ply_idx - 1].static_eval } else { TtDepth::NONE_SCORE };
+    let parent_move_count = if ply_idx > 0 { td.stack[ply_idx - 1].move_count as usize } else { 0 };
+
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     if PV {
-        pv.clear();
-        *sel_depth = (*sel_depth).max(ply);
+        td.pv_table.clear(ply_idx);
+        td.sel_depth = td.sel_depth.max(ply);
     }
 
     if depth == 0 {
-        if ply == 0 && !board.has_legal_moves() {
-            let score = if board.in_check() { -MATE_SCORE } else { draw_score(draw_jitter, *nodes) };
+        if ply == 0 && !td.board.has_legal_moves() {
+            let score = if td.board.in_check() { -MATE_SCORE } else { draw_score(draw_jitter, td.nodes) };
             return (score, None);
         }
-        return (quiescence::<CFG, PV>(board, 0, ply, previous, alpha, beta, nodes, sel_depth, tt, history).0, None);
+        return (quiescence::<CFG, PV>(td, alpha, beta, 0, ply, previous).0, None);
     }
 
-    let draw = draw_score(draw_jitter, *nodes);
-    if ply > 0 && alpha < draw && board.upcoming_repetition(ply as usize) {
+    let draw = draw_score(draw_jitter, td.nodes);
+    if ply > 0 && alpha < draw && td.board.upcoming_repetition(ply_idx) {
         alpha = draw;
         if alpha >= beta {
             return (alpha, None);
         }
     }
 
-    let in_check = board.in_check();
+    let in_check = td.board.in_check();
     if ply > 0 {
-        if board.is_draw(ply as isize) {
-            if in_check && !board.has_legal_moves() {
+        if td.board.is_draw(ply as isize) {
+            if in_check && !td.board.has_legal_moves() {
                 return (-MATE_SCORE + i32::from(ply), None);
             }
             return (draw, None);
         }
         if ply >= MAX_PLY {
-            if in_check && !board.has_legal_moves() {
+            if in_check && !td.board.has_legal_moves() {
                 return (-MATE_SCORE + i32::from(ply), None);
             }
-            return (if in_check { draw } else { evaluate(board) }, None);
+            return (if in_check { draw } else { evaluate(&td.board) }, None);
+        }
+
+        // Mate Distance Pruning (MDP)
+        alpha = alpha.max(-MATE_SCORE + i32::from(ply));
+        let mate_beta = beta.min(MATE_SCORE - i32::from(ply) - 1);
+        if alpha >= mate_beta {
+            return (alpha, None);
         }
     }
 
-    let ply_idx = ply as usize;
-    let excluded_move = stack[ply_idx].excluded_move;
+    let excluded_move = td.stack[ply_idx].excluded_move;
     let in_singular = excluded_move.is_present();
-    let hash = board.hash();
+
+    let hash = td.board.hash();
     let entry = if selective && !in_singular {
-        tt.and_then(|t| t.read(hash, board.fiftymove_clock(), ply as isize))
+        td.tt.and_then(|t| t.read(hash, td.board.fiftymove_clock(), ply as isize))
     } else {
         None
     };
@@ -1029,7 +611,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let mut tt_pv = PV;
 
     if let Some(entry) = &entry {
-        if entry.mv.is_present() && board.is_legal(entry.mv) {
+        if entry.mv.is_present() && td.board.is_legal(entry.mv) {
             tt_move = entry.mv;
         }
         tt_pv |= entry.tt_pv;
@@ -1038,43 +620,51 @@ fn search_node<const CFG: u32, const PV: bool>(
             && ply > 0
             && entry.depth >= depth as i32
             && entry.score != TtDepth::NONE_SCORE
-            && board.fiftymove_clock() < 90
             && match entry.bound {
                 Bound::Exact => true,
-                Bound::Lower => entry.score >= beta,
-                Bound::Upper => entry.score <= alpha,
+                Bound::Lower => entry.score >= beta && (cut_node || depth > 5),
+                Bound::Upper => entry.score <= alpha && (!cut_node || depth > 5),
                 Bound::None => false,
             }
         {
             if tt_move.is_quiet()
                 && entry.score >= beta
                 && parent_move_count < 4
-                && let Some(h) = history.as_deref_mut()
+                && let Some(h) = td.history.as_deref_mut()
             {
                 let d = depth as i32;
-                let quiet_bonus = (180 * d - 80).min(1_600);
-                let cont_bonus = (95 * d - 70).min(1_200);
-                let creates_threat = creates_threat_on_board(board, tt_move);
-                h.quiet_history.update(board.all_threats(), creates_threat, board.side_to_move(), tt_move, quiet_bonus);
-                h.update_continuation_histories(ply_idx, board.moved_piece(tt_move), tt_move.to(), cont_bonus);
+                let quiet_bonus = (180 * d - 70).min(1_600);
+                let cont_bonus = (100 * d - 70).min(1_100);
+                let creates_threat = creates_threat_on_board(&td.board, tt_move);
+                h.quiet_history.update(
+                    td.board.all_threats(),
+                    creates_threat,
+                    td.board.side_to_move(),
+                    tt_move,
+                    quiet_bonus,
+                );
+                h.update_continuation_histories(ply_idx, td.board.moved_piece(tt_move), tt_move.to(), cont_bonus);
             }
-            return (entry.score, Some(tt_move));
+
+            if td.board.fiftymove_clock() < 90 {
+                return (entry.score, Some(tt_move));
+            }
         }
     }
 
     let raw_eval = if in_check {
         TtDepth::NONE_SCORE
     } else if in_singular {
-        stack[ply_idx].static_eval
+        td.stack[ply_idx].static_eval
     } else if let Some(entry) = &entry
         && entry.raw_eval != TtDepth::NONE_SCORE
     {
         entry.raw_eval
     } else {
-        let ev = evaluate(board);
+        let ev = evaluate(&td.board);
         if selective
             && entry.is_none()
-            && let Some(t) = tt
+            && let Some(t) = td.tt
         {
             t.write(
                 hash,
@@ -1091,10 +681,10 @@ fn search_node<const CFG: u32, const PV: bool>(
         ev
     };
 
-    stack[ply_idx].static_eval = raw_eval;
-    stack[ply_idx].reduction = 0;
-    if ply_idx + 2 < stack.len() {
-        stack[ply_idx + 2].cutoff_count = 0;
+    td.stack[ply_idx].static_eval = raw_eval;
+    td.stack[ply_idx].reduction = 0;
+    if ply_idx + 2 < td.stack.len() {
+        td.stack[ply_idx + 2].cutoff_count = 0;
     }
 
     // Parent-move quiet history update from static-eval surprise.
@@ -1105,24 +695,24 @@ fn search_node<const CFG: u32, const PV: bool>(
         && prior_move.is_quiet()
         && parent_eval != TtDepth::NONE_SCORE
         && (depth < 6 || entry.is_none())
-        && let Some(h) = history.as_deref_mut()
+        && let Some(h) = td.history.as_deref_mut()
     {
         let eval_delta = -(raw_eval + parent_eval);
         if eval_delta != 0 {
             let bonus = (eval_delta * 6).clamp(-150, 300);
-            h.quiet_history.update(board.prior_threats(), false, !board.side_to_move(), prior_move, bonus);
+            h.quiet_history.update(td.board.prior_threats(), false, !td.board.side_to_move(), prior_move, bonus);
         }
     }
 
-    if let Some(h) = history.as_deref_mut() {
+    if let Some(h) = td.history.as_deref_mut() {
         h.clear_child_killers(ply_idx);
     }
 
     let static_eval = raw_eval;
-    let improving = stack.is_improving(ply_idx, in_check, static_eval);
-    let parent_stat_score = if ply_idx > 0 { stack[ply_idx - 1].stat_score } else { 0 };
-    let parent_reduction = if ply_idx > 0 { stack[ply_idx - 1].reduction } else { 0 };
-    let parent_laterality = if ply_idx > 0 { stack[ply_idx - 1].laterality } else { 0 };
+    let improving = td.stack.is_improving(ply_idx, in_check, static_eval);
+    let parent_stat_score = if ply_idx > 0 { td.stack[ply_idx - 1].stat_score } else { 0 };
+    let parent_reduction = if ply_idx > 0 { td.stack[ply_idx - 1].reduction } else { 0 };
+    let parent_laterality = if ply_idx > 0 { td.stack[ply_idx - 1].laterality } else { 0 };
 
     let potential_singularity = selective
         && use_se
@@ -1138,10 +728,7 @@ fn search_node<const CFG: u32, const PV: bool>(
                 && !is_decisive(e.score)
         });
 
-    // Razoring: when static evaluation plus a depth-scaled margin is already
-    // at or below alpha at shallow non-PV depths, verify the fail-low with a
-    // quiescence search; if a capture refutes the fail-low strongly and no TT
-    // move exists, promote that refutation move into tt_move.
+    // Razoring
     if selective
         && use_razoring
         && !in_singular
@@ -1152,18 +739,7 @@ fn search_node<const CFG: u32, const PV: bool>(
         && static_eval + RAZOR_BASE + (depth as i32) * RAZOR_MARGIN <= alpha
         && !entry.is_some_and(|e| e.bound == Bound::Lower && e.score > alpha)
     {
-        let (q_score, q_move) = quiescence::<CFG, false>(
-            board,
-            0,
-            ply,
-            previous,
-            alpha,
-            beta,
-            nodes,
-            sel_depth,
-            tt,
-            history.as_deref_mut(),
-        );
+        let (q_score, q_move) = quiescence::<CFG, false>(td, alpha, beta, 0, ply, previous);
         if q_score <= alpha {
             return (q_score, None);
         }
@@ -1183,10 +759,10 @@ fn search_node<const CFG: u32, const PV: bool>(
         && !is_decisive(beta)
         && !is_decisive(static_eval)
     {
-        let stm = board.side_to_move();
+        let stm = td.board.side_to_move();
         let tt_below_beta = entry.is_some_and(|e| e.score != TtDepth::NONE_SCORE && e.score < beta);
-        if !tt_below_beta && board.non_pawn_count(stm) > 0 {
-            let no_threats_on_us = (board.all_threats() & board.colors(stm)).is_empty();
+        if !tt_below_beta && td.board.non_pawn_count(stm) > 0 {
+            let no_threats_on_us = (td.board.all_threats() & td.board.colors(stm)).is_empty();
             let margin = (RFP_DEPTH_MARGIN * depth as i32
                 - RFP_IMPROVING_BONUS * i32::from(improving)
                 - RFP_NO_THREATS_BONUS * i32::from(no_threats_on_us)
@@ -1206,12 +782,12 @@ fn search_node<const CFG: u32, const PV: bool>(
         && !in_check
         && prior_move.is_present()
         && depth >= NMP_MIN_DEPTH
-        && ply >= stack.nmp_min_ply
+        && ply >= td.stack.nmp_min_ply
         && !is_decisive(beta)
         && !is_decisive(raw_eval)
     {
-        let stm = board.side_to_move();
-        let non_pawn_count = board.non_pawn_count(stm);
+        let stm = td.board.side_to_move();
+        let non_pawn_count = td.board.non_pawn_count(stm);
         let tt_upper_fail_low =
             entry.is_some_and(|e| e.bound == Bound::Upper && e.score != TtDepth::NONE_SCORE && e.score < beta);
         let eval_margin_ok = if depth <= NMP_SHALLOW_DEPTH {
@@ -1219,7 +795,7 @@ fn search_node<const CFG: u32, const PV: bool>(
         } else {
             raw_eval >= beta + NMP_DEEP_FLOOR
         };
-        let tt_tactical_win = tt_move.is_noisy() && board.see_ge(tt_move, NMP_TT_SEE_MARGIN);
+        let tt_tactical_win = tt_move.is_noisy() && td.board.see_ge(tt_move, NMP_TT_SEE_MARGIN);
 
         if !tt_upper_fail_low
             && eval_margin_ok
@@ -1231,71 +807,30 @@ fn search_node<const CFG: u32, const PV: bool>(
             let reduction = NMP_BASE_REDUCTION + i32::from(improving) + depth as i32 / 4 + extra;
             let null_depth = (depth as i32 - reduction).max(0) as u8;
 
-            if let Some(h) = history.as_deref_mut() {
+            if let Some(h) = td.history.as_deref_mut() {
                 h.continuation_history.remember(ply_idx, false, Move::NULL, Piece::None);
             }
-            stack[ply_idx].stat_score = 0;
-            stack[ply_idx].reduction = 0;
-            stack[ply_idx].laterality = parent_laterality;
+            td.stack[ply_idx].mv = Move::NULL;
+            td.stack[ply_idx].move_count = 0;
+            td.stack[ply_idx].stat_score = 0;
+            td.stack[ply_idx].reduction = 0;
+            td.stack[ply_idx].laterality = parent_laterality;
 
-            board.make_null_move();
-            if let Some(t) = tt {
-                t.prefetch(board.hash());
-            }
-
-            let mut null_pv = PvLine::new();
-            let null_score = -search_node::<CFG, false>(
-                board,
-                stack,
-                null_depth,
-                ply + 1,
-                ply + 1,
-                None,
-                Move::NULL,
-                !cut_node,
-                raw_eval,
-                0,
-                -beta,
-                -beta + 1,
-                &mut null_pv,
-                nodes,
-                sel_depth,
-                tt,
-                history.as_deref_mut(),
-            )
-            .0;
-
-            board.undo_null_move();
+            td.make_null_move();
+            let null_score =
+                -search_node::<CFG, false>(td, -beta, -beta + 1, null_depth, !cut_node, ply + 1, ply + 1).0;
+            td.undo_null_move();
 
             if null_score >= beta {
                 let pruned_score = if null_score >= MATE_THRESHOLD { beta } else { null_score };
-                if stack.nmp_min_ply > 0 || depth < NMP_VERIFY_MIN_DEPTH {
+                if td.stack.nmp_min_ply > 0 || depth < NMP_VERIFY_MIN_DEPTH {
                     return (pruned_score, None);
                 }
 
-                stack.nmp_min_ply = ply + 3 * u16::from(null_depth) / 4;
-                let mut verify_pv = PvLine::new();
-                let verified_score = search_node::<CFG, false>(
-                    board,
-                    stack,
-                    null_depth,
-                    ply,
-                    last_critical_ply,
-                    previous,
-                    prior_move,
-                    false,
-                    parent_eval,
-                    parent_move_count,
-                    beta - 1,
-                    beta,
-                    &mut verify_pv,
-                    nodes,
-                    sel_depth,
-                    tt,
-                    history.as_deref_mut(),
-                )
-                .0;
-                stack.nmp_min_ply = 0;
+                td.stack.nmp_min_ply = ply + 3 * u16::from(null_depth) / 4;
+                let verified_score =
+                    search_node::<CFG, false>(td, beta - 1, beta, null_depth, false, ply, last_critical_ply).0;
+                td.stack.nmp_min_ply = 0;
 
                 if verified_score >= beta {
                     return (pruned_score, None);
@@ -1327,62 +862,40 @@ fn search_node<const CFG: u32, const PV: bool>(
             let prob_depth = depth - 4;
             let mut prob_picker = MainMovePicker::new_probcut(tt_move, see_threshold);
 
-            while let Some(mv) = prob_picker.next(board, history.as_deref(), true, ply_idx) {
-                let moved_piece = board.moved_piece(mv);
-                let hist = history.as_deref().map_or(0, |h| {
-                    h.noisy_history.get(board.all_threats(), moved_piece, mv.to(), board.type_on(mv.capture_sq()))
+            while let Some(mv) = prob_picker.next(&td.board, td.history.as_deref(), true, ply_idx) {
+                let moved_piece = td.board.moved_piece(mv);
+                let hist = td.history.as_deref().map_or(0, |h| {
+                    h.noisy_history.get(td.board.all_threats(), moved_piece, mv.to(), td.board.type_on(mv.capture_sq()))
                 });
-                if let Some(h) = history.as_deref_mut() {
+                if let Some(h) = td.history.as_deref_mut() {
                     h.continuation_history.remember(ply_idx, false, mv, moved_piece);
                 }
-                stack[ply_idx].stat_score = hist;
-                stack[ply_idx].reduction = 0;
-                stack[ply_idx].laterality = parent_laterality;
+                td.stack[ply_idx].mv = mv;
+                td.stack[ply_idx].move_count = 1;
+                td.stack[ply_idx].stat_score = hist;
+                td.stack[ply_idx].reduction = 0;
+                td.stack[ply_idx].laterality = parent_laterality;
 
-                make_move(board, mv, nodes, tt);
+                td.make_move(mv);
 
-                let mut score = -quiescence::<CFG, false>(
-                    board,
-                    0,
-                    ply + 1,
-                    Some(mv.to()),
-                    -prob_beta,
-                    -prob_beta + 1,
-                    nodes,
-                    sel_depth,
-                    tt,
-                    history.as_deref_mut(),
-                )
-                .0;
-
+                let mut score = -quiescence::<CFG, false>(td, -prob_beta, -prob_beta + 1, 0, ply + 1, Some(mv.to())).0;
                 if score >= prob_beta {
-                    let mut prob_pv = PvLine::new();
                     score = -search_node::<CFG, false>(
-                        board,
-                        stack,
-                        prob_depth,
-                        ply + 1,
-                        last_critical_ply,
-                        Some(mv.to()),
-                        mv,
-                        !cut_node,
-                        raw_eval,
-                        1,
+                        td,
                         -prob_beta,
                         -prob_beta + 1,
-                        &mut prob_pv,
-                        nodes,
-                        sel_depth,
-                        tt,
-                        history.as_deref_mut(),
+                        prob_depth,
+                        !cut_node,
+                        ply + 1,
+                        last_critical_ply,
                     )
                     .0;
                 }
 
-                undo_move(board, mv);
+                td.undo_move(mv);
 
                 if score >= prob_beta && !is_decisive(score) {
-                    if let Some(t) = tt {
+                    if let Some(t) = td.tt {
                         t.write(hash, depth as i32 - 3, raw_eval, score, Bound::Lower, mv, ply as isize, tt_pv, false);
                     }
                     return (score, Some(mv));
@@ -1391,8 +904,7 @@ fn search_node<const CFG: u32, const PV: bool>(
         }
     }
 
-    // Internal Iterative Reduction (IIR): at non-PV cut nodes with no TT move
-    // or a TT entry too shallow to trust, reduce depth by 1 ply.
+    // Internal Iterative Reduction (IIR)
     if selective
         && use_iir
         && !in_singular
@@ -1404,16 +916,14 @@ fn search_node<const CFG: u32, const PV: bool>(
         depth -= 1;
     }
 
-    // Checked TT-capture cutoff: at non-PV nodes in check, if a legal TT
-    // capture evasion has a recent non-decisive lower/exact bound well above
-    // beta, fail high immediately.
+    // Checked TT-capture cutoff
     if selective
         && use_checked_tt_cut
         && !in_singular
         && !PV
         && in_check
         && depth >= CHECKED_TT_CAPTURE_MIN_DEPTH
-        && board.fiftymove_clock() < 90
+        && td.board.fiftymove_clock() < 90
         && !is_decisive(beta)
         && tt_move.is_capture()
         && entry.is_some_and(|e| {
@@ -1440,7 +950,7 @@ fn search_node<const CFG: u32, const PV: bool>(
         parent_laterality,
     );
 
-    let (killers, countermove) = if let Some(h) = history.as_deref() {
+    let (killers, countermove) = if let Some(h) = td.history.as_deref() {
         (h.killers(ply_idx), h.countermove(prior_move))
     } else {
         ([Move::NULL; 2], Move::NULL)
@@ -1450,42 +960,39 @@ fn search_node<const CFG: u32, const PV: bool>(
     let mut best_move = None;
     let mut bound = Bound::Upper;
     let mut move_count = 0usize;
-
     let mut quiet_moves = [Move::NULL; 32];
     let mut quiet_len = 0usize;
     let mut noisy_moves = [Move::NULL; 32];
     let mut noisy_len = 0usize;
-
     let mut skip_quiets = false;
+
     let mut picker = MainMovePicker::new(if selective { tt_move } else { Move::NULL }, false, killers, countermove);
-    while let Some(mv) = picker.next(board, history.as_deref(), skip_quiets, ply_idx) {
+    while let Some(mv) = picker.next(&td.board, td.history.as_deref(), skip_quiets, ply_idx) {
         if mv == excluded_move {
             continue;
         }
         let emitted_stage = picker.emitted_stage();
         move_count += 1;
-        if ply == 0 && board.is_draw(0) {
+        if ply == 0 && td.board.is_draw(0) {
             return (draw, Some(mv));
         }
 
-        let moved_piece = board.moved_piece(mv);
+        let moved_piece = td.board.moved_piece(mv);
         let is_quiet = mv.is_quiet();
-        let creates_threat = selective && is_quiet && creates_threat_on_board(board, mv);
-        let hist = if let Some(h) = history.as_deref() {
+        let creates_threat = selective && is_quiet && creates_threat_on_board(&td.board, mv);
+        let hist = if let Some(h) = td.history.as_deref() {
             if is_quiet {
-                h.quiet_history.get(board.all_threats(), creates_threat, board.side_to_move(), mv)
+                h.quiet_history.get(td.board.all_threats(), creates_threat, td.board.side_to_move(), mv)
                     + h.conthist(ply_idx, 1, moved_piece, mv.to())
                     + h.conthist(ply_idx, 2, moved_piece, mv.to())
             } else {
-                h.noisy_history.get(board.all_threats(), moved_piece, mv.to(), board.type_on(mv.capture_sq()))
+                h.noisy_history.get(td.board.all_threats(), moved_piece, mv.to(), td.board.type_on(mv.capture_sq()))
             }
         } else {
             0
         };
 
-        // Late Move Pruning (LMP): once enough moves have been considered at
-        // this depth, close the quiet stages so subsequent quiet moves are skipped
-        // while keeping the current move and remaining noisy moves eligible.
+        // Late Move Pruning (LMP)
         if selective
             && use_lmp
             && !PV
@@ -1499,9 +1006,7 @@ fn search_node<const CFG: u32, const PV: bool>(
             skip_quiets = true;
         }
 
-        // Main-loop Futility Pruning (FP): skip individual non-checking quiet
-        // moves at shallow LMR-adjusted depths when static_eval plus a strictly
-        // positive margin cannot reach alpha.
+        // Main-loop Futility Pruning (FP)
         if selective
             && use_fp
             && !PV
@@ -1513,7 +1018,7 @@ fn search_node<const CFG: u32, const PV: bool>(
         {
             let lmr_plies = lmr_table_term(depth, move_count) / LMR_SCALE;
             let fp_depth = (depth as i32 - lmr_plies).max(0);
-            if fp_depth <= FP_MAX_DEPTH && !board.is_direct_check(mv) {
+            if fp_depth <= FP_MAX_DEPTH && !td.board.is_direct_check(mv) {
                 let hist_adj = (hist / FP_HIST_DIV).clamp(FP_HIST_MIN, FP_HIST_MAX);
                 let margin = (FP_BASE_MARGIN + FP_DEPTH_MARGIN * fp_depth + hist_adj).max(FP_MIN_MARGIN);
                 if static_eval + margin <= alpha {
@@ -1522,8 +1027,7 @@ fn search_node<const CFG: u32, const PV: bool>(
             }
         }
 
-        // Quiet-History Pruning (HP): skip individual non-checking quiet moves
-        // at shallow depths whose combined history is deeply negative.
+        // Quiet-History Pruning (HP)
         if selective
             && use_hp
             && !PV
@@ -1532,7 +1036,7 @@ fn search_node<const CFG: u32, const PV: bool>(
             && is_quiet
             && depth <= HP_MAX_DEPTH
             && best_score > -MATE_THRESHOLD
-            && !board.is_direct_check(mv)
+            && !td.board.is_direct_check(mv)
         {
             let threshold = HP_DEPTH_SCALE * depth as i32 + HP_IMPROVING_OFFSET * i32::from(improving);
             if hist < threshold {
@@ -1540,8 +1044,7 @@ fn search_node<const CFG: u32, const PV: bool>(
             }
         }
 
-        // Main-loop SEE pruning: skip quiet or noisy moves at shallow depths
-        // whose static exchange loss exceeds a depth- and history-scaled margin.
+        // Main-loop SEE pruning
         if selective && use_see && ply > 0 && !in_check && best_score > -MATE_THRESHOLD {
             let cut_shift = usize::from(!PV && cut_node);
             let threshold = if is_quiet {
@@ -1551,13 +1054,12 @@ fn search_node<const CFG: u32, const PV: bool>(
             } else {
                 ((SEE_NOISY_DEPTH_COEFF * depth as i32 - hist / SEE_NOISY_HIST_DIV) >> cut_shift).min(0)
             };
-            if !board.see_ge(mv, threshold) {
+            if !td.board.see_ge(mv, threshold) {
                 continue;
             }
         }
 
-        // Singular Extensions (SE): verify whether the TT move is uniquely best
-        // by searching all alternatives at reduced depth with a lowered beta.
+        // Singular Extensions (SE)
         let mut extension = 0i32;
         if potential_singularity
             && mv == tt_move
@@ -1565,31 +1067,11 @@ fn search_node<const CFG: u32, const PV: bool>(
         {
             let s_beta = (e.score.min(beta + SE_BETA_MARGIN) - depth as i32 * SE_DEPTH_MARGIN).max(-MATE_THRESHOLD + 1);
             let s_depth = ((9 * (depth as i32 - 1)) / 16).max(1) as u8;
-            let mut verify_pv = PvLine::new();
 
-            stack[ply_idx].excluded_move = mv;
-            let verify = search_node::<CFG, false>(
-                board,
-                stack,
-                s_depth,
-                ply,
-                last_critical_ply,
-                previous,
-                prior_move,
-                true,
-                parent_eval,
-                parent_move_count,
-                s_beta - 1,
-                s_beta,
-                &mut verify_pv,
-                nodes,
-                sel_depth,
-                tt,
-                history.as_deref_mut(),
-            )
-            .0;
-            stack[ply_idx].excluded_move = Move::NULL;
-            if let Some(h) = history.as_deref_mut() {
+            td.stack[ply_idx].excluded_move = mv;
+            let verify = search_node::<CFG, false>(td, s_beta - 1, s_beta, s_depth, true, ply, last_critical_ply).0;
+            td.stack[ply_idx].excluded_move = Move::NULL;
+            if let Some(h) = td.history.as_deref_mut() {
                 h.clear_child_killers(ply_idx);
             }
 
@@ -1610,43 +1092,34 @@ fn search_node<const CFG: u32, const PV: bool>(
             }
         }
 
-        if let Some(h) = history.as_deref_mut() {
+        if let Some(h) = td.history.as_deref_mut() {
             h.continuation_history.remember(ply_idx, in_check, mv, moved_piece);
         }
-        stack[ply_idx].stat_score = hist;
-        stack[ply_idx].laterality =
+        td.stack[ply_idx].mv = mv;
+        td.stack[ply_idx].move_count = move_count as u16;
+        td.stack[ply_idx].stat_score = hist;
+        td.stack[ply_idx].laterality =
             parent_laterality + if move_count > 1 { (move_count.ilog2() as i32 - 1).max(0) } else { 0 };
 
-        let mut child_pv = PvLine::new();
-        make_move(board, mv, nodes, tt);
-        let gives_check = board.in_check();
+        td.make_move(mv);
+        let gives_check = td.board.in_check();
         let base_child_depth = depth as i32 - 1;
         let max_child_depth = (MAX_PLY_USIZE as i32 - 1 - ply as i32).clamp(0, i32::from(u8::MAX));
         let child_depth = (base_child_depth + extension).clamp(0, max_child_depth) as u8;
 
         let score = if !selective || move_count == 1 {
-            stack[ply_idx].reduction = (base_child_depth - child_depth as i32) * LMR_SCALE;
+            td.stack[ply_idx].reduction = (base_child_depth - child_depth as i32) * LMR_SCALE;
             let res = -search_node::<CFG, PV>(
-                board,
-                stack,
-                child_depth,
-                ply + 1,
-                if move_count == 1 { last_critical_ply } else { ply + 1 },
-                Some(mv.to()),
-                mv,
-                !PV && !cut_node,
-                raw_eval,
-                move_count,
+                td,
                 -beta,
                 -alpha,
-                &mut child_pv,
-                nodes,
-                sel_depth,
-                tt,
-                history.as_deref_mut(),
+                child_depth,
+                !PV && !cut_node,
+                ply + 1,
+                if move_count == 1 { last_critical_ply } else { ply + 1 },
             )
             .0;
-            stack[ply_idx].reduction = 0;
+            td.stack[ply_idx].reduction = 0;
             res
         } else {
             let lmr_eligible = use_lmr && depth >= 2 && (is_quiet || !PV);
@@ -1669,7 +1142,7 @@ fn search_node<const CFG: u32, const PV: bool>(
                     - LMR_THREAT_BONUS * creates_threat as i32
                     + LMR_EXACT_BOUND_PENALTY * (bound == Bound::Exact) as i32
                     + LMR_CHILD_CUTOFF_PENALTY
-                        * (ply_idx + 1 < stack.len() && stack[ply_idx + 1].cutoff_count > 2) as i32;
+                        * (ply_idx + 1 < td.stack.len() && td.stack[ply_idx + 1].cutoff_count > 2) as i32;
 
                 quotient = raw_reduction / LMR_SCALE;
                 let reduction_plies = if quotient < 0 {
@@ -1680,33 +1153,13 @@ fn search_node<const CFG: u32, const PV: bool>(
                 reduced_depth = (child_depth as i32 - reduction_plies).clamp(1, child_depth as i32 + 1) as u8;
             }
 
-            let mut scout_pv = PvLine::new();
-            stack[ply_idx].reduction = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
-            let mut scout = -search_node::<CFG, false>(
-                board,
-                stack,
-                reduced_depth,
-                ply + 1,
-                ply + 1,
-                Some(mv.to()),
-                mv,
-                true,
-                raw_eval,
-                move_count,
-                -alpha - 1,
-                -alpha,
-                &mut scout_pv,
-                nodes,
-                sel_depth,
-                tt,
-                history.as_deref_mut(),
-            )
-            .0;
-            stack[ply_idx].reduction = 0;
+            td.stack[ply_idx].reduction = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
+            let mut scout = -search_node::<CFG, false>(td, -alpha - 1, -alpha, reduced_depth, true, ply + 1, ply + 1).0;
+            td.stack[ply_idx].reduction = 0;
 
             if is_quiet
                 && (quotient > 0 || !lmr_eligible)
-                && let Some(h) = history.as_deref_mut()
+                && let Some(h) = td.history.as_deref_mut()
             {
                 let bonus = if scout > alpha { SCOUT_HISTORY_BONUS } else { -SCOUT_HISTORY_BONUS };
                 h.update_continuation_histories(ply_idx, moved_piece, mv.to(), bonus);
@@ -1716,60 +1169,32 @@ fn search_node<const CFG: u32, const PV: bool>(
             if quotient > 0 && scout > alpha && reduced_depth < child_depth {
                 retry_depth = plan_scout_retry(best_score, scout, child_depth, reduced_depth);
                 if retry_depth > reduced_depth {
-                    stack[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
+                    td.stack[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
                     scout = -search_node::<CFG, false>(
-                        board,
-                        stack,
-                        retry_depth,
-                        ply + 1,
-                        last_critical_ply,
-                        Some(mv.to()),
-                        mv,
-                        PV || !cut_node,
-                        raw_eval,
-                        move_count,
+                        td,
                         -alpha - 1,
                         -alpha,
-                        &mut scout_pv,
-                        nodes,
-                        sel_depth,
-                        tt,
-                        history.as_deref_mut(),
+                        retry_depth,
+                        PV || !cut_node,
+                        ply + 1,
+                        last_critical_ply,
                     )
                     .0;
-                    stack[ply_idx].reduction = 0;
+                    td.stack[ply_idx].reduction = 0;
                 }
             }
 
             if PV && scout > alpha && beta > alpha + 1 {
-                stack[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
-                let res = -search_node::<CFG, true>(
-                    board,
-                    stack,
-                    retry_depth,
-                    ply + 1,
-                    last_critical_ply,
-                    Some(mv.to()),
-                    mv,
-                    false,
-                    raw_eval,
-                    move_count,
-                    -beta,
-                    -alpha,
-                    &mut child_pv,
-                    nodes,
-                    sel_depth,
-                    tt,
-                    history.as_deref_mut(),
-                )
-                .0;
-                stack[ply_idx].reduction = 0;
+                td.stack[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
+                let res =
+                    -search_node::<CFG, true>(td, -beta, -alpha, retry_depth, false, ply + 1, last_critical_ply).0;
+                td.stack[ply_idx].reduction = 0;
                 res
             } else {
                 scout
             }
         };
-        undo_move(board, mv);
+        td.undo_move(mv);
 
         if score > best_score {
             best_score = score;
@@ -1777,23 +1202,23 @@ fn search_node<const CFG: u32, const PV: bool>(
             if score > alpha {
                 bound = Bound::Exact;
                 if PV {
-                    pv.update(mv, &child_pv);
+                    td.pv_table.update(ply_idx, mv);
                 }
                 if score >= beta {
                     bound = Bound::Lower;
-                    stack[ply_idx].cutoff_count += 1;
+                    td.stack[ply_idx].cutoff_count += 1;
                     break;
                 }
                 alpha = score;
                 if selective
                     && PV
                     && mv != tt_move
-                    && let Some(t) = tt
+                    && let Some(t) = td.tt
                 {
                     t.write(hash, depth as i32, raw_eval, score, Bound::Lower, mv, ply as isize, true, false);
                 }
             } else if move_count == 1 && PV {
-                pv.update(mv, &child_pv);
+                td.pv_table.update(ply_idx, mv);
             }
         }
 
@@ -1810,22 +1235,19 @@ fn search_node<const CFG: u32, const PV: bool>(
         if in_singular {
             return (alpha, None);
         }
-        let score = if in_check { -MATE_SCORE + i32::from(ply) } else { draw_score(draw_jitter, *nodes) };
+        let score = if in_check { -MATE_SCORE + i32::from(ply) } else { draw_score(draw_jitter, td.nodes) };
         return (score, None);
     }
 
-    if selective && let Some(h) = history {
+    if selective {
         if best_score >= beta
             && let Some(best_mv) = best_move
         {
             update_histories_on_best_move(
-                board,
-                h,
+                td,
                 ply_idx,
                 depth as i32,
                 cut_node,
-                prior_move,
-                parent_move_count,
                 best_mv,
                 best_score,
                 beta,
@@ -1835,32 +1257,37 @@ fn search_node<const CFG: u32, const PV: bool>(
         }
 
         // Child fail-low rewards the parent move that refuted the current side.
-        if ply > 0 && bound == Bound::Upper && (cut_node || PV) && prior_move.is_present() {
+        if ply > 0
+            && bound == Bound::Upper
+            && (cut_node || PV)
+            && prior_move.is_present()
+            && let Some(h) = td.history.as_deref_mut()
+        {
             let d = depth as i32;
-            let prior_threats = board.prior_threats();
+            let prior_threats = td.board.prior_threats();
             if prior_move.is_quiet() {
                 let factor = 90
                     + (15 * parent_move_count as i32).min(225)
                     + 140 * (!in_check && best_score <= raw_eval - 50) as i32
                     + 300 * (parent_eval != TtDepth::NONE_SCORE && best_score <= -parent_eval - 70) as i32;
                 let scaled_bonus = factor * (180 * d - 40).min(2_400) / 128;
-                h.quiet_history.update(prior_threats, false, !board.side_to_move(), prior_move, scaled_bonus);
+                h.quiet_history.update(prior_threats, false, !td.board.side_to_move(), prior_move, scaled_bonus);
                 if ply >= 2 {
                     let bonus = (150 * d - 45).min(1_350);
                     h.continuation_history.update(
                         ply_idx - 1,
                         1,
-                        board.piece_on(prior_move.to()),
+                        td.board.piece_on(prior_move.to()),
                         prior_move.to(),
                         bonus,
                     );
                 }
             } else if prior_move.is_noisy() {
-                let captured_type = board.captured_piece().piece_type();
+                let captured_type = td.board.captured_piece().piece_type();
                 let bonus = (50 * d).min(650);
                 h.noisy_history.update(
                     prior_threats,
-                    board.piece_on(prior_move.to()),
+                    td.board.piece_on(prior_move.to()),
                     prior_move.to(),
                     captured_type,
                     bonus,
@@ -1873,7 +1300,7 @@ fn search_node<const CFG: u32, const PV: bool>(
 
     if selective
         && !in_singular
-        && let Some(t) = tt
+        && let Some(t) = td.tt
     {
         let store_mv = if bound == Bound::Upper { Move::NULL } else { best_move.unwrap_or(Move::NULL) };
         let store_depth = (depth as i32 - i32::from(bound == Bound::Lower)).max(1);
@@ -1885,9 +1312,13 @@ fn search_node<const CFG: u32, const PV: bool>(
 
 #[allow(clippy::too_many_arguments)]
 fn update_histories_on_best_move(
-    board: &Board, history: &mut HistoryTables, ply: usize, depth: i32, cut_node: bool, prior_move: Move,
-    parent_move_count: usize, best_move: Move, best_score: i32, beta: i32, quiet_moves: &[Move], noisy_moves: &[Move],
+    td: &mut ThreadData<'_>, ply: usize, depth: i32, cut_node: bool, best_move: Move, best_score: i32, beta: i32,
+    quiet_moves: &[Move], noisy_moves: &[Move],
 ) {
+    let Some(history) = td.history.as_deref_mut() else { return };
+    let board = &td.board;
+    let prior_move = if ply > 0 { td.stack[ply - 1].mv } else { Move::NULL };
+    let parent_move_count = if ply > 0 { td.stack[ply - 1].move_count as usize } else { 0 };
     let stm = board.side_to_move();
     let threats = board.all_threats();
     let pawn_key = board.pawn_key();
@@ -1949,36 +1380,35 @@ fn update_histories_on_best_move(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn quiescence<const CFG: u32, const PV: bool>(
-    board: &mut Board, q_depth: i16, ply: u16, previous: Option<Square>, mut alpha: i32, beta: i32, nodes: &mut u64,
-    sel_depth: &mut u16, tt: Option<&TranspositionTable>, mut history: Option<&mut HistoryTables>,
+    td: &mut ThreadData<'_>, mut alpha: i32, beta: i32, q_depth: i16, ply: u16, previous: Option<Square>,
 ) -> (i32, Move) {
     let draw_jitter = (CFG & CFG_DRAW_JITTER) != 0;
     let selective = (CFG & CFG_SELECTIVE) != 0;
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     debug_assert!(ply <= MAX_PLY && q_depth <= 0);
-    *sel_depth = (*sel_depth).max(ply);
-    let draw = draw_score(draw_jitter, *nodes);
-    if ply > 0 && alpha < draw && board.upcoming_repetition(ply as usize) {
+    td.sel_depth = td.sel_depth.max(ply);
+    let draw = draw_score(draw_jitter, td.nodes);
+    if ply > 0 && alpha < draw && td.board.upcoming_repetition(ply as usize) {
         alpha = draw;
         if alpha >= beta {
             return (alpha, Move::NULL);
         }
     }
 
-    let in_check = board.in_check();
-    let is_draw = board.is_draw(ply as isize);
+    let in_check = td.board.in_check();
+    let is_draw = td.board.is_draw(ply as isize);
     if is_draw || ply >= MAX_PLY {
-        if in_check && !board.has_legal_moves() {
+        if in_check && !td.board.has_legal_moves() {
             return (-MATE_SCORE + i32::from(ply), Move::NULL);
         }
-        return (if is_draw || in_check { draw } else { evaluate(board) }, Move::NULL);
+        return (if is_draw || in_check { draw } else { evaluate(&td.board) }, Move::NULL);
     }
 
-    let hash = board.hash();
+    let hash = td.board.hash();
     let tt_depth = i32::from(q_depth.max(RECAPTURE_ONLY_DEPTH));
-    let entry = if selective { tt.and_then(|t| t.read(hash, board.fiftymove_clock(), ply as isize)) } else { None };
+    let entry =
+        if selective { td.tt.and_then(|t| t.read(hash, td.board.fiftymove_clock(), ply as isize)) } else { None };
     let mut tt_move = Move::NULL;
     let mut tt_pv = PV;
 
@@ -2009,10 +1439,10 @@ fn quiescence<const CFG: u32, const PV: bool>(
         raw_eval = match &entry {
             Some(entry) if entry.raw_eval != TtDepth::NONE_SCORE => entry.raw_eval,
             _ => {
-                let ev = evaluate(board);
+                let ev = evaluate(&td.board);
                 if selective
                     && entry.is_none()
-                    && let Some(t) = tt
+                    && let Some(t) = td.tt
                 {
                     t.write(
                         hash,
@@ -2049,7 +1479,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
     if best_score >= beta {
         if selective
             && entry.is_none()
-            && let Some(t) = tt
+            && let Some(t) = td.tt
         {
             t.write(hash, tt_depth, raw_eval, best_score, Bound::Lower, Move::NULL, ply as isize, tt_pv, false);
         }
@@ -2059,9 +1489,12 @@ fn quiescence<const CFG: u32, const PV: bool>(
 
     let mut best_move = Move::NULL;
     let mut picker = QuiescenceMovePicker::new(if selective { tt_move } else { Move::NULL }, in_check, q_depth >= -1);
-    while let Some(mv) =
-        picker.next(board, history.as_deref(), selective && in_check && best_score > -MATE_THRESHOLD, ply as usize)
-    {
+    while let Some(mv) = picker.next(
+        &td.board,
+        td.history.as_deref(),
+        selective && in_check && best_score > -MATE_THRESHOLD,
+        ply as usize,
+    ) {
         let recapture = mv.is_capture() && previous == Some(mv.capture_sq());
         if selective
             && !in_check
@@ -2069,29 +1502,17 @@ fn quiescence<const CFG: u32, const PV: bool>(
             && best_score > -MATE_THRESHOLD
             && !recapture
             && !mv.is_promotion()
-            && !board.gives_check(mv)
+            && !td.board.gives_check(mv)
         {
             continue;
         }
-        let moved_piece = board.moved_piece(mv);
-        if let Some(h) = history.as_deref_mut() {
+        let moved_piece = td.board.moved_piece(mv);
+        if let Some(h) = td.history.as_deref_mut() {
             h.continuation_history.remember(ply as usize, in_check, mv, moved_piece);
         }
-        make_move(board, mv, nodes, tt);
-        let score = -quiescence::<CFG, PV>(
-            board,
-            q_depth - 1,
-            ply + 1,
-            Some(mv.to()),
-            -beta,
-            -alpha,
-            nodes,
-            sel_depth,
-            tt,
-            history.as_deref_mut(),
-        )
-        .0;
-        undo_move(board, mv);
+        td.make_move(mv);
+        let score = -quiescence::<CFG, PV>(td, -beta, -alpha, q_depth - 1, ply + 1, Some(mv.to())).0;
+        td.undo_move(mv);
         if score > best_score {
             best_score = score;
             if score > alpha {
@@ -2111,38 +1532,23 @@ fn quiescence<const CFG: u32, const PV: bool>(
     if selective
         && best_score >= beta
         && best_move.is_noisy()
-        && let Some(h) = history
+        && let Some(h) = td.history.as_deref_mut()
     {
         h.noisy_history.update(
-            board.all_threats(),
-            board.moved_piece(best_move),
+            td.board.all_threats(),
+            td.board.moved_piece(best_move),
             best_move.to(),
-            board.type_on(best_move.capture_sq()),
+            td.board.type_on(best_move.capture_sq()),
             100,
         );
     }
 
-    if selective && let Some(t) = tt {
+    if selective && let Some(t) = td.tt {
         let bound = if best_score >= beta { Bound::Lower } else { Bound::Upper };
         t.write(hash, tt_depth, raw_eval, best_score, bound, best_move, ply as isize, tt_pv, false);
     }
 
     (best_score, best_move)
-}
-
-fn make_move(board: &mut Board, mv: Move, nodes: &mut u64, tt: Option<&TranspositionTable>) {
-    if let Some(t) = tt {
-        t.prefetch(board.key_after(mv));
-    }
-    *nodes += 1;
-    board.make_move(mv);
-    if let Some(t) = tt {
-        t.prefetch(board.hash());
-    }
-}
-
-fn undo_move(board: &mut Board, mv: Move) {
-    board.undo_move(mv);
 }
 
 const fn draw_score(draw_jitter: bool, nodes: u64) -> i32 {

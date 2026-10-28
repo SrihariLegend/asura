@@ -4,6 +4,7 @@ pub mod board;
 pub mod history;
 pub mod movepick;
 pub mod search;
+pub mod thread;
 pub mod tools;
 pub mod transposition;
 pub mod types;

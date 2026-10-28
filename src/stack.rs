@@ -4,23 +4,27 @@ use crate::types::{MAX_PLY, Move, Score, is_valid};
 
 #[derive(Copy, Clone)]
 pub struct StackEntry {
+    pub mv: Move,
     pub excluded_move: Move,
     pub static_eval: i32,
     pub stat_score: i32,
     pub reduction: i32,
     pub laterality: i32,
     pub cutoff_count: i32,
+    pub move_count: u16,
 }
 
 impl Default for StackEntry {
     fn default() -> Self {
         Self {
+            mv: Move::NULL,
             excluded_move: Move::NULL,
             static_eval: Score::NONE,
             stat_score: 0,
             reduction: 0,
             laterality: 0,
             cutoff_count: 0,
+            move_count: 0,
         }
     }
 }
