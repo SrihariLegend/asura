@@ -2,7 +2,7 @@ use asura::{
     board::Board,
     search::{
         lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws, search_without_lmr,
-        search_without_nmp,
+        search_without_nmp, search_without_rfp,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -249,8 +249,8 @@ fn null_move_pruning_reduces_nodes_and_skips_pawn_only_zugzwang() {
     // 1. In a middlegame position with non-pawn material on both sides, NMP
     // prunes non-PV subtrees where passing the turn still holds beta.
     let italian = Board::from_fen("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
-    let nmp_on = search_with_zero_draws(&italian, 5);
-    let nmp_off = search_without_nmp(&italian, 5);
+    let nmp_on = search_with_zero_draws(&italian, 6);
+    let nmp_off = search_without_nmp(&italian, 6);
     assert_eq!(nmp_on.score, nmp_off.score);
     assert!(
         nmp_on.nodes < nmp_off.nodes,
@@ -286,4 +286,26 @@ fn null_move_pruning_reduces_nodes_and_skips_pawn_only_zugzwang() {
     }
     let res = search_with_tt(&italian, 4, &tt);
     assert!(res.best_move.is_some());
+}
+
+#[test]
+fn reverse_futility_pruning_reduces_nodes_and_skips_pawn_only_endgames() {
+    let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+    let rfp_on = search_with_zero_draws(&kiwipete, 5);
+    let rfp_off = search_without_rfp(&kiwipete, 5);
+    assert_eq!(rfp_on.best_move, rfp_off.best_move);
+    assert!(
+        rfp_on.nodes < rfp_off.nodes,
+        "RFP should reduce nodes in the same selective engine ({} vs {})",
+        rfp_on.nodes,
+        rfp_off.nodes
+    );
+
+    // Pawn-only endgame with a 1-pawn lead: non_pawn_count == 0 disables RFP.
+    let kp_lead = Board::from_fen("8/8/8/2k5/3pP3/5K2/6P1/8 w - - 0 1").unwrap();
+    let kp_on = search_with_zero_draws(&kp_lead, 4);
+    let kp_off = search_without_rfp(&kp_lead, 4);
+    assert_eq!(kp_on.best_move, kp_off.best_move);
+    assert_eq!(kp_on.score, kp_off.score);
+    assert_eq!(kp_on.nodes, kp_off.nodes);
 }
