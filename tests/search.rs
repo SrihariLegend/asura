@@ -2,8 +2,9 @@ use asura::{
     board::Board,
     movepick::{MainMovePicker, MainStage},
     search::{
-        lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws, search_without_lmp,
-        search_without_lmr, search_without_nmp, search_without_probcut, search_without_rfp, search_without_see_pruning,
+        lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws, search_without_fp,
+        search_without_lmp, search_without_lmr, search_without_nmp, search_without_probcut, search_without_rfp,
+        search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -378,4 +379,34 @@ fn late_move_pruning_closes_quiet_stage_and_reduces_nodes() {
         lmp_on.nodes,
         lmp_off.nodes
     );
+}
+
+#[test]
+fn main_loop_futility_pruning_reduces_nodes_and_exempts_direct_checks() {
+    let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+    let fp_on = search_with_zero_draws(&kiwipete, 6);
+    let fp_off = search_without_fp(&kiwipete, 6);
+    assert_eq!(fp_on.best_move, fp_off.best_move);
+    assert!(
+        fp_on.nodes < fp_off.nodes,
+        "Futility pruning should reduce nodes in the same selective engine ({} vs {})",
+        fp_on.nodes,
+        fp_off.nodes
+    );
+
+    // Surgical check-exemption test: in this position White is down 1100 cp
+    // and at depths 1-2 selects e6e1 (-1100). At depth 3, the sacrifice
+    // 1. Re6xe7+ (BadNoisy, !PV) 1...Kxe7 reaches ply 2 (depth = 1, !PV) with
+    // static_eval = -1500 and alpha = -1100 (so static_eval + margin <= alpha
+    // activates FP after 2. fxg6 sets best_score = -1400 > -MATE_THRESHOLD).
+    // The quiet direct check 2. Nc3-d5+ (clearing c3 for 2...Ke8 3. Ra3-e3#)
+    // is saved from FP solely by !board.is_direct_check(mv), finding mate (+31_995).
+    let check_mate = Board::from_fen("nr1rkr2/pp1ppp2/3pR1p1/5P2/8/R1N5/8/7K w - - 0 1").unwrap();
+    let d2 = search_with_zero_draws(&check_mate, 2);
+    let cf_on = search_with_zero_draws(&check_mate, 3);
+    let cf_off = search_without_fp(&check_mate, 3);
+    assert_eq!(d2.score, -1_100);
+    assert_eq!(cf_on.best_move.unwrap().to_uci(&check_mate), "e6e7");
+    assert_eq!(cf_on.score, 31_995);
+    assert_eq!(cf_on.score, cf_off.score);
 }

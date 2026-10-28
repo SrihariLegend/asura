@@ -70,6 +70,28 @@ const SEE_QUIET_QUAD_COEFF: i32 = -20;
 const SEE_NOISY_DEPTH_COEFF: i32 = -90;
 const SEE_NOISY_HIST_DIV: i32 = 100;
 
+// Main-loop Futility Pruning constants on the 100 = 1 pawn / 10_000 = MAX_HISTORY scale.
+const FP_MAX_DEPTH: i32 = 6;
+const FP_BASE_MARGIN: i32 = 80;
+const FP_DEPTH_MARGIN: i32 = 80;
+const FP_HIST_DIV: i32 = 200;
+const FP_HIST_MIN: i32 = -60;
+const FP_HIST_MAX: i32 = 150;
+const FP_MIN_MARGIN: i32 = 50;
+
+// Compile-time search configuration flags.
+const CFG_DRAW_JITTER: u32 = 1 << 0;
+const CFG_SELECTIVE: u32 = 1 << 1;
+const CFG_LMR: u32 = 1 << 2;
+const CFG_NMP: u32 = 1 << 3;
+const CFG_RFP: u32 = 1 << 4;
+const CFG_PROBCUT: u32 = 1 << 5;
+const CFG_SEE: u32 = 1 << 6;
+const CFG_LMP: u32 = 1 << 7;
+const CFG_FP: u32 = 1 << 8;
+const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE | CFG_LMR | CFG_NMP | CFG_RFP | CFG_PROBCUT | CFG_SEE | CFG_LMP | CFG_FP;
+const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
+
 thread_local! {
     static LOCAL_TT: RefCell<TranspositionTable> = RefCell::new(TranspositionTable::new(4));
     static LOCAL_HISTORY: RefCell<HistoryTables> = RefCell::new(HistoryTables::default());
@@ -436,7 +458,7 @@ pub fn search(position: &Board, depth: u8) -> SearchResult {
         LOCAL_HISTORY.with_borrow_mut(|history| {
             tt.clear(1);
             history.clear();
-            run_search::<true, true, true, true, true, true, true, true>(position, depth, Some(tt), Some(history))
+            run_search::<CFG_STANDARD>(position, depth, Some(tt), Some(history))
         })
     })
 }
@@ -445,7 +467,7 @@ pub fn search(position: &Board, depth: u8) -> SearchResult {
 pub fn search_with_tt(position: &Board, depth: u8, tt: &TranspositionTable) -> SearchResult {
     LOCAL_HISTORY.with_borrow_mut(|history| {
         history.clear();
-        run_search::<true, true, true, true, true, true, true, true>(position, depth, Some(tt), Some(history))
+        run_search::<CFG_STANDARD>(position, depth, Some(tt), Some(history))
     })
 }
 
@@ -453,7 +475,7 @@ pub fn search_with_tt(position: &Board, depth: u8, tt: &TranspositionTable) -> S
 pub fn search_with_context(
     position: &Board, depth: u8, tt: &TranspositionTable, history: &mut HistoryTables,
 ) -> SearchResult {
-    run_search::<true, true, true, true, true, true, true, true>(position, depth, Some(tt), Some(history))
+    run_search::<CFG_STANDARD>(position, depth, Some(tt), Some(history))
 }
 
 /// The normal selective search, with recognized draws scored exactly zero.
@@ -462,7 +484,7 @@ pub fn search_with_zero_draws(position: &Board, depth: u8) -> SearchResult {
         LOCAL_HISTORY.with_borrow_mut(|history| {
             tt.clear(1);
             history.clear();
-            run_search::<false, true, true, true, true, true, true, true>(position, depth, Some(tt), Some(history))
+            run_search::<CFG_ALL_SELECTIVE>(position, depth, Some(tt), Some(history))
         })
     })
 }
@@ -473,7 +495,7 @@ pub fn search_without_lmr(position: &Board, depth: u8) -> SearchResult {
         LOCAL_HISTORY.with_borrow_mut(|history| {
             tt.clear(1);
             history.clear();
-            run_search::<false, true, false, true, true, true, true, true>(position, depth, Some(tt), Some(history))
+            run_search::<{ CFG_ALL_SELECTIVE & !CFG_LMR }>(position, depth, Some(tt), Some(history))
         })
     })
 }
@@ -484,7 +506,7 @@ pub fn search_without_nmp(position: &Board, depth: u8) -> SearchResult {
         LOCAL_HISTORY.with_borrow_mut(|history| {
             tt.clear(1);
             history.clear();
-            run_search::<false, true, true, false, true, true, true, true>(position, depth, Some(tt), Some(history))
+            run_search::<{ CFG_ALL_SELECTIVE & !CFG_NMP }>(position, depth, Some(tt), Some(history))
         })
     })
 }
@@ -495,7 +517,7 @@ pub fn search_without_rfp(position: &Board, depth: u8) -> SearchResult {
         LOCAL_HISTORY.with_borrow_mut(|history| {
             tt.clear(1);
             history.clear();
-            run_search::<false, true, true, true, false, true, true, true>(position, depth, Some(tt), Some(history))
+            run_search::<{ CFG_ALL_SELECTIVE & !CFG_RFP }>(position, depth, Some(tt), Some(history))
         })
     })
 }
@@ -506,7 +528,7 @@ pub fn search_without_probcut(position: &Board, depth: u8) -> SearchResult {
         LOCAL_HISTORY.with_borrow_mut(|history| {
             tt.clear(1);
             history.clear();
-            run_search::<false, true, true, true, true, false, true, true>(position, depth, Some(tt), Some(history))
+            run_search::<{ CFG_ALL_SELECTIVE & !CFG_PROBCUT }>(position, depth, Some(tt), Some(history))
         })
     })
 }
@@ -517,7 +539,7 @@ pub fn search_without_see_pruning(position: &Board, depth: u8) -> SearchResult {
         LOCAL_HISTORY.with_borrow_mut(|history| {
             tt.clear(1);
             history.clear();
-            run_search::<false, true, true, true, true, true, false, true>(position, depth, Some(tt), Some(history))
+            run_search::<{ CFG_ALL_SELECTIVE & !CFG_SEE }>(position, depth, Some(tt), Some(history))
         })
     })
 }
@@ -528,27 +550,29 @@ pub fn search_without_lmp(position: &Board, depth: u8) -> SearchResult {
         LOCAL_HISTORY.with_borrow_mut(|history| {
             tt.clear(1);
             history.clear();
-            run_search::<false, true, true, true, true, true, true, false>(position, depth, Some(tt), Some(history))
+            run_search::<{ CFG_ALL_SELECTIVE & !CFG_LMP }>(position, depth, Some(tt), Some(history))
         })
     })
 }
 
-/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP.
-/// Keeps every evasion and capture eligible for independent minimax comparisons.
-pub fn search_reference(position: &Board, depth: u8) -> SearchResult {
-    run_search::<false, false, false, false, false, false, false, false>(position, depth, None, None)
+/// The selective search with main-loop Futility Pruning (FP) disabled and recognized draws scored zero.
+pub fn search_without_fp(position: &Board, depth: u8) -> SearchResult {
+    LOCAL_TT.with_borrow_mut(|tt| {
+        LOCAL_HISTORY.with_borrow_mut(|history| {
+            tt.clear(1);
+            history.clear();
+            run_search::<{ CFG_ALL_SELECTIVE & !CFG_FP }>(position, depth, Some(tt), Some(history))
+        })
+    })
 }
 
-fn run_search<
-    const DRAW_JITTER: bool,
-    const SELECTIVE: bool,
-    const USE_LMR: bool,
-    const USE_NMP: bool,
-    const USE_RFP: bool,
-    const USE_PROBCUT: bool,
-    const USE_SEE: bool,
-    const USE_LMP: bool,
->(
+/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP.
+/// Keeps every evasion and capture eligible for independent minimax comparisons.
+pub fn search_reference(position: &Board, depth: u8) -> SearchResult {
+    run_search::<0>(position, depth, None, None)
+}
+
+fn run_search<const CFG: u32>(
     position: &Board, depth: u8, tt: Option<&TranspositionTable>, mut history: Option<&mut HistoryTables>,
 ) -> SearchResult {
     let mut board = position.clone();
@@ -560,28 +584,28 @@ fn run_search<
         h.prepare_search(&board);
     }
 
-    let (score, best_move) = if !SELECTIVE || depth == 0 {
+    let selective = (CFG & CFG_SELECTIVE) != 0;
+    let (score, best_move) = if !selective || depth == 0 {
         let mut sel_depth = 0;
-        let (score, best_move) =
-            search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, USE_LMP, true>(
-                &mut board,
-                &mut stack,
-                depth,
-                0,
-                0,
-                None,
-                Move::NULL,
-                false,
-                TtDepth::NONE_SCORE,
-                0,
-                -INFINITY,
-                INFINITY,
-                &mut pv,
-                &mut nodes,
-                &mut sel_depth,
-                tt,
-                history,
-            );
+        let (score, best_move) = search_node::<CFG, true>(
+            &mut board,
+            &mut stack,
+            depth,
+            0,
+            0,
+            None,
+            Move::NULL,
+            false,
+            TtDepth::NONE_SCORE,
+            0,
+            -INFINITY,
+            INFINITY,
+            &mut pv,
+            &mut nodes,
+            &mut sel_depth,
+            tt,
+            history,
+        );
         if let Some(mv) = best_move
             && pv.len == 0
         {
@@ -589,42 +613,27 @@ fn run_search<
         }
         (score, best_move)
     } else {
-        run_iterative_search::<DRAW_JITTER, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, USE_LMP>(
-            &mut board,
-            &mut stack,
-            depth,
-            &mut nodes,
-            &mut pv,
-            tt.unwrap(),
-            history.unwrap(),
-        )
+        run_iterative_search::<CFG>(&mut board, &mut stack, depth, &mut nodes, &mut pv, tt.unwrap(), history.unwrap())
     };
 
     debug_assert!(board == *position, "search did not undo every move");
     SearchResult { best_move, score, nodes, pv }
 }
 
-fn run_iterative_search<
-    const DRAW_JITTER: bool,
-    const USE_LMR: bool,
-    const USE_NMP: bool,
-    const USE_RFP: bool,
-    const USE_PROBCUT: bool,
-    const USE_SEE: bool,
-    const USE_LMP: bool,
->(
+fn run_iterative_search<const CFG: u32>(
     board: &mut Board, stack: &mut SearchStack, max_depth: u8, nodes: &mut u64, pv: &mut PvLine,
     tt: &TranspositionTable, history: &mut HistoryTables,
 ) -> (i32, Option<Move>) {
+    let draw_jitter = (CFG & CFG_DRAW_JITTER) != 0;
     let mut root_moves = RootMoves::new(board);
     if root_moves.is_empty() {
-        let score = if board.in_check() { -MATE_SCORE } else { draw_score::<DRAW_JITTER>(*nodes) };
+        let score = if board.in_check() { -MATE_SCORE } else { draw_score(draw_jitter, *nodes) };
         return (score, None);
     }
     if board.is_draw(0) {
         let mv = root_moves.at(0).mv;
         pv.update(mv, &PvLine::new());
-        return (draw_score::<DRAW_JITTER>(*nodes), Some(mv));
+        return (draw_score(draw_jitter, *nodes), Some(mv));
     }
 
     let mut eval_stability: i32 = 0;
@@ -649,7 +658,7 @@ fn run_iterative_search<
         loop {
             *stack = SearchStack::default();
             let root_effective_depth = aspiration_depth.max(1);
-            let score = search_root::<DRAW_JITTER, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, USE_LMP>(
+            let score = search_root::<CFG>(
                 board,
                 stack,
                 window.alpha,
@@ -724,15 +733,7 @@ fn run_iterative_search<
 }
 
 #[allow(clippy::too_many_arguments)]
-fn search_root<
-    const DRAW_JITTER: bool,
-    const USE_LMR: bool,
-    const USE_NMP: bool,
-    const USE_RFP: bool,
-    const USE_PROBCUT: bool,
-    const USE_SEE: bool,
-    const USE_LMP: bool,
->(
+fn search_root<const CFG: u32>(
     board: &mut Board, stack: &mut SearchStack, mut alpha: i32, beta: i32, root_effective_depth: u8, pv_idx: usize,
     work_item: Move, root_moves: &mut RootMoves, nodes: &mut u64, tt: &TranspositionTable, history: &mut HistoryTables,
 ) -> i32 {
@@ -803,9 +804,10 @@ fn search_root<
         make_move(board, mv, nodes, Some(tt));
         let gives_check = board.in_check();
 
+        let use_lmr = (CFG & CFG_LMR) != 0;
         let score = if move_count == 1 {
             stack.entries[0].reduction = 0;
-            -search_node::<DRAW_JITTER, true, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, USE_LMP, true>(
+            -search_node::<CFG, true>(
                 board,
                 stack,
                 child_depth,
@@ -829,7 +831,7 @@ fn search_root<
             // At PV/Root nodes, LMR applies only to quiet moves.
             let mut reduced_depth = child_depth;
             let mut quotient = 0;
-            if USE_LMR && is_quiet && root_effective_depth >= 2 && child_depth >= 1 {
+            if use_lmr && is_quiet && root_effective_depth >= 2 && child_depth >= 1 {
                 let mut raw_reduction = lmr_table_term(root_effective_depth, move_count) + node_bias
                     - hist / 10
                     - LMR_CHECK_BONUS * gives_check as i32
@@ -846,27 +848,26 @@ fn search_root<
 
             let mut scout_pv = PvLine::new();
             stack.entries[0].reduction = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
-            let mut scout =
-                -search_node::<DRAW_JITTER, true, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, USE_LMP, false>(
-                    board,
-                    stack,
-                    reduced_depth,
-                    1,
-                    1,
-                    Some(mv.to()),
-                    mv,
-                    true,
-                    raw_eval,
-                    move_count,
-                    -alpha - 1,
-                    -alpha,
-                    &mut scout_pv,
-                    nodes,
-                    &mut sel_depth,
-                    Some(tt),
-                    Some(history),
-                )
-                .0;
+            let mut scout = -search_node::<CFG, false>(
+                board,
+                stack,
+                reduced_depth,
+                1,
+                1,
+                Some(mv.to()),
+                mv,
+                true,
+                raw_eval,
+                move_count,
+                -alpha - 1,
+                -alpha,
+                &mut scout_pv,
+                nodes,
+                &mut sel_depth,
+                Some(tt),
+                Some(history),
+            )
+            .0;
             stack.entries[0].reduction = 0;
 
             let mut retry_depth = child_depth;
@@ -877,17 +878,7 @@ fn search_root<
                 }
                 if retry_depth > reduced_depth {
                     stack.entries[0].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
-                    scout = -search_node::<
-                        DRAW_JITTER,
-                        true,
-                        USE_LMR,
-                        USE_NMP,
-                        USE_RFP,
-                        USE_PROBCUT,
-                        USE_SEE,
-                        USE_LMP,
-                        false,
-                    >(
+                    scout = -search_node::<CFG, false>(
                         board,
                         stack,
                         retry_depth,
@@ -913,27 +904,26 @@ fn search_root<
 
             if scout > alpha && beta > alpha + 1 {
                 stack.entries[0].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
-                let res =
-                    -search_node::<DRAW_JITTER, true, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, USE_LMP, true>(
-                        board,
-                        stack,
-                        retry_depth,
-                        1,
-                        0,
-                        Some(mv.to()),
-                        mv,
-                        false,
-                        raw_eval,
-                        move_count,
-                        -beta,
-                        -alpha,
-                        &mut child_pv,
-                        nodes,
-                        &mut sel_depth,
-                        Some(tt),
-                        Some(history),
-                    )
-                    .0;
+                let res = -search_node::<CFG, true>(
+                    board,
+                    stack,
+                    retry_depth,
+                    1,
+                    0,
+                    Some(mv.to()),
+                    mv,
+                    false,
+                    raw_eval,
+                    move_count,
+                    -beta,
+                    -alpha,
+                    &mut child_pv,
+                    nodes,
+                    &mut sel_depth,
+                    Some(tt),
+                    Some(history),
+                )
+                .0;
                 stack.entries[0].reduction = 0;
                 res
             } else {
@@ -1007,22 +997,22 @@ fn search_root<
 }
 
 #[allow(clippy::too_many_arguments)]
-fn search_node<
-    const DRAW_JITTER: bool,
-    const SELECTIVE: bool,
-    const USE_LMR: bool,
-    const USE_NMP: bool,
-    const USE_RFP: bool,
-    const USE_PROBCUT: bool,
-    const USE_SEE: bool,
-    const USE_LMP: bool,
-    const PV: bool,
->(
+fn search_node<const CFG: u32, const PV: bool>(
     board: &mut Board, stack: &mut SearchStack, depth: u8, ply: u16, last_critical_ply: u16, previous: Option<Square>,
     prior_move: Move, cut_node: bool, parent_eval: i32, parent_move_count: usize, mut alpha: i32, beta: i32,
     pv: &mut PvLine, nodes: &mut u64, sel_depth: &mut u16, tt: Option<&TranspositionTable>,
     mut history: Option<&mut HistoryTables>,
 ) -> (i32, Option<Move>) {
+    let draw_jitter = (CFG & CFG_DRAW_JITTER) != 0;
+    let selective = (CFG & CFG_SELECTIVE) != 0;
+    let use_lmr = (CFG & CFG_LMR) != 0;
+    let use_nmp = (CFG & CFG_NMP) != 0;
+    let use_rfp = (CFG & CFG_RFP) != 0;
+    let use_probcut = (CFG & CFG_PROBCUT) != 0;
+    let use_see = (CFG & CFG_SEE) != 0;
+    let use_lmp = (CFG & CFG_LMP) != 0;
+    let use_fp = (CFG & CFG_FP) != 0;
+
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     if PV {
         pv.clear();
@@ -1031,18 +1021,13 @@ fn search_node<
 
     if depth == 0 {
         if ply == 0 && !board.has_legal_moves() {
-            let score = if board.in_check() { -MATE_SCORE } else { draw_score::<DRAW_JITTER>(*nodes) };
+            let score = if board.in_check() { -MATE_SCORE } else { draw_score(draw_jitter, *nodes) };
             return (score, None);
         }
-        return (
-            quiescence::<DRAW_JITTER, SELECTIVE, PV>(
-                board, 0, ply, previous, alpha, beta, nodes, sel_depth, tt, history,
-            ),
-            None,
-        );
+        return (quiescence::<CFG, PV>(board, 0, ply, previous, alpha, beta, nodes, sel_depth, tt, history), None);
     }
 
-    let draw = draw_score::<DRAW_JITTER>(*nodes);
+    let draw = draw_score(draw_jitter, *nodes);
     if ply > 0 && alpha < draw && board.upcoming_repetition(ply as usize) {
         alpha = draw;
         if alpha >= beta {
@@ -1068,7 +1053,7 @@ fn search_node<
 
     let ply_idx = ply as usize;
     let hash = board.hash();
-    let entry = if SELECTIVE { tt.and_then(|t| t.read(hash, board.fiftymove_clock(), ply as isize)) } else { None };
+    let entry = if selective { tt.and_then(|t| t.read(hash, board.fiftymove_clock(), ply as isize)) } else { None };
     let mut tt_move = Move::NULL;
     let mut tt_pv = PV;
 
@@ -1119,7 +1104,7 @@ fn search_node<
         entry.raw_eval
     } else {
         let ev = evaluate(board);
-        if SELECTIVE
+        if selective
             && entry.is_none()
             && let Some(t) = tt
         {
@@ -1145,7 +1130,7 @@ fn search_node<
     }
 
     // Parent-move quiet history update from static-eval surprise.
-    if SELECTIVE
+    if selective
         && ply > 0
         && !in_check
         && prior_move.is_quiet()
@@ -1171,8 +1156,8 @@ fn search_node<
     let parent_laterality = if ply_idx > 0 { stack.entries[ply_idx - 1].laterality } else { 0 };
 
     // Reverse Futility Pruning (RFP)
-    if SELECTIVE
-        && USE_RFP
+    if selective
+        && use_rfp
         && !tt_pv
         && !in_check
         && depth <= RFP_MAX_DEPTH
@@ -1196,8 +1181,8 @@ fn search_node<
     }
 
     // Null Move Pruning (NMP)
-    if SELECTIVE
-        && USE_NMP
+    if selective
+        && use_nmp
         && !PV
         && !in_check
         && prior_move.is_present()
@@ -1240,17 +1225,7 @@ fn search_node<
             }
 
             let mut null_pv = PvLine::new();
-            let null_score = -search_node::<
-                DRAW_JITTER,
-                SELECTIVE,
-                USE_LMR,
-                USE_NMP,
-                USE_RFP,
-                USE_PROBCUT,
-                USE_SEE,
-                USE_LMP,
-                false,
-            >(
+            let null_score = -search_node::<CFG, false>(
                 board,
                 stack,
                 null_depth,
@@ -1281,17 +1256,7 @@ fn search_node<
 
                 stack.nmp_min_ply = ply + 3 * u16::from(null_depth) / 4;
                 let mut verify_pv = PvLine::new();
-                let verified_score = search_node::<
-                    DRAW_JITTER,
-                    SELECTIVE,
-                    USE_LMR,
-                    USE_NMP,
-                    USE_RFP,
-                    USE_PROBCUT,
-                    USE_SEE,
-                    USE_LMP,
-                    false,
-                >(
+                let verified_score = search_node::<CFG, false>(
                     board,
                     stack,
                     null_depth,
@@ -1321,8 +1286,8 @@ fn search_node<
     }
 
     // ProbCut
-    if SELECTIVE
-        && USE_PROBCUT
+    if selective
+        && use_probcut
         && cut_node
         && !in_check
         && depth >= PROBCUT_MIN_DEPTH
@@ -1356,7 +1321,7 @@ fn search_node<
 
                 make_move(board, mv, nodes, tt);
 
-                let mut score = -quiescence::<DRAW_JITTER, SELECTIVE, false>(
+                let mut score = -quiescence::<CFG, false>(
                     board,
                     0,
                     ply + 1,
@@ -1371,17 +1336,7 @@ fn search_node<
 
                 if score >= prob_beta {
                     let mut prob_pv = PvLine::new();
-                    score = -search_node::<
-                        DRAW_JITTER,
-                        SELECTIVE,
-                        USE_LMR,
-                        USE_NMP,
-                        USE_RFP,
-                        USE_PROBCUT,
-                        USE_SEE,
-                        USE_LMP,
-                        false,
-                    >(
+                    score = -search_node::<CFG, false>(
                         board,
                         stack,
                         prob_depth,
@@ -1445,7 +1400,7 @@ fn search_node<
     let mut noisy_len = 0usize;
 
     let mut skip_quiets = false;
-    let mut picker = MainMovePicker::new(if SELECTIVE { tt_move } else { Move::NULL }, false, killers, countermove);
+    let mut picker = MainMovePicker::new(if selective { tt_move } else { Move::NULL }, false, killers, countermove);
     while let Some(mv) = picker.next(board, history.as_deref(), skip_quiets, ply_idx) {
         let emitted_stage = picker.emitted_stage();
         move_count += 1;
@@ -1455,7 +1410,7 @@ fn search_node<
 
         let moved_piece = board.moved_piece(mv);
         let is_quiet = mv.is_quiet();
-        let creates_threat = SELECTIVE && is_quiet && creates_threat_on_board(board, mv);
+        let creates_threat = selective && is_quiet && creates_threat_on_board(board, mv);
         let hist = if let Some(h) = history.as_deref() {
             if is_quiet {
                 h.quiet_history.get(board.all_threats(), creates_threat, board.side_to_move(), mv)
@@ -1471,8 +1426,8 @@ fn search_node<
         // Late Move Pruning (LMP): once enough moves have been considered at
         // this depth, close the quiet stages so subsequent quiet moves are skipped
         // while keeping the current move and remaining noisy moves eligible.
-        if SELECTIVE
-            && USE_LMP
+        if selective
+            && use_lmp
             && !PV
             && ply > 0
             && !in_check
@@ -1484,9 +1439,32 @@ fn search_node<
             skip_quiets = true;
         }
 
+        // Main-loop Futility Pruning (FP): skip individual non-checking quiet
+        // moves at shallow LMR-adjusted depths when static_eval plus a strictly
+        // positive margin cannot reach alpha.
+        if selective
+            && use_fp
+            && !PV
+            && ply > 0
+            && !in_check
+            && is_quiet
+            && best_score > -MATE_THRESHOLD
+            && !is_decisive(alpha)
+        {
+            let lmr_plies = lmr_table_term(depth, move_count) / LMR_SCALE;
+            let fp_depth = (depth as i32 - lmr_plies).max(0);
+            if fp_depth <= FP_MAX_DEPTH && !board.is_direct_check(mv) {
+                let hist_adj = (hist / FP_HIST_DIV).clamp(FP_HIST_MIN, FP_HIST_MAX);
+                let margin = (FP_BASE_MARGIN + FP_DEPTH_MARGIN * fp_depth + hist_adj).max(FP_MIN_MARGIN);
+                if static_eval + margin <= alpha {
+                    continue;
+                }
+            }
+        }
+
         // Main-loop SEE pruning: skip quiet or noisy moves at shallow depths
         // whose static exchange loss exceeds a depth- and history-scaled margin.
-        if SELECTIVE && USE_SEE && ply > 0 && !in_check && best_score > -MATE_THRESHOLD {
+        if selective && use_see && ply > 0 && !in_check && best_score > -MATE_THRESHOLD {
             let cut_shift = usize::from(!PV && cut_node);
             let threshold = if is_quiet {
                 let lmr_plies = lmr_table_term(depth, move_count) / LMR_SCALE;
@@ -1512,9 +1490,9 @@ fn search_node<
         let gives_check = board.in_check();
         let child_depth = depth - 1;
 
-        let score = if !SELECTIVE || move_count == 1 {
+        let score = if !selective || move_count == 1 {
             stack.entries[ply_idx].reduction = 0;
-            -search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, USE_LMP, PV>(
+            -search_node::<CFG, PV>(
                 board,
                 stack,
                 child_depth,
@@ -1535,7 +1513,7 @@ fn search_node<
             )
             .0
         } else {
-            let lmr_eligible = USE_LMR && depth >= 2 && (is_quiet || !PV);
+            let lmr_eligible = use_lmr && depth >= 2 && (is_quiet || !PV);
             let mut reduced_depth = child_depth;
             let mut quotient = 0;
 
@@ -1568,17 +1546,7 @@ fn search_node<
 
             let mut scout_pv = PvLine::new();
             stack.entries[ply_idx].reduction = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
-            let mut scout = -search_node::<
-                DRAW_JITTER,
-                SELECTIVE,
-                USE_LMR,
-                USE_NMP,
-                USE_RFP,
-                USE_PROBCUT,
-                USE_SEE,
-                USE_LMP,
-                false,
-            >(
+            let mut scout = -search_node::<CFG, false>(
                 board,
                 stack,
                 reduced_depth,
@@ -1613,17 +1581,7 @@ fn search_node<
                 retry_depth = plan_scout_retry(best_score, scout, child_depth, reduced_depth);
                 if retry_depth > reduced_depth {
                     stack.entries[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
-                    scout = -search_node::<
-                        DRAW_JITTER,
-                        SELECTIVE,
-                        USE_LMR,
-                        USE_NMP,
-                        USE_RFP,
-                        USE_PROBCUT,
-                        USE_SEE,
-                        USE_LMP,
-                        false,
-                    >(
+                    scout = -search_node::<CFG, false>(
                         board,
                         stack,
                         retry_depth,
@@ -1649,17 +1607,7 @@ fn search_node<
 
             if PV && scout > alpha && beta > alpha + 1 {
                 stack.entries[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
-                let res = -search_node::<
-                    DRAW_JITTER,
-                    SELECTIVE,
-                    USE_LMR,
-                    USE_NMP,
-                    USE_RFP,
-                    USE_PROBCUT,
-                    USE_SEE,
-                    USE_LMP,
-                    true,
-                >(
+                let res = -search_node::<CFG, true>(
                     board,
                     stack,
                     retry_depth,
@@ -1701,7 +1649,7 @@ fn search_node<
                     break;
                 }
                 alpha = score;
-                if SELECTIVE
+                if selective
                     && PV
                     && mv != tt_move
                     && let Some(t) = tt
@@ -1723,11 +1671,11 @@ fn search_node<
     }
 
     if move_count == 0 {
-        let score = if in_check { -MATE_SCORE + i32::from(ply) } else { draw_score::<DRAW_JITTER>(*nodes) };
+        let score = if in_check { -MATE_SCORE + i32::from(ply) } else { draw_score(draw_jitter, *nodes) };
         return (score, None);
     }
 
-    if SELECTIVE && let Some(h) = history {
+    if selective && let Some(h) = history {
         if best_score >= beta
             && let Some(best_mv) = best_move
         {
@@ -1784,7 +1732,7 @@ fn search_node<
 
     tt_pv |= ply > 0 && bound == Bound::Upper && move_count > 2;
 
-    if SELECTIVE && let Some(t) = tt {
+    if selective && let Some(t) = tt {
         let store_mv = if bound == Bound::Upper { Move::NULL } else { best_move.unwrap_or(Move::NULL) };
         let store_depth = (depth as i32 - i32::from(bound == Bound::Lower)).max(1);
         t.write(hash, store_depth, raw_eval, best_score, bound, store_mv, ply as isize, tt_pv, PV);
@@ -1860,14 +1808,16 @@ fn update_histories_on_best_move(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
+fn quiescence<const CFG: u32, const PV: bool>(
     board: &mut Board, q_depth: i16, ply: u16, previous: Option<Square>, mut alpha: i32, beta: i32, nodes: &mut u64,
     sel_depth: &mut u16, tt: Option<&TranspositionTable>, mut history: Option<&mut HistoryTables>,
 ) -> i32 {
+    let draw_jitter = (CFG & CFG_DRAW_JITTER) != 0;
+    let selective = (CFG & CFG_SELECTIVE) != 0;
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     debug_assert!(ply <= MAX_PLY && q_depth <= 0);
     *sel_depth = (*sel_depth).max(ply);
-    let draw = draw_score::<DRAW_JITTER>(*nodes);
+    let draw = draw_score(draw_jitter, *nodes);
     if ply > 0 && alpha < draw && board.upcoming_repetition(ply as usize) {
         alpha = draw;
         if alpha >= beta {
@@ -1886,7 +1836,7 @@ fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
 
     let hash = board.hash();
     let tt_depth = i32::from(q_depth.max(RECAPTURE_ONLY_DEPTH));
-    let entry = if SELECTIVE { tt.and_then(|t| t.read(hash, board.fiftymove_clock(), ply as isize)) } else { None };
+    let entry = if selective { tt.and_then(|t| t.read(hash, board.fiftymove_clock(), ply as isize)) } else { None };
     let mut tt_move = Move::NULL;
     let mut tt_pv = PV;
 
@@ -1918,7 +1868,7 @@ fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
             Some(entry) if entry.raw_eval != TtDepth::NONE_SCORE => entry.raw_eval,
             _ => {
                 let ev = evaluate(board);
-                if SELECTIVE
+                if selective
                     && entry.is_none()
                     && let Some(t) = tt
                 {
@@ -1955,7 +1905,7 @@ fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
     }
 
     if best_score >= beta {
-        if SELECTIVE
+        if selective
             && entry.is_none()
             && let Some(t) = tt
         {
@@ -1966,12 +1916,12 @@ fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
     alpha = alpha.max(best_score);
 
     let mut best_move = Move::NULL;
-    let mut picker = QuiescenceMovePicker::new(if SELECTIVE { tt_move } else { Move::NULL }, in_check, q_depth >= -1);
+    let mut picker = QuiescenceMovePicker::new(if selective { tt_move } else { Move::NULL }, in_check, q_depth >= -1);
     while let Some(mv) =
-        picker.next(board, history.as_deref(), SELECTIVE && in_check && best_score > -MATE_THRESHOLD, ply as usize)
+        picker.next(board, history.as_deref(), selective && in_check && best_score > -MATE_THRESHOLD, ply as usize)
     {
         let recapture = mv.is_capture() && previous == Some(mv.capture_sq());
-        if SELECTIVE
+        if selective
             && !in_check
             && q_depth <= RECAPTURE_ONLY_DEPTH
             && best_score > -MATE_THRESHOLD
@@ -1986,7 +1936,7 @@ fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
             h.continuation_history.remember(ply as usize, in_check, mv, moved_piece);
         }
         make_move(board, mv, nodes, tt);
-        let score = -quiescence::<DRAW_JITTER, SELECTIVE, PV>(
+        let score = -quiescence::<CFG, PV>(
             board,
             q_depth - 1,
             ply + 1,
@@ -2015,7 +1965,7 @@ fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
         return -MATE_SCORE + i32::from(ply);
     }
 
-    if SELECTIVE
+    if selective
         && best_score >= beta
         && best_move.is_noisy()
         && let Some(h) = history
@@ -2029,7 +1979,7 @@ fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
         );
     }
 
-    if SELECTIVE && let Some(t) = tt {
+    if selective && let Some(t) = tt {
         let bound = if best_score >= beta { Bound::Lower } else { Bound::Upper };
         t.write(hash, tt_depth, raw_eval, best_score, bound, best_move, ply as isize, tt_pv, false);
     }
@@ -2056,6 +2006,6 @@ fn undo_move(board: &mut Board, mv: Move) {
     board.undo_move(mv);
 }
 
-fn draw_score<const DRAW_JITTER: bool>(nodes: u64) -> i32 {
-    if DRAW_JITTER { (nodes % 5) as i32 - 2 } else { 0 }
+const fn draw_score(draw_jitter: bool, nodes: u64) -> i32 {
+    if draw_jitter { (nodes % 5) as i32 - 2 } else { 0 }
 }
