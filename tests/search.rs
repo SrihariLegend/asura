@@ -2,8 +2,8 @@ use asura::{
     board::Board,
     movepick::{MainMovePicker, MainStage},
     search::{
-        lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws, search_without_lmr,
-        search_without_nmp, search_without_probcut, search_without_rfp, search_without_see_pruning,
+        lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws, search_without_lmp,
+        search_without_lmr, search_without_nmp, search_without_probcut, search_without_rfp, search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -363,5 +363,19 @@ fn main_loop_see_pruning_reduces_nodes_and_preserves_tactics() {
         "Main-loop SEE pruning should reduce nodes in the same selective engine ({} vs {})",
         see_on.nodes,
         see_off.nodes
+    );
+}
+
+#[test]
+fn late_move_pruning_closes_quiet_stage_and_reduces_nodes() {
+    let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+    let lmp_on = search_with_zero_draws(&kiwipete, 5);
+    let lmp_off = search_without_lmp(&kiwipete, 5);
+    assert_eq!(lmp_on.best_move, lmp_off.best_move);
+    assert!(
+        lmp_on.nodes < lmp_off.nodes,
+        "LMP should reduce nodes in the same selective engine ({} vs {})",
+        lmp_on.nodes,
+        lmp_off.nodes
     );
 }
