@@ -21,11 +21,12 @@ fn exchange(commands: &str) -> String {
 
 #[test]
 fn handshake_only_advertises_implemented_options() {
-    let output = exchange("uci\nisready\nquit\n");
+    let output = exchange("uci\nsetoption name Hash value 4\nsetoption name Clear Hash\nisready\nquit\n");
     assert!(output.starts_with(&format!("id name Asura {}\n", env!("CARGO_PKG_VERSION"))));
+    assert!(output.contains("option name Hash type spin default 16 min 1 max 262144\n"));
+    assert!(output.contains("option name Clear Hash type button\n"));
     assert!(output.contains("option name UCI_Chess960 type check default false\n"));
     assert!(output.ends_with("uciok\nreadyok\n"));
-    assert!(!output.contains("name Hash"));
     assert!(!output.contains("name Threads"));
 }
 

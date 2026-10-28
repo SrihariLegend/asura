@@ -73,9 +73,34 @@ impl Board {
         Color::new((self.halfmove_number & 1) as u8)
     }
 
-    /// Position key, excluding move counters and any search-specific adjustments.
+    pub fn fiftymove_clock_bucket(&self) -> usize {
+        (self.fiftymove_clock().saturating_sub(8) as usize / 8).min(15)
+    }
+
     pub fn hash(&self) -> u64 {
-        self.state.keys.full()
+        self.state.keys.full() ^ ZOBRIST.fiftymove_clock[self.fiftymove_clock_bucket()]
+    }
+
+    pub fn key_after(&self, mv: Move) -> u64 {
+        let from = mv.from();
+        let to = mv.to();
+        let piece = self.piece_on(from);
+        let captured = self.piece_on(to);
+
+        let mut key = self.state.keys.full() ^ ZOBRIST.side ^ ZOBRIST.pieces[piece][from] ^ ZOBRIST.pieces[piece][to];
+
+        if captured != Piece::None {
+            key ^= ZOBRIST.pieces[captured][to];
+        }
+
+        let fiftymove_clock = if captured != Piece::None || piece.piece_type() == PieceType::Pawn {
+            0
+        } else {
+            self.fiftymove_clock().saturating_add(1)
+        };
+        let bucket = (fiftymove_clock.saturating_sub(8) as usize / 8).min(15);
+
+        key ^ ZOBRIST.fiftymove_clock[bucket]
     }
 
     pub const fn pawn_key(&self) -> u64 {

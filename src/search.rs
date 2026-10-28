@@ -2,14 +2,15 @@ use crate::{
     board::Board,
     evaluation::evaluate,
     movepick::{MainMovePicker, QuiescenceMovePicker},
+    transposition::{Bound, TranspositionTable, TtDepth},
     types::{Move, Square},
 };
 
-pub(crate) const MATE_SCORE: i32 = 32_000;
+pub const MATE_SCORE: i32 = 32_000;
 const MAX_PLY: u16 = 256;
 const MAX_PLY_USIZE: usize = MAX_PLY as usize;
 const RECAPTURE_ONLY_DEPTH: i16 = -4;
-pub(crate) const MATE_THRESHOLD: i32 = MATE_SCORE - MAX_PLY as i32;
+pub const MATE_THRESHOLD: i32 = MATE_SCORE - MAX_PLY as i32;
 const INFINITY: i32 = MATE_SCORE + 1;
 
 // Centipawn-scale (100 = 1 pawn) aspiration constants using power-of-10 ratios.
@@ -23,6 +24,12 @@ const ASPIRATION_FAIL_HIGH_WIDEN_NUM: i32 = 50;
 const ASPIRATION_RATIO_DEN: i32 = 100;
 const ASPIRATION_INFINITE_BOUND: i32 = 1_000;
 const EVAL_STABILITY_THRESHOLD: i32 = 10;
+
+use std::cell::RefCell;
+
+thread_local! {
+    static LOCAL_TT: RefCell<TranspositionTable> = RefCell::new(TranspositionTable::new(4));
+}
 
 /// Fixed-capacity principal variation buffer stored on the stack without heap allocation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -278,25 +285,37 @@ impl RootMoves {
 }
 
 /// Iterative-deepening, single-threaded alpha-beta search with aspiration
-/// windows, dedicated root search, principal variation search, and hybrid
-/// quiescence leaves.
+/// windows, dedicated root search, principal variation search, transposition
+/// table, and hybrid quiescence leaves.
 pub fn search(position: &Board, depth: u8) -> SearchResult {
-    run_search::<true, true>(position, depth)
+    LOCAL_TT.with_borrow_mut(|tt| {
+        tt.clear(1);
+        run_search::<true, true>(position, depth, Some(tt))
+    })
+}
+
+/// Search using a caller-supplied transposition table (e.g. persistent across UCI moves).
+pub fn search_with_tt(position: &Board, depth: u8, tt: &TranspositionTable) -> SearchResult {
+    run_search::<true, true>(position, depth, Some(tt))
 }
 
 /// The normal selective search, with recognized draws scored exactly zero.
 pub fn search_with_zero_draws(position: &Board, depth: u8) -> SearchResult {
-    run_search::<false, true>(position, depth)
+    LOCAL_TT.with_borrow_mut(|tt| {
+        tt.clear(1);
+        run_search::<false, true>(position, depth, Some(tt))
+    })
 }
 
-/// Diagnostic search with zero draw scores and no selective QS pruning.
+/// Diagnostic search with zero draw scores and no selective QS pruning or TT cutoffs.
 /// Keeps every evasion and capture eligible for independent minimax comparisons.
-/// Alpha-beta cutoffs, the shallow quiet-check budget and maximum ply still apply.
 pub fn search_reference(position: &Board, depth: u8) -> SearchResult {
-    run_search::<false, false>(position, depth)
+    run_search::<false, false>(position, depth, None)
 }
 
-fn run_search<const DRAW_JITTER: bool, const SELECTIVE: bool>(position: &Board, depth: u8) -> SearchResult {
+fn run_search<const DRAW_JITTER: bool, const SELECTIVE: bool>(
+    position: &Board, depth: u8, tt: Option<&TranspositionTable>,
+) -> SearchResult {
     let mut board = position.clone();
     let mut nodes = 0;
     let mut pv = PvLine::new();
@@ -313,6 +332,7 @@ fn run_search<const DRAW_JITTER: bool, const SELECTIVE: bool>(position: &Board, 
             &mut pv,
             &mut nodes,
             &mut sel_depth,
+            tt,
         );
         if let Some(mv) = best_move
             && pv.len == 0
@@ -321,7 +341,7 @@ fn run_search<const DRAW_JITTER: bool, const SELECTIVE: bool>(position: &Board, 
         }
         (score, best_move)
     } else {
-        run_iterative_search::<DRAW_JITTER>(&mut board, depth, &mut nodes, &mut pv)
+        run_iterative_search::<DRAW_JITTER>(&mut board, depth, &mut nodes, &mut pv, tt.unwrap())
     };
 
     debug_assert!(board == *position, "search did not undo every move");
@@ -329,7 +349,7 @@ fn run_search<const DRAW_JITTER: bool, const SELECTIVE: bool>(position: &Board, 
 }
 
 fn run_iterative_search<const DRAW_JITTER: bool>(
-    board: &mut Board, max_depth: u8, nodes: &mut u64, pv: &mut PvLine,
+    board: &mut Board, max_depth: u8, nodes: &mut u64, pv: &mut PvLine, tt: &TranspositionTable,
 ) -> (i32, Option<Move>) {
     let mut root_moves = RootMoves::new(board);
     if root_moves.is_empty() {
@@ -353,6 +373,7 @@ fn run_iterative_search<const DRAW_JITTER: bool>(
         let pv_idx = 0;
         let prev_score = root_moves.aspiration_previous_score(pv_idx);
         let mut window = AspirationWindow::new(step, prev_score, eval_stability, pv_stability);
+        let mut aspiration_depth = step;
         let mut root_pv_move = root_moves.at(pv_idx).mv;
 
         if prev_score.average > -MATE_SCORE {
@@ -360,12 +381,8 @@ fn run_iterative_search<const DRAW_JITTER: bool>(
         }
         let _ = optimism;
 
-        // Note: fail-high depth reduction relies on the transposition table to
-        // retain the deeper subtree score of the fail-high move across retries.
-        // Without a TT, re-searching at `step - 1` would drop the horizon ply
-        // that discovered the tactic.
-        let root_effective_depth = step.max(1);
         loop {
+            let root_effective_depth = aspiration_depth.max(1);
             let score = search_root::<DRAW_JITTER>(
                 board,
                 window.alpha,
@@ -375,17 +392,23 @@ fn run_iterative_search<const DRAW_JITTER: bool>(
                 root_pv_move,
                 &mut root_moves,
                 nodes,
+                tt,
             );
             root_moves.sort_from(pv_idx);
 
             match window.on_result(score) {
                 AspirationKind::FailHigh => {
+                    if !is_decisive(score) && aspiration_depth > 3 {
+                        aspiration_depth -= 1;
+                    }
                     let winning_move = root_moves.at(pv_idx).mv;
                     if winning_move.is_present() {
                         root_pv_move = winning_move;
                     }
                 }
-                AspirationKind::FailLow => {}
+                AspirationKind::FailLow => {
+                    aspiration_depth = step;
+                }
                 AspirationKind::Exact => break,
             }
         }
@@ -435,11 +458,33 @@ fn run_iterative_search<const DRAW_JITTER: bool>(
 #[allow(clippy::too_many_arguments)]
 fn search_root<const DRAW_JITTER: bool>(
     board: &mut Board, mut alpha: i32, beta: i32, root_effective_depth: u8, pv_idx: usize, work_item: Move,
-    root_moves: &mut RootMoves, nodes: &mut u64,
+    root_moves: &mut RootMoves, nodes: &mut u64, tt: &TranspositionTable,
 ) -> i32 {
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
-    let mut picker = MainMovePicker::new(work_item, true);
+    let hash = board.hash();
+    let entry = tt.read(hash, board.fiftymove_clock(), 0);
+    let tt_move = entry.map(|e| e.mv).unwrap_or(Move::NULL);
+    let priority_move = if work_item.is_present() { work_item } else { tt_move };
+
+    let in_check = board.in_check();
+    let raw_eval = if in_check {
+        TtDepth::NONE_SCORE
+    } else if let Some(entry) = &entry
+        && entry.raw_eval != TtDepth::NONE_SCORE
+    {
+        entry.raw_eval
+    } else {
+        let ev = evaluate(board);
+        if entry.is_none() {
+            tt.write(hash, TtDepth::EVAL_ONLY, ev, TtDepth::NONE_SCORE, Bound::None, Move::NULL, 0, true, false);
+        }
+        ev
+    };
+
+    let mut picker = MainMovePicker::new(priority_move, true);
     let mut best_score = -INFINITY;
+    let mut best_move = Move::NULL;
+    let mut bound = Bound::Upper;
     let mut move_count = 0usize;
 
     while let Some(mv) = picker.next(board) {
@@ -447,13 +492,12 @@ fn search_root<const DRAW_JITTER: bool>(
             continue;
         }
         move_count += 1;
-        let cand_depth = root_effective_depth;
-        let child_depth = cand_depth - 1;
+        let child_depth = root_effective_depth - 1;
         let nodes_before = *nodes;
         let mut child_pv = PvLine::new();
         let mut sel_depth = 1u16;
 
-        make_move(board, mv, nodes);
+        make_move(board, mv, nodes, Some(tt));
 
         let score = if move_count == 1 {
             -search_node::<DRAW_JITTER, true, true>(
@@ -466,6 +510,7 @@ fn search_root<const DRAW_JITTER: bool>(
                 &mut child_pv,
                 nodes,
                 &mut sel_depth,
+                Some(tt),
             )
             .0
         } else {
@@ -480,6 +525,7 @@ fn search_root<const DRAW_JITTER: bool>(
                 &mut scout_pv,
                 nodes,
                 &mut sel_depth,
+                Some(tt),
             )
             .0;
             if scout > alpha && beta > alpha + 1 {
@@ -493,6 +539,7 @@ fn search_root<const DRAW_JITTER: bool>(
                     &mut child_pv,
                     nodes,
                     &mut sel_depth,
+                    Some(tt),
                 )
                 .0
             } else {
@@ -517,12 +564,24 @@ fn search_root<const DRAW_JITTER: bool>(
         if score > best_score {
             best_score = score;
             if score > alpha {
-                alpha = score;
-                if alpha >= beta {
+                best_move = mv;
+                bound = Bound::Exact;
+                if score >= beta {
+                    bound = Bound::Lower;
                     break;
+                }
+                alpha = score;
+                if pv_idx == 0 && mv != priority_move {
+                    tt.write(hash, root_effective_depth as i32, raw_eval, score, Bound::Lower, mv, 0, true, false);
                 }
             }
         }
+    }
+
+    if pv_idx == 0 {
+        let store_mv = if bound == Bound::Upper { Move::NULL } else { best_move };
+        let store_depth = (root_effective_depth as i32 - i32::from(bound == Bound::Lower)).max(1);
+        tt.write(hash, store_depth, raw_eval, best_score, bound, store_mv, 0, true, true);
     }
 
     best_score
@@ -531,7 +590,7 @@ fn search_root<const DRAW_JITTER: bool>(
 #[allow(clippy::too_many_arguments)]
 fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
     board: &mut Board, depth: u8, ply: u16, previous: Option<Square>, mut alpha: i32, beta: i32, pv: &mut PvLine,
-    nodes: &mut u64, sel_depth: &mut u16,
+    nodes: &mut u64, sel_depth: &mut u16, tt: Option<&TranspositionTable>,
 ) -> (i32, Option<Move>) {
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     if PV {
@@ -544,7 +603,10 @@ fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
             let score = if board.in_check() { -MATE_SCORE } else { draw_score::<DRAW_JITTER>(*nodes) };
             return (score, None);
         }
-        return (quiescence::<DRAW_JITTER, SELECTIVE>(board, 0, ply, previous, alpha, beta, nodes, sel_depth), None);
+        return (
+            quiescence::<DRAW_JITTER, SELECTIVE, PV>(board, 0, ply, previous, alpha, beta, nodes, sel_depth, tt),
+            None,
+        );
     }
 
     let draw = draw_score::<DRAW_JITTER>(*nodes);
@@ -555,24 +617,89 @@ fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
         }
     }
 
-    let moves = board.generate_all_moves();
+    let in_check = board.in_check();
+    if ply > 0 {
+        if board.is_draw(ply as isize) {
+            if in_check && !board.has_legal_moves() {
+                return (-MATE_SCORE + i32::from(ply), None);
+            }
+            return (draw, None);
+        }
+        if ply >= MAX_PLY {
+            if in_check && !board.has_legal_moves() {
+                return (-MATE_SCORE + i32::from(ply), None);
+            }
+            return (if in_check { draw } else { evaluate(board) }, None);
+        }
+    }
 
-    // Full-width nodes adjudicate both checkmate and stalemate.
-    if moves.is_empty() {
-        let score = if board.in_check() { -MATE_SCORE + i32::from(ply) } else { draw };
-        return (score, None);
+    let hash = board.hash();
+    let entry = if SELECTIVE { tt.and_then(|t| t.read(hash, board.fiftymove_clock(), ply as isize)) } else { None };
+    let mut tt_move = Move::NULL;
+    let mut tt_pv = PV;
+
+    if let Some(entry) = &entry {
+        tt_move = entry.mv;
+        tt_pv |= entry.tt_pv;
+
+        if !PV
+            && ply > 0
+            && entry.depth >= depth as i32
+            && entry.score != TtDepth::NONE_SCORE
+            && board.fiftymove_clock() < 90
+            && match entry.bound {
+                Bound::Exact => true,
+                Bound::Lower => entry.score >= beta,
+                Bound::Upper => entry.score <= alpha,
+                Bound::None => false,
+            }
+        {
+            return (entry.score, Some(entry.mv));
+        }
     }
-    if board.is_draw(ply as isize) {
-        let best_move = (ply == 0).then_some(moves[0]);
-        return (draw, best_move);
-    }
+
+    let raw_eval = if in_check {
+        TtDepth::NONE_SCORE
+    } else if let Some(entry) = &entry
+        && entry.raw_eval != TtDepth::NONE_SCORE
+    {
+        entry.raw_eval
+    } else {
+        let ev = evaluate(board);
+        if SELECTIVE
+            && entry.is_none()
+            && let Some(t) = tt
+        {
+            t.write(
+                hash,
+                TtDepth::EVAL_ONLY,
+                ev,
+                TtDepth::NONE_SCORE,
+                Bound::None,
+                Move::NULL,
+                ply as isize,
+                tt_pv,
+                false,
+            );
+        }
+        ev
+    };
 
     let mut best_score = -INFINITY;
     let mut best_move = None;
-    for (index, &mv) in moves.iter().enumerate() {
+    let mut bound = Bound::Upper;
+    let mut move_count = 0usize;
+
+    let mut picker = MainMovePicker::new(if SELECTIVE { tt_move } else { Move::NULL }, false);
+    while let Some(mv) = picker.next(board) {
+        move_count += 1;
+        if ply == 0 && board.is_draw(0) {
+            return (draw, Some(mv));
+        }
+
         let mut child_pv = PvLine::new();
-        make_move(board, mv, nodes);
-        let score = if !SELECTIVE || !PV || index == 0 {
+        make_move(board, mv, nodes, tt);
+        let score = if !SELECTIVE || !PV || move_count == 1 {
             -search_node::<DRAW_JITTER, SELECTIVE, PV>(
                 board,
                 depth - 1,
@@ -583,6 +710,7 @@ fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
                 &mut child_pv,
                 nodes,
                 sel_depth,
+                tt,
             )
             .0
         } else {
@@ -597,6 +725,7 @@ fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
                 &mut scout_pv,
                 nodes,
                 sel_depth,
+                tt,
             )
             .0;
             if scout > alpha && beta > alpha + 1 {
@@ -610,6 +739,7 @@ fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
                     &mut child_pv,
                     nodes,
                     sel_depth,
+                    tt,
                 )
                 .0
             } else {
@@ -622,25 +752,46 @@ fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
             best_score = score;
             best_move = Some(mv);
             if score > alpha {
+                bound = Bound::Exact;
                 if PV {
                     pv.update(mv, &child_pv);
                 }
-                alpha = score;
-                if alpha >= beta {
+                if score >= beta {
+                    bound = Bound::Lower;
                     break;
                 }
-            } else if index == 0 && PV {
+                alpha = score;
+                if SELECTIVE
+                    && PV
+                    && mv != tt_move
+                    && let Some(t) = tt
+                {
+                    t.write(hash, depth as i32, raw_eval, score, Bound::Lower, mv, ply as isize, true, false);
+                }
+            } else if move_count == 1 && PV {
                 pv.update(mv, &child_pv);
             }
         }
     }
+
+    if move_count == 0 {
+        let score = if in_check { -MATE_SCORE + i32::from(ply) } else { draw_score::<DRAW_JITTER>(*nodes) };
+        return (score, None);
+    }
+
+    if SELECTIVE && let Some(t) = tt {
+        let store_mv = if bound == Bound::Upper { Move::NULL } else { best_move.unwrap_or(Move::NULL) };
+        let store_depth = (depth as i32 - i32::from(bound == Bound::Lower)).max(1);
+        t.write(hash, store_depth, raw_eval, best_score, bound, store_mv, ply as isize, tt_pv, PV);
+    }
+
     (best_score, best_move)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool>(
+fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
     board: &mut Board, q_depth: i16, ply: u16, previous: Option<Square>, mut alpha: i32, beta: i32, nodes: &mut u64,
-    sel_depth: &mut u16,
+    sel_depth: &mut u16, tt: Option<&TranspositionTable>,
 ) -> i32 {
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     debug_assert!(ply <= MAX_PLY && q_depth <= 0);
@@ -662,13 +813,89 @@ fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool>(
         return if is_draw || in_check { draw } else { evaluate(board) };
     }
 
-    let mut best_score = if in_check { -INFINITY } else { evaluate(board) };
+    let hash = board.hash();
+    let tt_depth = i32::from(q_depth.max(RECAPTURE_ONLY_DEPTH));
+    let entry = if SELECTIVE { tt.and_then(|t| t.read(hash, board.fiftymove_clock(), ply as isize)) } else { None };
+    let mut tt_move = Move::NULL;
+    let mut tt_pv = PV;
+
+    if let Some(entry) = &entry {
+        tt_move = entry.mv;
+        tt_pv |= entry.tt_pv;
+
+        if entry.depth >= tt_depth
+            && entry.score != TtDepth::NONE_SCORE
+            && (!PV || !is_decisive(entry.score))
+            && match entry.bound {
+                Bound::Exact => true,
+                Bound::Lower => entry.score >= beta,
+                Bound::Upper => entry.score <= alpha,
+                Bound::None => false,
+            }
+        {
+            return entry.score;
+        }
+    }
+
+    let raw_eval;
+    let mut best_score;
+    if in_check {
+        raw_eval = TtDepth::NONE_SCORE;
+        best_score = -INFINITY;
+    } else {
+        raw_eval = match &entry {
+            Some(entry) if entry.raw_eval != TtDepth::NONE_SCORE => entry.raw_eval,
+            _ => {
+                let ev = evaluate(board);
+                if SELECTIVE
+                    && entry.is_none()
+                    && let Some(t) = tt
+                {
+                    t.write(
+                        hash,
+                        TtDepth::EVAL_ONLY,
+                        ev,
+                        TtDepth::NONE_SCORE,
+                        Bound::None,
+                        Move::NULL,
+                        ply as isize,
+                        tt_pv,
+                        false,
+                    );
+                }
+                ev
+            }
+        };
+        best_score = raw_eval;
+
+        if let Some(entry) = &entry
+            && entry.depth >= tt_depth
+            && entry.score != TtDepth::NONE_SCORE
+            && (!PV || !is_decisive(entry.score))
+            && match entry.bound {
+                Bound::Exact => true,
+                Bound::Lower => entry.score > best_score,
+                Bound::Upper => entry.score < best_score,
+                Bound::None => false,
+            }
+        {
+            best_score = entry.score;
+        }
+    }
+
     if best_score >= beta {
+        if SELECTIVE
+            && entry.is_none()
+            && let Some(t) = tt
+        {
+            t.write(hash, tt_depth, raw_eval, best_score, Bound::Lower, Move::NULL, ply as isize, tt_pv, false);
+        }
         return best_score;
     }
     alpha = alpha.max(best_score);
 
-    let mut picker = QuiescenceMovePicker::new(in_check, q_depth >= -1);
+    let mut best_move = Move::NULL;
+    let mut picker = QuiescenceMovePicker::new(if SELECTIVE { tt_move } else { Move::NULL }, in_check, q_depth >= -1);
     while let Some(mv) = picker.next(board, SELECTIVE && in_check && best_score > -MATE_THRESHOLD) {
         let recapture = mv.is_capture() && previous == Some(mv.capture_sq());
         if SELECTIVE
@@ -681,8 +908,8 @@ fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool>(
         {
             continue;
         }
-        make_move(board, mv, nodes);
-        let score = -quiescence::<DRAW_JITTER, SELECTIVE>(
+        make_move(board, mv, nodes, tt);
+        let score = -quiescence::<DRAW_JITTER, SELECTIVE, PV>(
             board,
             q_depth - 1,
             ply + 1,
@@ -691,24 +918,46 @@ fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool>(
             -alpha,
             nodes,
             sel_depth,
+            tt,
         );
         undo_move(board, mv);
-        best_score = best_score.max(score);
-        alpha = alpha.max(score);
-        if alpha >= beta {
-            break;
+        if score > best_score {
+            best_score = score;
+            if score > alpha {
+                best_move = mv;
+                if score >= beta {
+                    break;
+                }
+                alpha = score;
+            }
         }
     }
-    if in_check && best_score == -INFINITY { -MATE_SCORE + i32::from(ply) } else { best_score }
+
+    if in_check && best_score == -INFINITY {
+        return -MATE_SCORE + i32::from(ply);
+    }
+
+    if SELECTIVE && let Some(t) = tt {
+        let bound = if best_score >= beta { Bound::Lower } else { Bound::Upper };
+        t.write(hash, tt_depth, raw_eval, best_score, bound, best_move, ply as isize, tt_pv, false);
+    }
+
+    best_score
 }
 
 const fn is_decisive(score: i32) -> bool {
     score.abs() >= MATE_THRESHOLD
 }
 
-fn make_move(board: &mut Board, mv: Move, nodes: &mut u64) {
+fn make_move(board: &mut Board, mv: Move, nodes: &mut u64, tt: Option<&TranspositionTable>) {
+    if let Some(t) = tt {
+        t.prefetch(board.key_after(mv));
+    }
     *nodes += 1;
     board.make_move(mv);
+    if let Some(t) = tt {
+        t.prefetch(board.hash());
+    }
 }
 
 fn undo_move(board: &mut Board, mv: Move) {

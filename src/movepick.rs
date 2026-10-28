@@ -145,8 +145,9 @@ impl MainMovePicker {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 enum Stage {
+    HashMove,
     GenerateNoisy,
     GoodNoisy,
     GenerateEvasions,
@@ -165,20 +166,22 @@ pub(crate) struct QuiescenceMovePicker {
     bad_noisy: MoveList,
     bad_index: usize,
     quiet_index: usize,
+    tt_move: Move,
     stage: Stage,
     in_check: bool,
     quiet_checks: bool,
 }
 
 impl QuiescenceMovePicker {
-    pub(crate) fn new(in_check: bool, quiet_checks: bool) -> Self {
+    pub(crate) fn new(tt_move: Move, in_check: bool, quiet_checks: bool) -> Self {
         Self {
             moves: MoveList::new(),
             scores: [0; MAX_MOVES],
             bad_noisy: MoveList::new(),
             bad_index: 0,
             quiet_index: 0,
-            stage: Stage::GenerateNoisy,
+            tt_move,
+            stage: if tt_move.is_present() { Stage::HashMove } else { Stage::GenerateNoisy },
             in_check,
             quiet_checks,
         }
@@ -187,9 +190,23 @@ impl QuiescenceMovePicker {
     pub(crate) fn next(&mut self, board: &Board, skip_quiet_evasions: bool) -> Option<Move> {
         loop {
             match self.stage {
+                Stage::HashMove => {
+                    self.stage = Stage::GenerateNoisy;
+                    if board.is_legal(self.tt_move)
+                        && (self.in_check
+                            || self.tt_move.is_noisy()
+                            || (self.quiet_checks && board.gives_check(self.tt_move)))
+                    {
+                        return Some(self.tt_move);
+                    }
+                }
                 Stage::GenerateNoisy => {
                     board.append_noisy_moves(&mut self.moves);
                     for (index, &mv) in self.moves.iter().enumerate() {
+                        if mv == self.tt_move {
+                            self.scores[index] = i32::MIN;
+                            continue;
+                        }
                         let mut gain = if mv.is_capture() { material_value(board.type_on(mv.capture_sq())) } else { 0 };
                         if mv.is_promotion() {
                             gain += material_value(mv.promo_piece_type()) - material_value(PieceType::Pawn);
@@ -218,10 +235,14 @@ impl QuiescenceMovePicker {
                     }
                 }
                 Stage::Evasions => {
-                    if !skip_quiet_evasions && self.quiet_index < self.moves.len() {
-                        let mv = self.moves[self.quiet_index];
-                        self.quiet_index += 1;
-                        return Some(mv);
+                    if !skip_quiet_evasions {
+                        while self.quiet_index < self.moves.len() {
+                            let mv = self.moves[self.quiet_index];
+                            self.quiet_index += 1;
+                            if mv != self.tt_move {
+                                return Some(mv);
+                            }
+                        }
                     }
                     self.stage = Stage::BadNoisy;
                 }
@@ -239,10 +260,12 @@ impl QuiescenceMovePicker {
                     self.stage = Stage::Checks;
                 }
                 Stage::Checks => {
-                    if self.quiet_index < self.moves.len() {
+                    while self.quiet_index < self.moves.len() {
                         let mv = self.moves[self.quiet_index];
                         self.quiet_index += 1;
-                        return Some(mv);
+                        if mv != self.tt_move {
+                            return Some(mv);
+                        }
                     }
                     self.stage = Stage::Done;
                 }

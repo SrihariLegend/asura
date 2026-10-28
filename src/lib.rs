@@ -3,6 +3,7 @@ use std::{collections::VecDeque, io};
 pub mod board;
 pub mod search;
 pub mod tools;
+pub mod transposition;
 pub mod types;
 
 mod evaluation;

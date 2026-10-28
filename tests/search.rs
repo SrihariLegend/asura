@@ -135,7 +135,7 @@ fn draw_jitter_uses_the_search_node_count_and_resets_each_call() {
     // Blocked a-pawns preserve the material balance without adding legal
     // moves, and keep king-only material draws out of this stalemate fixture.
     for (fen, score, nodes, best_move) in
-        [("7k/7P/8/p5K1/P7/8/8/8 w - - 0 1", 2, 45, "g5h6"), ("7k/7P/5K2/p7/P7/8/8/8 w - - 0 1", 2, 37, "f6g6")]
+        [("7k/7P/8/p5K1/P7/8/8/8 w - - 0 1", 2, 40, "g5h6"), ("7k/7P/5K2/p7/P7/8/8/8 w - - 0 1", 2, 31, "f6g6")]
     {
         let board = Board::from_fen(fen).unwrap();
         let original = board.clone();

@@ -5,12 +5,14 @@ use std::{
 
 use crate::{
     board::Board,
-    search::{MATE_SCORE, MATE_THRESHOLD, search},
+    search::{MATE_SCORE, MATE_THRESHOLD, search_with_tt},
     tools,
+    transposition::{DEFAULT_TT_SIZE, TranspositionTable},
 };
 
 pub fn message_loop(mut commands: VecDeque<String>, mut input: impl BufRead, mut output: impl Write) -> io::Result<()> {
     let mut board = Board::starting_position();
+    let mut tt = TranspositionTable::default();
     let mut frc = false;
     let mut use_stdin = commands.is_empty();
 
@@ -32,6 +34,8 @@ pub fn message_loop(mut commands: VecDeque<String>, mut input: impl BufRead, mut
             ["uci"] => {
                 writeln!(output, "id name Asura {}", env!("CARGO_PKG_VERSION"))?;
                 writeln!(output, "id author Asura contributors")?;
+                writeln!(output, "option name Hash type spin default {DEFAULT_TT_SIZE} min 1 max 262144")?;
+                writeln!(output, "option name Clear Hash type button")?;
                 writeln!(output, "option name UCI_Chess960 type check default false")?;
                 writeln!(output, "uciok")?;
                 use_stdin = true;
@@ -40,11 +44,19 @@ pub fn message_loop(mut commands: VecDeque<String>, mut input: impl BufRead, mut
             ["ucinewgame"] => {
                 board = Board::starting_position();
                 board.set_frc(frc);
+                tt.clear(1);
             }
             ["position", tokens @ ..] => match position(tokens, frc) {
                 Ok(position) => board = position,
                 Err(error) => writeln!(output, "info string {error}")?,
             },
+            ["setoption", "name", "Hash", "value", value] => {
+                match value.parse::<usize>().ok().filter(|&mb| (1..=262_144).contains(&mb)) {
+                    Some(mb) => tt.resize(1, mb),
+                    None => writeln!(output, "info string Hash must be an integer from 1 to 262144")?,
+                }
+            }
+            ["setoption", "name", "Clear", "Hash"] => tt.clear(1),
             ["setoption", "name", "UCI_Chess960", "value", value] => match value.parse::<bool>() {
                 Ok(value) => {
                     frc = value;
@@ -61,7 +73,7 @@ pub fn message_loop(mut commands: VecDeque<String>, mut input: impl BufRead, mut
             ["perft", ..] => writeln!(output, "info string Usage: perft <depth>")?,
             ["d"] => writeln!(output, "{board}")?,
             ["go", "depth", depth] => match depth.parse::<u8>().ok().filter(|&depth| depth > 0) {
-                Some(depth) => go(&board, depth, &mut output)?,
+                Some(depth) => go(&board, &tt, depth, &mut output)?,
                 None => writeln!(output, "info string depth must be an integer from 1 to 255")?,
             },
             ["go", ..] => writeln!(output, "info string Usage: go depth <1..=255>")?,
@@ -75,8 +87,9 @@ pub fn message_loop(mut commands: VecDeque<String>, mut input: impl BufRead, mut
     output.flush()
 }
 
-fn go(board: &Board, depth: u8, output: &mut impl Write) -> io::Result<()> {
-    let result = search(board, depth);
+fn go(board: &Board, tt: &TranspositionTable, depth: u8, output: &mut impl Write) -> io::Result<()> {
+    tt.increment_age();
+    let result = search_with_tt(board, depth, tt);
     let score = if result.score.abs() >= MATE_THRESHOLD {
         let plies = MATE_SCORE - result.score.abs();
         let moves = (plies + i32::from(result.score > 0)) / 2;
