@@ -72,4 +72,8 @@ define! {
     u8,  HP_MAX_DEPTH: 4;
     i32, HP_DEPTH_SCALE: -400;
     i32, HP_IMPROVING_OFFSET: -200;
+
+    // Internal Iterative Reduction constants.
+    u8,  IIR_MIN_DEPTH: 3;
+    i32, IIR_TT_DEPTH_GAP: 4;
 }

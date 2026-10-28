@@ -28,8 +28,9 @@ const CFG_SEE: u32 = 1 << 6;
 const CFG_LMP: u32 = 1 << 7;
 const CFG_FP: u32 = 1 << 8;
 const CFG_HP: u32 = 1 << 9;
+const CFG_IIR: u32 = 1 << 10;
 const CFG_ALL_SELECTIVE: u32 =
-    CFG_SELECTIVE | CFG_LMR | CFG_NMP | CFG_RFP | CFG_PROBCUT | CFG_SEE | CFG_LMP | CFG_FP | CFG_HP;
+    CFG_SELECTIVE | CFG_LMR | CFG_NMP | CFG_RFP | CFG_PROBCUT | CFG_SEE | CFG_LMP | CFG_FP | CFG_HP | CFG_IIR;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -467,7 +468,18 @@ pub fn search_without_hp(position: &Board, depth: u8) -> SearchResult {
     })
 }
 
-/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP.
+/// The selective search with Internal Iterative Reduction (IIR) disabled and recognized draws scored zero.
+pub fn search_without_iir(position: &Board, depth: u8) -> SearchResult {
+    LOCAL_TT.with_borrow_mut(|tt| {
+        LOCAL_HISTORY.with_borrow_mut(|history| {
+            tt.clear(1);
+            history.clear();
+            run_search::<{ CFG_ALL_SELECTIVE & !CFG_IIR }>(position, depth, Some(tt), Some(history))
+        })
+    })
+}
+
+/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR.
 /// Keeps every evasion and capture eligible for independent minimax comparisons.
 pub fn search_reference(position: &Board, depth: u8) -> SearchResult {
     run_search::<0>(position, depth, None, None)
@@ -899,9 +911,9 @@ fn search_root<const CFG: u32>(
 
 #[allow(clippy::too_many_arguments)]
 fn search_node<const CFG: u32, const PV: bool>(
-    board: &mut Board, stack: &mut SearchStack, depth: u8, ply: u16, last_critical_ply: u16, previous: Option<Square>,
-    prior_move: Move, cut_node: bool, parent_eval: i32, parent_move_count: usize, mut alpha: i32, beta: i32,
-    pv: &mut PvLine, nodes: &mut u64, sel_depth: &mut u16, tt: Option<&TranspositionTable>,
+    board: &mut Board, stack: &mut SearchStack, mut depth: u8, ply: u16, last_critical_ply: u16,
+    previous: Option<Square>, prior_move: Move, cut_node: bool, parent_eval: i32, parent_move_count: usize,
+    mut alpha: i32, beta: i32, pv: &mut PvLine, nodes: &mut u64, sel_depth: &mut u16, tt: Option<&TranspositionTable>,
     mut history: Option<&mut HistoryTables>,
 ) -> (i32, Option<Move>) {
     let draw_jitter = (CFG & CFG_DRAW_JITTER) != 0;
@@ -914,6 +926,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_lmp = (CFG & CFG_LMP) != 0;
     let use_fp = (CFG & CFG_FP) != 0;
     let use_hp = (CFG & CFG_HP) != 0;
+    let use_iir = (CFG & CFG_IIR) != 0;
 
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     if PV {
@@ -960,7 +973,9 @@ fn search_node<const CFG: u32, const PV: bool>(
     let mut tt_pv = PV;
 
     if let Some(entry) = &entry {
-        tt_move = entry.mv;
+        if entry.mv.is_present() && board.is_legal(entry.mv) {
+            tt_move = entry.mv;
+        }
         tt_pv |= entry.tt_pv;
 
         if !PV
@@ -975,26 +990,19 @@ fn search_node<const CFG: u32, const PV: bool>(
                 Bound::None => false,
             }
         {
-            if entry.mv.is_quiet()
+            if tt_move.is_quiet()
                 && entry.score >= beta
                 && parent_move_count < 4
-                && board.is_legal(entry.mv)
                 && let Some(h) = history.as_deref_mut()
             {
                 let d = depth as i32;
                 let quiet_bonus = (180 * d - 80).min(1_600);
                 let cont_bonus = (95 * d - 70).min(1_200);
-                let creates_threat = creates_threat_on_board(board, entry.mv);
-                h.quiet_history.update(
-                    board.all_threats(),
-                    creates_threat,
-                    board.side_to_move(),
-                    entry.mv,
-                    quiet_bonus,
-                );
-                h.update_continuation_histories(ply_idx, board.moved_piece(entry.mv), entry.mv.to(), cont_bonus);
+                let creates_threat = creates_threat_on_board(board, tt_move);
+                h.quiet_history.update(board.all_threats(), creates_threat, board.side_to_move(), tt_move, quiet_bonus);
+                h.update_continuation_histories(ply_idx, board.moved_piece(tt_move), tt_move.to(), cont_bonus);
             }
-            return (entry.score, Some(entry.mv));
+            return (entry.score, Some(tt_move));
         }
     }
 
@@ -1102,7 +1110,7 @@ fn search_node<const CFG: u32, const PV: bool>(
         } else {
             raw_eval >= beta + NMP_DEEP_FLOOR
         };
-        let tt_tactical_win = tt_move.is_noisy() && board.is_legal(tt_move) && board.see_ge(tt_move, NMP_TT_SEE_MARGIN);
+        let tt_tactical_win = tt_move.is_noisy() && board.see_ge(tt_move, NMP_TT_SEE_MARGIN);
 
         if !tt_upper_fail_low
             && eval_margin_ok
@@ -1270,6 +1278,18 @@ fn search_node<const CFG: u32, const PV: bool>(
                 }
             }
         }
+    }
+
+    // Internal Iterative Reduction (IIR): at non-PV cut nodes with no TT move
+    // or a TT entry too shallow to trust, reduce depth by 1 ply.
+    if selective
+        && use_iir
+        && !PV
+        && cut_node
+        && depth >= IIR_MIN_DEPTH
+        && (tt_move.is_null() || entry.is_none_or(|e| e.depth + IIR_TT_DEPTH_GAP < depth as i32))
+    {
+        depth -= 1;
     }
 
     let node_bias = compute_node_bias(

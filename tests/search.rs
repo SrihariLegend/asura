@@ -3,8 +3,8 @@ use asura::{
     movepick::{MainMovePicker, MainStage},
     search::{
         lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws, search_without_fp,
-        search_without_hp, search_without_lmp, search_without_lmr, search_without_nmp, search_without_probcut,
-        search_without_rfp, search_without_see_pruning,
+        search_without_hp, search_without_iir, search_without_lmp, search_without_lmr, search_without_nmp,
+        search_without_probcut, search_without_rfp, search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -423,4 +423,35 @@ fn quiet_history_pruning_reduces_nodes_and_preserves_tactics() {
         hp_on.nodes,
         hp_off.nodes
     );
+}
+
+#[test]
+fn internal_iterative_reduction_reduces_cut_node_work_without_tt_move() {
+    let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+    let iir_on = search_with_zero_draws(&kiwipete, 6);
+    let iir_off = search_without_iir(&kiwipete, 6);
+    assert_eq!(iir_on.best_move, iir_off.best_move);
+    assert!(
+        iir_on.nodes < iir_off.nodes,
+        "IIR should reduce nodes in the same selective engine ({} vs {})",
+        iir_on.nodes,
+        iir_off.nodes
+    );
+
+    // A collided TT entry storing an illegal move at high depth must have its
+    // tt_move sanitized to Move::NULL on probe so cut-node IIR still triggers
+    // identically to an entry with Move::NULL.
+    let tt_illegal = TranspositionTable::new(1);
+    let tt_null = TranspositionTable::new(1);
+    let illegal_mv = Move::new(Square::A1, Square::H8, MoveKind::Normal);
+    for &mv in kiwipete.generate_all_moves().iter() {
+        let mut child = kiwipete.clone();
+        child.make_move(mv);
+        tt_illegal.write(child.hash(), 10, 0, 0, Bound::Lower, illegal_mv, 1, false, false);
+        tt_null.write(child.hash(), 10, 0, 0, Bound::Lower, Move::NULL, 1, false, false);
+    }
+    let res_illegal = search_with_tt(&kiwipete, 4, &tt_illegal);
+    let res_null = search_with_tt(&kiwipete, 4, &tt_null);
+    assert_eq!(res_illegal.nodes, res_null.nodes);
+    assert_eq!(res_illegal.best_move, res_null.best_move);
 }
