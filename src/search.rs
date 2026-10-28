@@ -37,6 +37,7 @@ const CFG_CHECKED_TT_CUT: u32 = 1 << 13;
 const CFG_LQC: u32 = 1 << 14;
 const CFG_QS_HP: u32 = 1 << 15;
 const CFG_QS_FP: u32 = 1 << 16;
+const CFG_QS_LMP: u32 = 1 << 17;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -52,7 +53,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_CHECKED_TT_CUT
     | CFG_LQC
     | CFG_QS_HP
-    | CFG_QS_FP;
+    | CFG_QS_FP
+    | CFG_QS_LMP;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -210,6 +212,8 @@ define_diagnostic_searches! {
     search_without_qs_history_pruning: CFG_ALL_SELECTIVE & !CFG_QS_HP;
     /// The selective search with quiescence capture-futility pruning disabled and recognized draws scored zero.
     search_without_qs_futility_pruning: CFG_ALL_SELECTIVE & !CFG_QS_FP;
+    /// The selective search with quiescence late-capture pruning disabled and recognized draws scored zero.
+    search_without_qs_late_capture_pruning: CFG_ALL_SELECTIVE & !CFG_QS_LMP;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -1089,7 +1093,7 @@ fn search_node<const CFG: u32, const PV: bool>(
             }
 
             if verify < s_beta {
-                extension = if PV {
+                extension = if PV || tt_pv {
                     1
                 } else {
                     1 + i32::from(verify < s_beta - SE_DOUBLE_GAP) + i32::from(verify < s_beta - SE_TRIPLE_GAP)
@@ -1436,6 +1440,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
     let selective = (CFG & CFG_SELECTIVE) != 0;
     let use_qs_hp = (CFG & CFG_QS_HP) != 0;
     let use_qs_fp = (CFG & CFG_QS_FP) != 0;
+    let use_qs_lmp = (CFG & CFG_QS_LMP) != 0;
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     debug_assert!(ply <= MAX_PLY && q_depth <= 0);
     td.sel_depth = td.sel_depth.max(ply);
@@ -1540,6 +1545,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
     alpha = alpha.max(best_score);
 
     let mut best_move = Move::NULL;
+    let mut move_count = 0usize;
     let mut picker = QuiescenceMovePicker::new(if selective { tt_move } else { Move::NULL }, in_check, q_depth >= -1);
     while let Some(mv) = picker.next(
         &td.board,
@@ -1547,6 +1553,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
         selective && in_check && best_score > -MATE_THRESHOLD,
         ply as usize,
     ) {
+        move_count += 1;
         let recapture = mv.is_capture() && previous == Some(mv.capture_sq());
         if selective
             && !in_check
@@ -1558,16 +1565,14 @@ fn quiescence<const CFG: u32, const PV: bool>(
             if q_depth <= RECAPTURE_ONLY_DEPTH {
                 continue;
             }
+            if use_qs_lmp && mv.is_capture() && move_count > QS_LATE_CAPTURE_LIMIT && !td.board.see_ge(mv, 1) {
+                continue;
+            }
             if use_qs_fp && mv.is_capture() {
                 let victim_val = qs_futility_victim(td.board.type_on(mv.capture_sq()));
                 let margin = stand_pat + QS_FUTILITY_MARGIN;
                 let capture_margin = margin + victim_val;
-                if alpha >= capture_margin {
-                    best_score = best_score.max(capture_margin);
-                    continue;
-                }
-                if alpha >= margin && !td.board.see_ge(mv, 1) {
-                    best_score = best_score.max(margin);
+                if alpha >= capture_margin || (alpha >= margin && !td.board.see_ge(mv, 1)) {
                     continue;
                 }
             }

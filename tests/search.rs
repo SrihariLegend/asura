@@ -6,7 +6,8 @@ use asura::{
         search_without_checked_tt_cutoff, search_without_fp, search_without_hp, search_without_iir,
         search_without_late_quiet_closure, search_without_lmp, search_without_lmr, search_without_nmp,
         search_without_probcut, search_without_qs_futility_pruning, search_without_qs_history_pruning,
-        search_without_razoring, search_without_rfp, search_without_se, search_without_see_pruning,
+        search_without_qs_late_capture_pruning, search_without_razoring, search_without_rfp, search_without_se,
+        search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -429,9 +430,9 @@ fn quiet_history_pruning_reduces_nodes_and_preserves_tactics() {
 
 #[test]
 fn internal_iterative_reduction_reduces_cut_node_work_without_tt_move() {
-    let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
-    let iir_on = search_with_zero_draws(&kiwipete, 6);
-    let iir_off = search_without_iir(&kiwipete, 6);
+    let italian = Board::from_fen("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
+    let iir_on = search_with_zero_draws(&italian, 7);
+    let iir_off = search_without_iir(&italian, 7);
     assert_eq!(iir_on.best_move, iir_off.best_move);
     assert!(
         iir_on.nodes < iir_off.nodes,
@@ -446,25 +447,25 @@ fn internal_iterative_reduction_reduces_cut_node_work_without_tt_move() {
     let tt_illegal = TranspositionTable::new(1);
     let tt_null = TranspositionTable::new(1);
     let illegal_mv = Move::new(Square::A1, Square::H8, MoveKind::Normal);
-    for &mv in kiwipete.generate_all_moves().iter() {
-        let mut child = kiwipete.clone();
+    for &mv in italian.generate_all_moves().iter() {
+        let mut child = italian.clone();
         child.make_move(mv);
         tt_illegal.write(child.hash(), 10, 0, 0, Bound::Lower, illegal_mv, 1, false, false);
         tt_null.write(child.hash(), 10, 0, 0, Bound::Lower, Move::NULL, 1, false, false);
     }
-    let res_illegal = search_with_tt(&kiwipete, 4, &tt_illegal);
-    let res_null = search_with_tt(&kiwipete, 4, &tt_null);
+    let res_illegal = search_with_tt(&italian, 4, &tt_illegal);
+    let res_null = search_with_tt(&italian, 4, &tt_null);
     assert_eq!(res_illegal.nodes, res_null.nodes);
     assert_eq!(res_illegal.best_move, res_null.best_move);
 }
 
 #[test]
 fn singular_extensions_extend_unique_tt_moves_and_multi_cut_alternatives() {
-    // 1. On Midgame at depth 7, Multi-Cut and negative extensions reduce nodes
+    // 1. On Midgame at depth 8, Multi-Cut and negative extensions reduce nodes
     // while preserving the exact score and best move.
     let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
-    let se_on = search_with_zero_draws(&midgame, 7);
-    let se_off = search_without_se(&midgame, 7);
+    let se_on = search_with_zero_draws(&midgame, 8);
+    let se_off = search_without_se(&midgame, 8);
     assert_eq!(se_on.best_move, se_off.best_move);
     assert_eq!(se_on.score, se_off.score);
     assert!(
@@ -495,11 +496,11 @@ fn singular_extensions_extend_unique_tt_moves_and_multi_cut_alternatives() {
     let after = tt_mc.read(child_after_c2d3.hash(), 0, 1).unwrap();
     assert_eq!(after.depth, 4, "Multi-Cut at depth 6 must return before overwriting TT at depth 5");
 
-    // 3. On Kiwipete at depth 7, extending singular tactical moves resolves a
-    // deeper tactical line (-20 vs -90 without SE).
+    // 3. On Kiwipete at depth 8, extending singular tactical moves resolves a
+    // deeper tactical line (-20 vs -100 without SE).
     let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
-    let kw_on = search_with_zero_draws(&kiwipete, 7);
-    let kw_off = search_without_se(&kiwipete, 7);
+    let kw_on = search_with_zero_draws(&kiwipete, 8);
+    let kw_off = search_without_se(&kiwipete, 8);
     assert!(kw_on.score > kw_off.score);
 }
 
@@ -624,8 +625,8 @@ fn post_move_late_quiet_closure_reduces_nodes_and_preserves_tactics() {
 #[test]
 fn quiescence_quiet_history_pruning_skips_negative_continuation_checks() {
     let italian = Board::from_fen("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
-    let on = search_with_zero_draws(&italian, 7);
-    let off = search_without_qs_history_pruning(&italian, 7);
+    let on = search_with_zero_draws(&italian, 8);
+    let off = search_without_qs_history_pruning(&italian, 8);
     assert_eq!(on.best_move, off.best_move);
     assert_eq!(on.score, off.score);
     assert!(
@@ -664,8 +665,8 @@ fn quiescence_quiet_history_pruning_skips_negative_continuation_checks() {
 #[test]
 fn quiescence_capture_futility_pruning_reduces_nodes_and_preserves_tactics() {
     let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
-    let kw_on = search_with_zero_draws(&kiwipete, 7);
-    let kw_off = search_without_qs_futility_pruning(&kiwipete, 7);
+    let kw_on = search_with_zero_draws(&kiwipete, 6);
+    let kw_off = search_without_qs_futility_pruning(&kiwipete, 6);
     assert_eq!(kw_on.best_move, kw_off.best_move);
     assert_eq!(kw_on.score, kw_off.score);
     assert!(
@@ -711,7 +712,7 @@ fn quiescence_capture_futility_pruning_reduces_nodes_and_preserves_tactics() {
     // capture_margin > alpha (so the first branch never fires anywhere in the
     // tree) and SEE == 0 < 1, so they are pruned solely by the second branch
     // (alpha >= margin && !see_ge(mv, 1)).
-    let see_pos = Board::from_fen("1R1r2k1/rR6/8/8/8/1R1r4/2N1n3/2BKB3 w - - 0 1").unwrap();
+    let see_pos = Board::from_fen("1R1r2k1/8/8/8/8/1R1r4/2N1n3/2BKB3 w - - 0 1").unwrap();
     let s_on = search_with_zero_draws(&see_pos, 1);
     let s_off = search_without_qs_futility_pruning(&see_pos, 1);
     assert_eq!(s_on.best_move, s_off.best_move);
@@ -721,5 +722,47 @@ fn quiescence_capture_futility_pruning_reduces_nodes_and_preserves_tactics() {
         "Quiescence equal-trade SEE futility must prune equal rook trades after 1. Kd1xe2 ({} vs {})",
         s_on.nodes,
         s_off.nodes
+    );
+}
+
+#[test]
+fn quiescence_late_capture_pruning_skips_late_equal_trades_and_preserves_tactics() {
+    let italian = Board::from_fen("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
+    let it_on = search_with_zero_draws(&italian, 7);
+    let it_off = search_without_qs_late_capture_pruning(&italian, 7);
+    assert_eq!(it_on.best_move, it_off.best_move);
+    assert_eq!(it_on.score, it_off.score);
+    assert!(
+        it_on.nodes < it_off.nodes,
+        "Quiescence late-capture pruning should reduce nodes on Italian ({} vs {})",
+        it_on.nodes,
+        it_off.nodes
+    );
+
+    let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
+    let mid_on = search_with_zero_draws(&midgame, 7);
+    let mid_off = search_without_qs_late_capture_pruning(&midgame, 7);
+    assert_eq!(mid_on.best_move, mid_off.best_move);
+    assert_eq!(mid_on.score, mid_off.score);
+    assert!(
+        mid_on.nodes < mid_off.nodes,
+        "Quiescence late-capture pruning should reduce nodes on Midgame ({} vs {})",
+        mid_on.nodes,
+        mid_off.nodes
+    );
+
+    // Direct depth-1 quiescence test where alpha < stand_pat + 200 (so capture
+    // futility does not fire): Move 1 is searched, while Move 2+ (move_count > 1)
+    // is skipped by the quiescence late-capture gate.
+    let late_cap = Board::from_fen("1r1r1r1k/1R1R1Rp1/8/8/8/8/1R1R1R2/6K1 w - - 0 1").unwrap();
+    let lc_on = search_with_zero_draws(&late_cap, 1);
+    let lc_off = search_without_qs_late_capture_pruning(&late_cap, 1);
+    assert_eq!(lc_on.best_move, lc_off.best_move);
+    assert_eq!(lc_on.score, lc_off.score);
+    assert!(
+        lc_on.nodes < lc_off.nodes,
+        "Quiescence late-capture gate must prune 2nd+ unrelated captures ({} vs {})",
+        lc_on.nodes,
+        lc_off.nodes
     );
 }

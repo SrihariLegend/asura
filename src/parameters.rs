@@ -60,9 +60,9 @@ define! {
     i32, SEE_NOISY_HIST_DIV: 100;
 
     // Main-loop Futility Pruning constants on the 100 = 1 pawn / 10_000 = MAX_HISTORY scale.
-    i32, FP_MAX_DEPTH: 6;
-    i32, FP_BASE_MARGIN: 80;
-    i32, FP_DEPTH_MARGIN: 80;
+    i32, FP_MAX_DEPTH: 1;
+    i32, FP_BASE_MARGIN: 120;
+    i32, FP_DEPTH_MARGIN: 120;
     i32, FP_HIST_DIV: 200;
     i32, FP_HIST_MIN: -60;
     i32, FP_HIST_MAX: 150;
@@ -105,4 +105,8 @@ define! {
 
     // Quiescence capture-futility margin on the 100 = 1 pawn scale.
     i32, QS_FUTILITY_MARGIN: 200;
+
+    // Quiescence late-capture limit (maximum legal move index for unrelated
+    // non-promotion, non-checking captures when not in check).
+    usize, QS_LATE_CAPTURE_LIMIT: 1;
 }
