@@ -4,7 +4,8 @@ use asura::{
     search::{
         lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws, search_without_fp,
         search_without_hp, search_without_iir, search_without_lmp, search_without_lmr, search_without_nmp,
-        search_without_probcut, search_without_rfp, search_without_se, search_without_see_pruning,
+        search_without_probcut, search_without_razoring, search_without_rfp, search_without_se,
+        search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -499,4 +500,42 @@ fn singular_extensions_extend_unique_tt_moves_and_multi_cut_alternatives() {
     let kw_on = search_with_zero_draws(&kiwipete, 7);
     let kw_off = search_without_se(&kiwipete, 7);
     assert!(kw_on.score > kw_off.score);
+}
+
+#[test]
+fn razoring_prunes_hopeless_nodes_and_preserves_tactical_refutations() {
+    let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+    let rz_on = search_with_zero_draws(&kiwipete, 7);
+    let rz_off = search_without_razoring(&kiwipete, 7);
+    assert_eq!(rz_on.best_move, rz_off.best_move);
+    assert_eq!(rz_on.score, rz_off.score);
+    assert!(
+        rz_on.nodes < rz_off.nodes,
+        "Razoring should reduce nodes on Kiwipete ({} vs {})",
+        rz_on.nodes,
+        rz_off.nodes
+    );
+
+    let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
+    let mid_on = search_with_zero_draws(&midgame, 7);
+    let mid_off = search_without_razoring(&midgame, 7);
+    assert_eq!(mid_on.best_move, mid_off.best_move);
+    assert_eq!(mid_on.score, mid_off.score);
+    assert!(
+        mid_on.nodes < mid_off.nodes,
+        "Razoring should reduce nodes on Midgame ({} vs {})",
+        mid_on.nodes,
+        mid_off.nodes
+    );
+
+    // Tactical refutation in quiescence: Black is down 1,180 cp (White's Queen,
+    // Rook, and Pawn vs Black's Knight) in static material at ply 1 (depth = 2,
+    // !PV) after a quiet White move, triggering the razoring probe, but Black
+    // has a knight capture winning White's Queen in quiescence (q_score > alpha),
+    // aborting the razor prune.
+    let trap = Board::from_fen("1k6/8/3n4/8/4Q3/8/P7/K6R w - - 0 1").unwrap();
+    let trap_on = search_with_zero_draws(&trap, 4);
+    let trap_off = search_without_razoring(&trap, 4);
+    assert_eq!(trap_on.best_move, trap_off.best_move);
+    assert_eq!(trap_on.score, trap_off.score);
 }

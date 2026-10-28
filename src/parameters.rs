@@ -83,4 +83,10 @@ define! {
     i32, SE_DEPTH_MARGIN: 3;
     i32, SE_DOUBLE_GAP: 25;
     i32, SE_TRIPLE_GAP: 100;
+
+    // Razoring constants on the 100 = 1 pawn scale.
+    u8,  RAZOR_MAX_DEPTH: 3;
+    i32, RAZOR_BASE: 200;
+    i32, RAZOR_MARGIN: 250;
+    i32, RAZOR_MOVE_MARGIN: 175;
 }

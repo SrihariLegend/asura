@@ -8,7 +8,7 @@ use crate::{
     parameters::*,
     stack::Stack as SearchStack,
     transposition::{Bound, TranspositionTable, TtDepth},
-    types::{MAX_PLY as MAX_PLY_USIZE, Move, Piece, Score, Square, is_decisive},
+    types::{MAX_PLY as MAX_PLY_USIZE, Move, Piece, Score, Square, is_decisive, is_win},
 };
 
 pub const MATE_SCORE: i32 = Score::MATE;
@@ -30,8 +30,19 @@ const CFG_FP: u32 = 1 << 8;
 const CFG_HP: u32 = 1 << 9;
 const CFG_IIR: u32 = 1 << 10;
 const CFG_SE: u32 = 1 << 11;
-const CFG_ALL_SELECTIVE: u32 =
-    CFG_SELECTIVE | CFG_LMR | CFG_NMP | CFG_RFP | CFG_PROBCUT | CFG_SEE | CFG_LMP | CFG_FP | CFG_HP | CFG_IIR | CFG_SE;
+const CFG_RAZOR: u32 = 1 << 12;
+const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
+    | CFG_LMR
+    | CFG_NMP
+    | CFG_RFP
+    | CFG_PROBCUT
+    | CFG_SEE
+    | CFG_LMP
+    | CFG_FP
+    | CFG_HP
+    | CFG_IIR
+    | CFG_SE
+    | CFG_RAZOR;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -491,7 +502,18 @@ pub fn search_without_se(position: &Board, depth: u8) -> SearchResult {
     })
 }
 
-/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE.
+/// The selective search with Razoring disabled and recognized draws scored zero.
+pub fn search_without_razoring(position: &Board, depth: u8) -> SearchResult {
+    LOCAL_TT.with_borrow_mut(|tt| {
+        LOCAL_HISTORY.with_borrow_mut(|history| {
+            tt.clear(1);
+            history.clear();
+            run_search::<{ CFG_ALL_SELECTIVE & !CFG_RAZOR }>(position, depth, Some(tt), Some(history))
+        })
+    })
+}
+
+/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring.
 /// Keeps every evasion and capture eligible for independent minimax comparisons.
 pub fn search_reference(position: &Board, depth: u8) -> SearchResult {
     run_search::<0>(position, depth, None, None)
@@ -940,6 +962,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_hp = (CFG & CFG_HP) != 0;
     let use_iir = (CFG & CFG_IIR) != 0;
     let use_se = (CFG & CFG_SE) != 0;
+    let use_razoring = (CFG & CFG_RAZOR) != 0;
 
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     if PV {
@@ -952,7 +975,7 @@ fn search_node<const CFG: u32, const PV: bool>(
             let score = if board.in_check() { -MATE_SCORE } else { draw_score(draw_jitter, *nodes) };
             return (score, None);
         }
-        return (quiescence::<CFG, PV>(board, 0, ply, previous, alpha, beta, nodes, sel_depth, tt, history), None);
+        return (quiescence::<CFG, PV>(board, 0, ply, previous, alpha, beta, nodes, sel_depth, tt, history).0, None);
     }
 
     let draw = draw_score(draw_jitter, *nodes);
@@ -1100,6 +1123,40 @@ fn search_node<const CFG: u32, const PV: bool>(
                 && e.score != TtDepth::NONE_SCORE
                 && !is_decisive(e.score)
         });
+
+    // Razoring: when static evaluation plus a depth-scaled margin is already
+    // at or below alpha at shallow non-PV depths, verify the fail-low with a
+    // quiescence search; if a capture refutes the fail-low strongly and no TT
+    // move exists, promote that refutation move into tt_move.
+    if selective
+        && use_razoring
+        && !in_singular
+        && !PV
+        && !in_check
+        && depth <= RAZOR_MAX_DEPTH
+        && !is_win(alpha)
+        && static_eval + RAZOR_BASE + (depth as i32) * RAZOR_MARGIN <= alpha
+        && !entry.is_some_and(|e| e.bound == Bound::Lower && e.score > alpha)
+    {
+        let (q_score, q_move) = quiescence::<CFG, false>(
+            board,
+            0,
+            ply,
+            previous,
+            alpha,
+            beta,
+            nodes,
+            sel_depth,
+            tt,
+            history.as_deref_mut(),
+        );
+        if q_score <= alpha {
+            return (q_score, None);
+        }
+        if tt_move.is_null() && q_score >= beta + RAZOR_MOVE_MARGIN {
+            tt_move = q_move;
+        }
+    }
 
     // Reverse Futility Pruning (RFP)
     if selective
@@ -1281,7 +1338,8 @@ fn search_node<const CFG: u32, const PV: bool>(
                     sel_depth,
                     tt,
                     history.as_deref_mut(),
-                );
+                )
+                .0;
 
                 if score >= prob_beta {
                     let mut prob_pv = PvLine::new();
@@ -1858,7 +1916,7 @@ fn update_histories_on_best_move(
 fn quiescence<const CFG: u32, const PV: bool>(
     board: &mut Board, q_depth: i16, ply: u16, previous: Option<Square>, mut alpha: i32, beta: i32, nodes: &mut u64,
     sel_depth: &mut u16, tt: Option<&TranspositionTable>, mut history: Option<&mut HistoryTables>,
-) -> i32 {
+) -> (i32, Move) {
     let draw_jitter = (CFG & CFG_DRAW_JITTER) != 0;
     let selective = (CFG & CFG_SELECTIVE) != 0;
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
@@ -1868,7 +1926,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
     if ply > 0 && alpha < draw && board.upcoming_repetition(ply as usize) {
         alpha = draw;
         if alpha >= beta {
-            return alpha;
+            return (alpha, Move::NULL);
         }
     }
 
@@ -1876,9 +1934,9 @@ fn quiescence<const CFG: u32, const PV: bool>(
     let is_draw = board.is_draw(ply as isize);
     if is_draw || ply >= MAX_PLY {
         if in_check && !board.has_legal_moves() {
-            return -MATE_SCORE + i32::from(ply);
+            return (-MATE_SCORE + i32::from(ply), Move::NULL);
         }
-        return if is_draw || in_check { draw } else { evaluate(board) };
+        return (if is_draw || in_check { draw } else { evaluate(board) }, Move::NULL);
     }
 
     let hash = board.hash();
@@ -1901,7 +1959,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
                 Bound::None => false,
             }
         {
-            return entry.score;
+            return (entry.score, Move::NULL);
         }
     }
 
@@ -1958,7 +2016,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
         {
             t.write(hash, tt_depth, raw_eval, best_score, Bound::Lower, Move::NULL, ply as isize, tt_pv, false);
         }
-        return best_score;
+        return (best_score, Move::NULL);
     }
     alpha = alpha.max(best_score);
 
@@ -1994,7 +2052,8 @@ fn quiescence<const CFG: u32, const PV: bool>(
             sel_depth,
             tt,
             history.as_deref_mut(),
-        );
+        )
+        .0;
         undo_move(board, mv);
         if score > best_score {
             best_score = score;
@@ -2009,7 +2068,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
     }
 
     if in_check && best_score == -INFINITY {
-        return -MATE_SCORE + i32::from(ply);
+        return (-MATE_SCORE + i32::from(ply), Move::NULL);
     }
 
     if selective
@@ -2031,7 +2090,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
         t.write(hash, tt_depth, raw_eval, best_score, bound, best_move, ply as isize, tt_pv, false);
     }
 
-    best_score
+    (best_score, best_move)
 }
 
 fn make_move(board: &mut Board, mv: Move, nodes: &mut u64, tt: Option<&TranspositionTable>) {
