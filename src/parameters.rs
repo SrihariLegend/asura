@@ -109,4 +109,7 @@ define! {
     // Quiescence late-capture limit (maximum legal move index for unrelated
     // non-promotion, non-checking captures when not in check).
     usize, QS_LATE_CAPTURE_LIMIT: 1;
+
+    // Quiescence history-backed early fail-high margin on the 100 = 1 pawn scale.
+    i32, QS_EARLY_CUTOFF_MARGIN: 225;
 }

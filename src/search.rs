@@ -38,6 +38,7 @@ const CFG_LQC: u32 = 1 << 14;
 const CFG_QS_HP: u32 = 1 << 15;
 const CFG_QS_FP: u32 = 1 << 16;
 const CFG_QS_LMP: u32 = 1 << 17;
+const CFG_QS_EARLY_CUT: u32 = 1 << 18;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -54,7 +55,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LQC
     | CFG_QS_HP
     | CFG_QS_FP
-    | CFG_QS_LMP;
+    | CFG_QS_LMP
+    | CFG_QS_EARLY_CUT;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -214,6 +216,8 @@ define_diagnostic_searches! {
     search_without_qs_futility_pruning: CFG_ALL_SELECTIVE & !CFG_QS_FP;
     /// The selective search with quiescence late-capture pruning disabled and recognized draws scored zero.
     search_without_qs_late_capture_pruning: CFG_ALL_SELECTIVE & !CFG_QS_LMP;
+    /// The selective search with quiescence history-backed early fail-high disabled and recognized draws scored zero.
+    search_without_qs_early_cutoff: CFG_ALL_SELECTIVE & !CFG_QS_EARLY_CUT;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -1441,6 +1445,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
     let use_qs_hp = (CFG & CFG_QS_HP) != 0;
     let use_qs_fp = (CFG & CFG_QS_FP) != 0;
     let use_qs_lmp = (CFG & CFG_QS_LMP) != 0;
+    let use_qs_early_cut = (CFG & CFG_QS_EARLY_CUT) != 0;
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     debug_assert!(ply <= MAX_PLY && q_depth <= 0);
     td.sel_depth = td.sel_depth.max(ply);
@@ -1554,6 +1559,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
         ply as usize,
     ) {
         move_count += 1;
+        let moved_piece = td.board.moved_piece(mv);
         let recapture = mv.is_capture() && previous == Some(mv.capture_sq());
         if selective
             && !in_check
@@ -1568,16 +1574,32 @@ fn quiescence<const CFG: u32, const PV: bool>(
             if use_qs_lmp && mv.is_capture() && move_count > QS_LATE_CAPTURE_LIMIT && !td.board.see_ge(mv, 1) {
                 continue;
             }
-            if use_qs_fp && mv.is_capture() {
-                let victim_val = qs_futility_victim(td.board.type_on(mv.capture_sq()));
-                let margin = stand_pat + QS_FUTILITY_MARGIN;
-                let capture_margin = margin + victim_val;
-                if alpha >= capture_margin || (alpha >= margin && !td.board.see_ge(mv, 1)) {
-                    continue;
+            if mv.is_capture() {
+                let captured_type = td.board.type_on(mv.capture_sq());
+                let victim_val = qs_futility_victim(captured_type);
+                let attacker_val = qs_futility_victim(moved_piece.piece_type());
+                if use_qs_early_cut
+                    && move_count == 1
+                    && !is_decisive(beta)
+                    && raw_eval + victim_val - attacker_val - QS_EARLY_CUTOFF_MARGIN > beta
+                    && td.history.as_deref().is_some_and(|h| {
+                        h.noisy_history.get(td.board.all_threats(), moved_piece, mv.to(), captured_type) > 0
+                    })
+                {
+                    if let Some(t) = td.tt {
+                        t.write(hash, tt_depth, raw_eval, beta, Bound::Lower, mv, ply as isize, tt_pv, false);
+                    }
+                    return (beta, Move::NULL);
+                }
+                if use_qs_fp {
+                    let margin = stand_pat + QS_FUTILITY_MARGIN;
+                    let capture_margin = margin + victim_val;
+                    if alpha >= capture_margin || (alpha >= margin && !td.board.see_ge(mv, 1)) {
+                        continue;
+                    }
                 }
             }
         }
-        let moved_piece = td.board.moved_piece(mv);
         if selective
             && use_qs_hp
             && best_score > -MATE_THRESHOLD

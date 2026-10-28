@@ -5,9 +5,9 @@ use asura::{
         lmr_table_term, search, search_reference, search_with_context, search_with_tt, search_with_zero_draws,
         search_without_checked_tt_cutoff, search_without_fp, search_without_hp, search_without_iir,
         search_without_late_quiet_closure, search_without_lmp, search_without_lmr, search_without_nmp,
-        search_without_probcut, search_without_qs_futility_pruning, search_without_qs_history_pruning,
-        search_without_qs_late_capture_pruning, search_without_razoring, search_without_rfp, search_without_se,
-        search_without_see_pruning,
+        search_without_probcut, search_without_qs_early_cutoff, search_without_qs_futility_pruning,
+        search_without_qs_history_pruning, search_without_qs_late_capture_pruning, search_without_razoring,
+        search_without_rfp, search_without_se, search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -764,5 +764,51 @@ fn quiescence_late_capture_pruning_skips_late_equal_trades_and_preserves_tactics
         "Quiescence late-capture gate must prune 2nd+ unrelated captures ({} vs {})",
         lc_on.nodes,
         lc_off.nodes
+    );
+}
+
+#[test]
+fn quiescence_early_cutoff_fails_high_on_history_backed_winning_captures() {
+    let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
+    let on = search_with_zero_draws(&midgame, 7);
+    let off = search_without_qs_early_cutoff(&midgame, 7);
+    assert_eq!(on.best_move, off.best_move);
+    assert_eq!(on.score, off.score);
+    assert!(
+        on.nodes < off.nodes,
+        "Quiescence history-backed early fail-high should reduce nodes on Midgame ({} vs {})",
+        on.nodes,
+        off.nodes
+    );
+
+    // Direct history-gated test: after Move 1 (1. c5xd6 c7xd6) establishes
+    // alpha at the root, Move 2 (1. c5xb6) vacates c5 and unveils White's
+    // Queen on a3 to Black's Bishop on d6 (1... Bd6xa3, victim_val = 900,
+    // attacker_val = 330, victim - attacker - 225 = +345). With positive
+    // noisy_history for BlackBishop -> a3 x Queen, quiescence fails high
+    // BEFORE calling make_move(1... Bd6xa3), using strictly fewer nodes than
+    // with zero noisy_history.
+    let pos = Board::from_fen("6k1/2p1p3/1n1b4/2P5/8/Q7/8/6K1 w - - 0 1").unwrap();
+    let tt_zero = TranspositionTable::new(1);
+    let mut hist_zero = asura::history::HistoryTables::default();
+    let res_zero = search_with_context(&pos, 1, &tt_zero, &mut hist_zero);
+
+    let tt_pos = TranspositionTable::new(1);
+    let mut hist_pos = asura::history::HistoryTables::default();
+    for mask in [asura::types::Bitboard(0), asura::types::Bitboard(!0)] {
+        hist_pos.noisy_history.update(
+            mask,
+            asura::types::Piece::BlackBishop,
+            Square::A3,
+            asura::types::PieceType::Queen,
+            500,
+        );
+    }
+    let res_pos = search_with_context(&pos, 1, &tt_pos, &mut hist_pos);
+    assert!(
+        res_pos.nodes < res_zero.nodes,
+        "Positive noisy history must trigger QS early fail-high before make_move ({} vs {})",
+        res_pos.nodes,
+        res_zero.nodes
     );
 }
