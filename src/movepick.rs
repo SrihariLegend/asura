@@ -37,6 +37,7 @@ pub struct MainMovePicker {
     priority_scored: bool,
     tt_move: Move,
     stage: MainStage,
+    emitted_stage: MainStage,
     noisy_count: usize,
     is_root: bool,
 }
@@ -55,6 +56,7 @@ impl MainMovePicker {
             priority_scored: false,
             tt_move,
             stage: if tt_move.is_present() { MainStage::HashMove } else { MainStage::GenerateNoisy },
+            emitted_stage: MainStage::HashMove,
             noisy_count: 0,
             is_root,
         }
@@ -62,6 +64,10 @@ impl MainMovePicker {
 
     pub const fn stage(&self) -> MainStage {
         self.stage
+    }
+
+    pub const fn emitted_stage(&self) -> MainStage {
+        self.emitted_stage
     }
 
     pub fn next(
@@ -72,6 +78,7 @@ impl MainMovePicker {
                 MainStage::HashMove => {
                     self.stage = MainStage::GenerateNoisy;
                     if board.is_legal(self.tt_move) {
+                        self.emitted_stage = MainStage::HashMove;
                         return Some(self.tt_move);
                     }
                 }
@@ -104,6 +111,7 @@ impl MainMovePicker {
                             self.score_noisy(board, history);
                         }
                         self.noisy_count += 1;
+                        self.emitted_stage = MainStage::GoodNoisy;
                         return Some(mv);
                     }
                     self.stage = if skip_quiets {
@@ -124,6 +132,7 @@ impl MainMovePicker {
                         self.score_priority_quiets(board, history, ply);
                     }
                     if let Some(mv) = self.take_best_priority() {
+                        self.emitted_stage = MainStage::PriorityQuiet;
                         return Some(mv);
                     }
                     self.stage = MainStage::GenerateQuiet;
@@ -156,11 +165,13 @@ impl MainMovePicker {
                         if self.is_root {
                             self.score_quiet(board, history, ply);
                         }
+                        self.emitted_stage = MainStage::Quiet;
                         return Some(mv);
                     }
                     if self.deferred_index < self.deferred_quiets.len() {
                         let mv = self.deferred_quiets[self.deferred_index];
                         self.deferred_index += 1;
+                        self.emitted_stage = MainStage::Quiet;
                         return Some(mv);
                     }
                     self.stage = MainStage::BadNoisy;
@@ -169,6 +180,7 @@ impl MainMovePicker {
                     if self.bad_index < self.bad_noisy.len() {
                         let mv = self.bad_noisy[self.bad_index];
                         self.bad_index += 1;
+                        self.emitted_stage = MainStage::BadNoisy;
                         return Some(mv);
                     }
                     self.stage = MainStage::Done;

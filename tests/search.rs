@@ -1,6 +1,6 @@
 use asura::{
     board::Board,
-    search::{search, search_with_zero_draws},
+    search::{lmr_table_term, search, search_reference, search_with_zero_draws, search_without_lmr},
 };
 
 #[test]
@@ -201,4 +201,40 @@ fn iterative_deepening_accumulates_iterations_and_resolves_aspiration_swings() {
     assert_eq!(d1_low.score, -900);
     assert_eq!(d2_low.score, -31_996);
     assert!(d2_low.nodes > d1_low.nodes);
+}
+
+#[test]
+fn lmr_table_and_late_move_reductions_preserve_tactics_while_reducing_tree_size() {
+    assert_eq!(lmr_table_term(1, 1), 0);
+    assert_eq!(lmr_table_term(8, 8), 1_730);
+    assert!(lmr_table_term(12, 16) > lmr_table_term(8, 8));
+
+    // At depths 1 and 2, Black's quiet fork 1...Nd3 (attacking b4 and f2) has
+    // not yet resulted in a capture, so a1b1 scores -120 and remains the root
+    // work_item (move_count == 1) entering depth 3. At depth 3, a1b1/a1a2/a1b2
+    // allow 1...Nd3 and lose a pawn (-220), while the late quiet pawn moves
+    // (generated after the king moves at move_count >= 4) are searched under
+    // root LMR, beat the failed-low alpha on their reduced scout, and go
+    // through full-depth verification + PV re-search to hold -120.
+    let lmr_rescue = Board::from_fen("7k/8/8/4n3/1P6/8/5P2/K7 w - - 0 1").unwrap();
+    let d1 = search_with_zero_draws(&lmr_rescue, 1);
+    let d2 = search_with_zero_draws(&lmr_rescue, 2);
+    let d3 = search_with_zero_draws(&lmr_rescue, 3);
+    let ref3 = search_reference(&lmr_rescue, 3);
+    assert_eq!(d1.best_move.unwrap().to_uci(&lmr_rescue), "a1b1");
+    assert_eq!(d2.best_move.unwrap().to_uci(&lmr_rescue), "a1b1");
+    assert_eq!(d3.score, -120);
+    assert_eq!(d3.score, ref3.score);
+    assert!(matches!(d3.best_move.unwrap().to_uci(&lmr_rescue).as_str(), "f2f3" | "f2f4" | "b4b5"));
+
+    // Same selective engine (TT, history, PVS, aspiration, selective QS) with LMR on vs off:
+    let start = Board::starting_position();
+    let lmr_on = search_with_zero_draws(&start, 5);
+    let lmr_off = search_without_lmr(&start, 5);
+    assert!(
+        lmr_on.nodes < lmr_off.nodes,
+        "LMR should reduce nodes in the same selective engine ({} vs {})",
+        lmr_on.nodes,
+        lmr_off.nodes
+    );
 }
