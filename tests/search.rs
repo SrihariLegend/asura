@@ -3,7 +3,7 @@ use asura::{
     movepick::{MainMovePicker, MainStage},
     search::{
         lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws, search_without_lmr,
-        search_without_nmp, search_without_probcut, search_without_rfp,
+        search_without_nmp, search_without_probcut, search_without_rfp, search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -350,4 +350,18 @@ fn probcut_prunes_tactical_captures_and_validates_collided_tt_moves() {
         assert_ne!(mv, bad_tt_capture);
         assert!(kiwipete.see_ge(mv, 300));
     }
+}
+
+#[test]
+fn main_loop_see_pruning_reduces_nodes_and_preserves_tactics() {
+    let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+    let see_on = search_with_zero_draws(&kiwipete, 5);
+    let see_off = search_without_see_pruning(&kiwipete, 5);
+    assert_eq!(see_on.best_move, see_off.best_move);
+    assert!(
+        see_on.nodes < see_off.nodes,
+        "Main-loop SEE pruning should reduce nodes in the same selective engine ({} vs {})",
+        see_on.nodes,
+        see_off.nodes
+    );
 }

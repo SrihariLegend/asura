@@ -64,6 +64,12 @@ const PROBCUT_MIN_DEPTH: u8 = 5;
 const PROBCUT_BETA_MARGIN: i32 = 150;
 const PROBCUT_IMPROVING_BONUS: i32 = 40;
 
+// Main-loop SEE pruning constants on the 100 = 1 pawn / 10_000 = MAX_HISTORY scale.
+const SEE_QUIET_HIST_DIV: i32 = 5_000;
+const SEE_QUIET_QUAD_COEFF: i32 = -20;
+const SEE_NOISY_DEPTH_COEFF: i32 = -90;
+const SEE_NOISY_HIST_DIV: i32 = 100;
+
 thread_local! {
     static LOCAL_TT: RefCell<TranspositionTable> = RefCell::new(TranspositionTable::new(4));
     static LOCAL_HISTORY: RefCell<HistoryTables> = RefCell::new(HistoryTables::default());
@@ -425,7 +431,7 @@ pub fn search(position: &Board, depth: u8) -> SearchResult {
         LOCAL_HISTORY.with_borrow_mut(|history| {
             tt.clear(1);
             history.clear();
-            run_search::<true, true, true, true, true, true>(position, depth, Some(tt), Some(history))
+            run_search::<true, true, true, true, true, true, true>(position, depth, Some(tt), Some(history))
         })
     })
 }
@@ -434,7 +440,7 @@ pub fn search(position: &Board, depth: u8) -> SearchResult {
 pub fn search_with_tt(position: &Board, depth: u8, tt: &TranspositionTable) -> SearchResult {
     LOCAL_HISTORY.with_borrow_mut(|history| {
         history.clear();
-        run_search::<true, true, true, true, true, true>(position, depth, Some(tt), Some(history))
+        run_search::<true, true, true, true, true, true, true>(position, depth, Some(tt), Some(history))
     })
 }
 
@@ -442,7 +448,7 @@ pub fn search_with_tt(position: &Board, depth: u8, tt: &TranspositionTable) -> S
 pub fn search_with_context(
     position: &Board, depth: u8, tt: &TranspositionTable, history: &mut HistoryTables,
 ) -> SearchResult {
-    run_search::<true, true, true, true, true, true>(position, depth, Some(tt), Some(history))
+    run_search::<true, true, true, true, true, true, true>(position, depth, Some(tt), Some(history))
 }
 
 /// The normal selective search, with recognized draws scored exactly zero.
@@ -451,63 +457,75 @@ pub fn search_with_zero_draws(position: &Board, depth: u8) -> SearchResult {
         LOCAL_HISTORY.with_borrow_mut(|history| {
             tt.clear(1);
             history.clear();
-            run_search::<false, true, true, true, true, true>(position, depth, Some(tt), Some(history))
+            run_search::<false, true, true, true, true, true, true>(position, depth, Some(tt), Some(history))
         })
     })
 }
 
-/// The selective search (TT, history, PVS, aspiration, NMP, RFP, ProbCut, selective QS) with LMR disabled
-/// and recognized draws scored zero, isolating the effect of LMR.
+/// The selective search (TT, history, PVS, aspiration, NMP, RFP, ProbCut, SEE pruning, selective QS)
+/// with LMR disabled and recognized draws scored zero, isolating the effect of LMR.
 pub fn search_without_lmr(position: &Board, depth: u8) -> SearchResult {
     LOCAL_TT.with_borrow_mut(|tt| {
         LOCAL_HISTORY.with_borrow_mut(|history| {
             tt.clear(1);
             history.clear();
-            run_search::<false, true, false, true, true, true>(position, depth, Some(tt), Some(history))
+            run_search::<false, true, false, true, true, true, true>(position, depth, Some(tt), Some(history))
         })
     })
 }
 
-/// The selective search (TT, history, PVS, aspiration, LMR, RFP, ProbCut, selective QS) with NMP disabled
-/// and recognized draws scored zero, isolating the effect of NMP.
+/// The selective search (TT, history, PVS, aspiration, LMR, RFP, ProbCut, SEE pruning, selective QS)
+/// with NMP disabled and recognized draws scored zero, isolating the effect of NMP.
 pub fn search_without_nmp(position: &Board, depth: u8) -> SearchResult {
     LOCAL_TT.with_borrow_mut(|tt| {
         LOCAL_HISTORY.with_borrow_mut(|history| {
             tt.clear(1);
             history.clear();
-            run_search::<false, true, true, false, true, true>(position, depth, Some(tt), Some(history))
+            run_search::<false, true, true, false, true, true, true>(position, depth, Some(tt), Some(history))
         })
     })
 }
 
-/// The selective search (TT, history, PVS, aspiration, LMR, NMP, ProbCut, selective QS) with RFP disabled
-/// and recognized draws scored zero, isolating the effect of RFP.
+/// The selective search (TT, history, PVS, aspiration, LMR, NMP, ProbCut, SEE pruning, selective QS)
+/// with RFP disabled and recognized draws scored zero, isolating the effect of RFP.
 pub fn search_without_rfp(position: &Board, depth: u8) -> SearchResult {
     LOCAL_TT.with_borrow_mut(|tt| {
         LOCAL_HISTORY.with_borrow_mut(|history| {
             tt.clear(1);
             history.clear();
-            run_search::<false, true, true, true, false, true>(position, depth, Some(tt), Some(history))
+            run_search::<false, true, true, true, false, true, true>(position, depth, Some(tt), Some(history))
         })
     })
 }
 
-/// The selective search (TT, history, PVS, aspiration, LMR, NMP, RFP, selective QS) with ProbCut disabled
-/// and recognized draws scored zero, isolating the effect of ProbCut.
+/// The selective search (TT, history, PVS, aspiration, LMR, NMP, RFP, SEE pruning, selective QS)
+/// with ProbCut disabled and recognized draws scored zero, isolating the effect of ProbCut.
 pub fn search_without_probcut(position: &Board, depth: u8) -> SearchResult {
     LOCAL_TT.with_borrow_mut(|tt| {
         LOCAL_HISTORY.with_borrow_mut(|history| {
             tt.clear(1);
             history.clear();
-            run_search::<false, true, true, true, true, false>(position, depth, Some(tt), Some(history))
+            run_search::<false, true, true, true, true, false, true>(position, depth, Some(tt), Some(history))
         })
     })
 }
 
-/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut.
+/// The selective search (TT, history, PVS, aspiration, LMR, NMP, RFP, ProbCut, selective QS)
+/// with main-loop SEE pruning disabled and recognized draws scored zero, isolating SEE pruning.
+pub fn search_without_see_pruning(position: &Board, depth: u8) -> SearchResult {
+    LOCAL_TT.with_borrow_mut(|tt| {
+        LOCAL_HISTORY.with_borrow_mut(|history| {
+            tt.clear(1);
+            history.clear();
+            run_search::<false, true, true, true, true, true, false>(position, depth, Some(tt), Some(history))
+        })
+    })
+}
+
+/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE.
 /// Keeps every evasion and capture eligible for independent minimax comparisons.
 pub fn search_reference(position: &Board, depth: u8) -> SearchResult {
-    run_search::<false, false, false, false, false, false>(position, depth, None, None)
+    run_search::<false, false, false, false, false, false, false>(position, depth, None, None)
 }
 
 fn run_search<
@@ -517,6 +535,7 @@ fn run_search<
     const USE_NMP: bool,
     const USE_RFP: bool,
     const USE_PROBCUT: bool,
+    const USE_SEE: bool,
 >(
     position: &Board, depth: u8, tt: Option<&TranspositionTable>, mut history: Option<&mut HistoryTables>,
 ) -> SearchResult {
@@ -531,25 +550,26 @@ fn run_search<
 
     let (score, best_move) = if !SELECTIVE || depth == 0 {
         let mut sel_depth = 0;
-        let (score, best_move) = search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, true>(
-            &mut board,
-            &mut stack,
-            depth,
-            0,
-            0,
-            None,
-            Move::NULL,
-            false,
-            TtDepth::NONE_SCORE,
-            0,
-            -INFINITY,
-            INFINITY,
-            &mut pv,
-            &mut nodes,
-            &mut sel_depth,
-            tt,
-            history,
-        );
+        let (score, best_move) =
+            search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, true>(
+                &mut board,
+                &mut stack,
+                depth,
+                0,
+                0,
+                None,
+                Move::NULL,
+                false,
+                TtDepth::NONE_SCORE,
+                0,
+                -INFINITY,
+                INFINITY,
+                &mut pv,
+                &mut nodes,
+                &mut sel_depth,
+                tt,
+                history,
+            );
         if let Some(mv) = best_move
             && pv.len == 0
         {
@@ -557,7 +577,7 @@ fn run_search<
         }
         (score, best_move)
     } else {
-        run_iterative_search::<DRAW_JITTER, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT>(
+        run_iterative_search::<DRAW_JITTER, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE>(
             &mut board,
             &mut stack,
             depth,
@@ -578,6 +598,7 @@ fn run_iterative_search<
     const USE_NMP: bool,
     const USE_RFP: bool,
     const USE_PROBCUT: bool,
+    const USE_SEE: bool,
 >(
     board: &mut Board, stack: &mut SearchStack, max_depth: u8, nodes: &mut u64, pv: &mut PvLine,
     tt: &TranspositionTable, history: &mut HistoryTables,
@@ -615,7 +636,7 @@ fn run_iterative_search<
         loop {
             *stack = SearchStack::default();
             let root_effective_depth = aspiration_depth.max(1);
-            let score = search_root::<DRAW_JITTER, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT>(
+            let score = search_root::<DRAW_JITTER, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE>(
                 board,
                 stack,
                 window.alpha,
@@ -696,6 +717,7 @@ fn search_root<
     const USE_NMP: bool,
     const USE_RFP: bool,
     const USE_PROBCUT: bool,
+    const USE_SEE: bool,
 >(
     board: &mut Board, stack: &mut SearchStack, mut alpha: i32, beta: i32, root_effective_depth: u8, pv_idx: usize,
     work_item: Move, root_moves: &mut RootMoves, nodes: &mut u64, tt: &TranspositionTable, history: &mut HistoryTables,
@@ -769,7 +791,7 @@ fn search_root<
 
         let score = if move_count == 1 {
             stack.entries[0].reduction = 0;
-            -search_node::<DRAW_JITTER, true, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, true>(
+            -search_node::<DRAW_JITTER, true, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, true>(
                 board,
                 stack,
                 child_depth,
@@ -810,7 +832,7 @@ fn search_root<
 
             let mut scout_pv = PvLine::new();
             stack.entries[0].reduction = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
-            let mut scout = -search_node::<DRAW_JITTER, true, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, false>(
+            let mut scout = -search_node::<DRAW_JITTER, true, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, false>(
                 board,
                 stack,
                 reduced_depth,
@@ -840,7 +862,7 @@ fn search_root<
                 }
                 if retry_depth > reduced_depth {
                     stack.entries[0].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
-                    scout = -search_node::<DRAW_JITTER, true, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, false>(
+                    scout = -search_node::<DRAW_JITTER, true, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, false>(
                         board,
                         stack,
                         retry_depth,
@@ -866,7 +888,7 @@ fn search_root<
 
             if scout > alpha && beta > alpha + 1 {
                 stack.entries[0].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
-                let res = -search_node::<DRAW_JITTER, true, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, true>(
+                let res = -search_node::<DRAW_JITTER, true, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, true>(
                     board,
                     stack,
                     retry_depth,
@@ -966,6 +988,7 @@ fn search_node<
     const USE_NMP: bool,
     const USE_RFP: bool,
     const USE_PROBCUT: bool,
+    const USE_SEE: bool,
     const PV: bool,
 >(
     board: &mut Board, stack: &mut SearchStack, depth: u8, ply: u16, last_critical_ply: u16, previous: Option<Square>,
@@ -1190,26 +1213,27 @@ fn search_node<
             }
 
             let mut null_pv = PvLine::new();
-            let null_score = -search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, false>(
-                board,
-                stack,
-                null_depth,
-                ply + 1,
-                ply + 1,
-                None,
-                Move::NULL,
-                !cut_node,
-                raw_eval,
-                0,
-                -beta,
-                -beta + 1,
-                &mut null_pv,
-                nodes,
-                sel_depth,
-                tt,
-                history.as_deref_mut(),
-            )
-            .0;
+            let null_score =
+                -search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, false>(
+                    board,
+                    stack,
+                    null_depth,
+                    ply + 1,
+                    ply + 1,
+                    None,
+                    Move::NULL,
+                    !cut_node,
+                    raw_eval,
+                    0,
+                    -beta,
+                    -beta + 1,
+                    &mut null_pv,
+                    nodes,
+                    sel_depth,
+                    tt,
+                    history.as_deref_mut(),
+                )
+                .0;
 
             board.undo_null_move();
 
@@ -1222,7 +1246,7 @@ fn search_node<
                 stack.nmp_min_ply = ply + 3 * u16::from(null_depth) / 4;
                 let mut verify_pv = PvLine::new();
                 let verified_score =
-                    search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, false>(
+                    search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, false>(
                         board,
                         stack,
                         null_depth,
@@ -1302,26 +1326,27 @@ fn search_node<
 
                 if score >= prob_beta {
                     let mut prob_pv = PvLine::new();
-                    score = -search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, false>(
-                        board,
-                        stack,
-                        prob_depth,
-                        ply + 1,
-                        last_critical_ply,
-                        Some(mv.to()),
-                        mv,
-                        !cut_node,
-                        raw_eval,
-                        1,
-                        -prob_beta,
-                        -prob_beta + 1,
-                        &mut prob_pv,
-                        nodes,
-                        sel_depth,
-                        tt,
-                        history.as_deref_mut(),
-                    )
-                    .0;
+                    score =
+                        -search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, false>(
+                            board,
+                            stack,
+                            prob_depth,
+                            ply + 1,
+                            last_critical_ply,
+                            Some(mv.to()),
+                            mv,
+                            !cut_node,
+                            raw_eval,
+                            1,
+                            -prob_beta,
+                            -prob_beta + 1,
+                            &mut prob_pv,
+                            nodes,
+                            sel_depth,
+                            tt,
+                            history.as_deref_mut(),
+                        )
+                        .0;
                 }
 
                 undo_move(board, mv);
@@ -1388,6 +1413,22 @@ fn search_node<
             0
         };
 
+        // Main-loop SEE pruning: skip quiet or noisy moves at shallow depths
+        // whose static exchange loss exceeds a depth- and history-scaled margin.
+        if SELECTIVE && USE_SEE && ply > 0 && !in_check && best_score > -MATE_THRESHOLD {
+            let cut_shift = usize::from(!PV && cut_node);
+            let threshold = if is_quiet {
+                let lmr_plies = lmr_table_term(depth, move_count) / LMR_SCALE;
+                let rank = (depth as i32 + hist / SEE_QUIET_HIST_DIV - lmr_plies).max(1);
+                (SEE_QUIET_QUAD_COEFF * rank * rank) >> cut_shift
+            } else {
+                ((SEE_NOISY_DEPTH_COEFF * depth as i32 - hist / SEE_NOISY_HIST_DIV) >> cut_shift).min(0)
+            };
+            if !board.see_ge(mv, threshold) {
+                continue;
+            }
+        }
+
         if let Some(h) = history.as_deref_mut() {
             h.continuation_history.remember(ply_idx, in_check, mv, moved_piece);
         }
@@ -1402,7 +1443,7 @@ fn search_node<
 
         let score = if !SELECTIVE || move_count == 1 {
             stack.entries[ply_idx].reduction = 0;
-            -search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, PV>(
+            -search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, PV>(
                 board,
                 stack,
                 child_depth,
@@ -1456,26 +1497,27 @@ fn search_node<
 
             let mut scout_pv = PvLine::new();
             stack.entries[ply_idx].reduction = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
-            let mut scout = -search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, false>(
-                board,
-                stack,
-                reduced_depth,
-                ply + 1,
-                ply + 1,
-                Some(mv.to()),
-                mv,
-                true,
-                raw_eval,
-                move_count,
-                -alpha - 1,
-                -alpha,
-                &mut scout_pv,
-                nodes,
-                sel_depth,
-                tt,
-                history.as_deref_mut(),
-            )
-            .0;
+            let mut scout =
+                -search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, false>(
+                    board,
+                    stack,
+                    reduced_depth,
+                    ply + 1,
+                    ply + 1,
+                    Some(mv.to()),
+                    mv,
+                    true,
+                    raw_eval,
+                    move_count,
+                    -alpha - 1,
+                    -alpha,
+                    &mut scout_pv,
+                    nodes,
+                    sel_depth,
+                    tt,
+                    history.as_deref_mut(),
+                )
+                .0;
             stack.entries[ply_idx].reduction = 0;
 
             if is_quiet
@@ -1491,7 +1533,35 @@ fn search_node<
                 retry_depth = plan_scout_retry(best_score, scout, child_depth, reduced_depth);
                 if retry_depth > reduced_depth {
                     stack.entries[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
-                    scout = -search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, false>(
+                    scout =
+                        -search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, false>(
+                            board,
+                            stack,
+                            retry_depth,
+                            ply + 1,
+                            last_critical_ply,
+                            Some(mv.to()),
+                            mv,
+                            PV || !cut_node,
+                            raw_eval,
+                            move_count,
+                            -alpha - 1,
+                            -alpha,
+                            &mut scout_pv,
+                            nodes,
+                            sel_depth,
+                            tt,
+                            history.as_deref_mut(),
+                        )
+                        .0;
+                    stack.entries[ply_idx].reduction = 0;
+                }
+            }
+
+            if PV && scout > alpha && beta > alpha + 1 {
+                stack.entries[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
+                let res =
+                    -search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, USE_SEE, true>(
                         board,
                         stack,
                         retry_depth,
@@ -1499,44 +1569,18 @@ fn search_node<
                         last_critical_ply,
                         Some(mv.to()),
                         mv,
-                        PV || !cut_node,
+                        false,
                         raw_eval,
                         move_count,
-                        -alpha - 1,
+                        -beta,
                         -alpha,
-                        &mut scout_pv,
+                        &mut child_pv,
                         nodes,
                         sel_depth,
                         tt,
                         history.as_deref_mut(),
                     )
                     .0;
-                    stack.entries[ply_idx].reduction = 0;
-                }
-            }
-
-            if PV && scout > alpha && beta > alpha + 1 {
-                stack.entries[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
-                let res = -search_node::<DRAW_JITTER, SELECTIVE, USE_LMR, USE_NMP, USE_RFP, USE_PROBCUT, true>(
-                    board,
-                    stack,
-                    retry_depth,
-                    ply + 1,
-                    last_critical_ply,
-                    Some(mv.to()),
-                    mv,
-                    false,
-                    raw_eval,
-                    move_count,
-                    -beta,
-                    -alpha,
-                    &mut child_pv,
-                    nodes,
-                    sel_depth,
-                    tt,
-                    history.as_deref_mut(),
-                )
-                .0;
                 stack.entries[ply_idx].reduction = 0;
                 res
             } else {
