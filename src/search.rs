@@ -5,79 +5,17 @@ use crate::{
     evaluation::evaluate,
     history::HistoryTables,
     movepick::{MainMovePicker, MainStage, QuiescenceMovePicker, creates_threat_on_board},
+    parameters::*,
+    stack::Stack as SearchStack,
     transposition::{Bound, TranspositionTable, TtDepth},
-    types::{Move, Piece, Square},
+    types::{MAX_PLY as MAX_PLY_USIZE, Move, Piece, Score, Square, is_decisive},
 };
 
-pub const MATE_SCORE: i32 = 32_000;
-const MAX_PLY: u16 = 256;
-const MAX_PLY_USIZE: usize = MAX_PLY as usize;
+pub const MATE_SCORE: i32 = Score::MATE;
+const MAX_PLY: u16 = MAX_PLY_USIZE as u16;
 const RECAPTURE_ONLY_DEPTH: i16 = -4;
-pub const MATE_THRESHOLD: i32 = MATE_SCORE - MAX_PLY as i32;
-const INFINITY: i32 = MATE_SCORE + 1;
-
-// Centipawn-scale (100 = 1 pawn) aspiration constants using power-of-10 ratios.
-const ASPIRATION_MIN_DEPTH: u8 = 2;
-const ASPIRATION_BASE_DELTA: i32 = 10;
-const ASPIRATION_STABILITY_MAX: i32 = 5;
-const ASPIRATION_VOLATILITY_NUM: i32 = 25;
-const ASPIRATION_QUADRATIC_DIV: i32 = 10_000;
-const ASPIRATION_FAIL_LOW_WIDEN_NUM: i32 = 25;
-const ASPIRATION_FAIL_HIGH_WIDEN_NUM: i32 = 50;
-const ASPIRATION_RATIO_DEN: i32 = 100;
-const ASPIRATION_INFINITE_BOUND: i32 = 1_000;
-const EVAL_STABILITY_THRESHOLD: i32 = 10;
-const SCOUT_HISTORY_BONUS: i32 = 50;
-
-// LMR constants in 1_000 = 1 ply fixed-point units.
-const LMR_SCALE: i32 = 1_000;
-const LMR_GOOD_NOISY_BASE: i32 = 200;
-const LMR_BAD_NOISY_BASE: i32 = 2_500;
-const LMR_PRIORITY_QUIET_BONUS: i32 = 1_000;
-const LMR_CHECK_BONUS: i32 = 750;
-const LMR_THREAT_BONUS: i32 = 750;
-const LMR_EXACT_BOUND_PENALTY: i32 = 1_000;
-const LMR_CHILD_CUTOFF_PENALTY: i32 = 1_000;
-
-// Null Move Pruning constants on the 100 = 1 pawn scale.
-const NMP_MIN_DEPTH: u8 = 3;
-const NMP_SHALLOW_DEPTH: u8 = 10;
-const NMP_SHALLOW_MARGIN: i32 = 0;
-const NMP_DEEP_FLOOR: i32 = -100;
-const NMP_TWO_PIECE_DEPTH: u8 = 12;
-const NMP_TT_SEE_MARGIN: i32 = 200;
-const NMP_BASE_REDUCTION: i32 = 3;
-const NMP_EXTRA_DIV: i32 = 100;
-const NMP_EXTRA_CAP: i32 = 6;
-const NMP_VERIFY_MIN_DEPTH: u8 = 14;
-
-// Reverse Futility Pruning constants on the 100 = 1 pawn / 10_000 = MAX_HISTORY scale.
-const RFP_MAX_DEPTH: u8 = 8;
-const RFP_DEPTH_MARGIN: i32 = 85;
-const RFP_IMPROVING_BONUS: i32 = 40;
-const RFP_NO_THREATS_BONUS: i32 = 35;
-const RFP_STAT_DIVISOR: i32 = 200;
-const RFP_MIN_MARGIN: i32 = 30;
-
-// ProbCut constants on the 100 = 1 pawn scale.
-const PROBCUT_MIN_DEPTH: u8 = 5;
-const PROBCUT_BETA_MARGIN: i32 = 150;
-const PROBCUT_IMPROVING_BONUS: i32 = 40;
-
-// Main-loop SEE pruning constants on the 100 = 1 pawn / 10_000 = MAX_HISTORY scale.
-const SEE_QUIET_HIST_DIV: i32 = 5_000;
-const SEE_QUIET_QUAD_COEFF: i32 = -20;
-const SEE_NOISY_DEPTH_COEFF: i32 = -90;
-const SEE_NOISY_HIST_DIV: i32 = 100;
-
-// Main-loop Futility Pruning constants on the 100 = 1 pawn / 10_000 = MAX_HISTORY scale.
-const FP_MAX_DEPTH: i32 = 6;
-const FP_BASE_MARGIN: i32 = 80;
-const FP_DEPTH_MARGIN: i32 = 80;
-const FP_HIST_DIV: i32 = 200;
-const FP_HIST_MIN: i32 = -60;
-const FP_HIST_MAX: i32 = 150;
-const FP_MIN_MARGIN: i32 = 50;
+pub const MATE_THRESHOLD: i32 = Score::MATE_IN_MAX;
+const INFINITY: i32 = Score::INFINITE;
 
 // Compile-time search configuration flags.
 const CFG_DRAW_JITTER: u32 = 1 << 0;
@@ -110,56 +48,6 @@ pub fn lmr_table_term(depth: u8, move_count: usize) -> i32 {
         t
     });
     table[(depth as usize).clamp(1, 127)][move_count.clamp(1, 127)]
-}
-
-#[derive(Copy, Clone)]
-struct StackEntry {
-    static_eval: i32,
-    stat_score: i32,
-    reduction: i32,
-    laterality: i32,
-    cutoff_count: i32,
-}
-
-impl Default for StackEntry {
-    fn default() -> Self {
-        Self {
-            static_eval: TtDepth::NONE_SCORE,
-            stat_score: 0,
-            reduction: 0,
-            laterality: 0,
-            cutoff_count: 0,
-        }
-    }
-}
-
-struct SearchStack {
-    entries: [StackEntry; MAX_PLY_USIZE + 4],
-    nmp_min_ply: u16,
-}
-
-impl Default for SearchStack {
-    fn default() -> Self {
-        Self {
-            entries: [StackEntry::default(); MAX_PLY_USIZE + 4],
-            nmp_min_ply: 0,
-        }
-    }
-}
-
-impl SearchStack {
-    fn is_improving(&self, ply: usize, in_check: bool, static_eval: i32) -> bool {
-        if in_check || static_eval == TtDepth::NONE_SCORE {
-            return false;
-        }
-        if ply >= 2 && self.entries[ply - 2].static_eval != TtDepth::NONE_SCORE {
-            return static_eval > self.entries[ply - 2].static_eval;
-        }
-        if ply >= 4 && self.entries[ply - 4].static_eval != TtDepth::NONE_SCORE {
-            return static_eval > self.entries[ply - 4].static_eval;
-        }
-        false
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -758,10 +646,10 @@ fn search_root<const CFG: u32>(
         ev
     };
 
-    stack.entries[0].static_eval = raw_eval;
-    stack.entries[0].reduction = 0;
-    stack.entries[0].laterality = 0;
-    stack.entries[2].cutoff_count = 0;
+    stack[0].static_eval = raw_eval;
+    stack[0].reduction = 0;
+    stack[0].laterality = 0;
+    stack[2].cutoff_count = 0;
     history.clear_child_killers(0);
 
     let node_bias = compute_node_bias(true, in_check, false, true, false, priority_move.is_capture(), 0, 0, 0, 0);
@@ -799,14 +687,14 @@ fn search_root<const CFG: u32>(
         };
 
         history.continuation_history.remember(0, in_check, mv, moved_piece);
-        stack.entries[0].stat_score = hist;
-        stack.entries[0].laterality = if move_count > 1 { (move_count.ilog2() as i32 - 1).max(0) } else { 0 };
+        stack[0].stat_score = hist;
+        stack[0].laterality = if move_count > 1 { (move_count.ilog2() as i32 - 1).max(0) } else { 0 };
         make_move(board, mv, nodes, Some(tt));
         let gives_check = board.in_check();
 
         let use_lmr = (CFG & CFG_LMR) != 0;
         let score = if move_count == 1 {
-            stack.entries[0].reduction = 0;
+            stack[0].reduction = 0;
             -search_node::<CFG, true>(
                 board,
                 stack,
@@ -837,7 +725,7 @@ fn search_root<const CFG: u32>(
                     - LMR_CHECK_BONUS * gives_check as i32
                     - LMR_THREAT_BONUS * creates_threat as i32
                     + LMR_EXACT_BOUND_PENALTY * (bound == Bound::Exact) as i32
-                    + LMR_CHILD_CUTOFF_PENALTY * (stack.entries[1].cutoff_count > 2) as i32;
+                    + LMR_CHILD_CUTOFF_PENALTY * (stack[1].cutoff_count > 2) as i32;
                 if raw_reduction < 0 {
                     raw_reduction = 0;
                 }
@@ -847,7 +735,7 @@ fn search_root<const CFG: u32>(
             }
 
             let mut scout_pv = PvLine::new();
-            stack.entries[0].reduction = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
+            stack[0].reduction = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
             let mut scout = -search_node::<CFG, false>(
                 board,
                 stack,
@@ -868,7 +756,7 @@ fn search_root<const CFG: u32>(
                 Some(history),
             )
             .0;
-            stack.entries[0].reduction = 0;
+            stack[0].reduction = 0;
 
             let mut retry_depth = child_depth;
             if quotient > 0 && scout > alpha && reduced_depth < child_depth {
@@ -877,7 +765,7 @@ fn search_root<const CFG: u32>(
                     retry_depth = child_depth.saturating_add(1);
                 }
                 if retry_depth > reduced_depth {
-                    stack.entries[0].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
+                    stack[0].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
                     scout = -search_node::<CFG, false>(
                         board,
                         stack,
@@ -898,12 +786,12 @@ fn search_root<const CFG: u32>(
                         Some(history),
                     )
                     .0;
-                    stack.entries[0].reduction = 0;
+                    stack[0].reduction = 0;
                 }
             }
 
             if scout > alpha && beta > alpha + 1 {
-                stack.entries[0].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
+                stack[0].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
                 let res = -search_node::<CFG, true>(
                     board,
                     stack,
@@ -924,7 +812,7 @@ fn search_root<const CFG: u32>(
                     Some(history),
                 )
                 .0;
-                stack.entries[0].reduction = 0;
+                stack[0].reduction = 0;
                 res
             } else {
                 scout
@@ -1123,10 +1011,10 @@ fn search_node<const CFG: u32, const PV: bool>(
         ev
     };
 
-    stack.entries[ply_idx].static_eval = raw_eval;
-    stack.entries[ply_idx].reduction = 0;
-    if ply_idx + 2 < stack.entries.len() {
-        stack.entries[ply_idx + 2].cutoff_count = 0;
+    stack[ply_idx].static_eval = raw_eval;
+    stack[ply_idx].reduction = 0;
+    if ply_idx + 2 < stack.len() {
+        stack[ply_idx + 2].cutoff_count = 0;
     }
 
     // Parent-move quiet history update from static-eval surprise.
@@ -1151,9 +1039,9 @@ fn search_node<const CFG: u32, const PV: bool>(
 
     let static_eval = raw_eval;
     let improving = stack.is_improving(ply_idx, in_check, static_eval);
-    let parent_stat_score = if ply_idx > 0 { stack.entries[ply_idx - 1].stat_score } else { 0 };
-    let parent_reduction = if ply_idx > 0 { stack.entries[ply_idx - 1].reduction } else { 0 };
-    let parent_laterality = if ply_idx > 0 { stack.entries[ply_idx - 1].laterality } else { 0 };
+    let parent_stat_score = if ply_idx > 0 { stack[ply_idx - 1].stat_score } else { 0 };
+    let parent_reduction = if ply_idx > 0 { stack[ply_idx - 1].reduction } else { 0 };
+    let parent_laterality = if ply_idx > 0 { stack[ply_idx - 1].laterality } else { 0 };
 
     // Reverse Futility Pruning (RFP)
     if selective
@@ -1215,9 +1103,9 @@ fn search_node<const CFG: u32, const PV: bool>(
             if let Some(h) = history.as_deref_mut() {
                 h.continuation_history.remember(ply_idx, false, Move::NULL, Piece::None);
             }
-            stack.entries[ply_idx].stat_score = 0;
-            stack.entries[ply_idx].reduction = 0;
-            stack.entries[ply_idx].laterality = parent_laterality;
+            stack[ply_idx].stat_score = 0;
+            stack[ply_idx].reduction = 0;
+            stack[ply_idx].laterality = parent_laterality;
 
             board.make_null_move();
             if let Some(t) = tt {
@@ -1315,9 +1203,9 @@ fn search_node<const CFG: u32, const PV: bool>(
                 if let Some(h) = history.as_deref_mut() {
                     h.continuation_history.remember(ply_idx, false, mv, moved_piece);
                 }
-                stack.entries[ply_idx].stat_score = hist;
-                stack.entries[ply_idx].reduction = 0;
-                stack.entries[ply_idx].laterality = parent_laterality;
+                stack[ply_idx].stat_score = hist;
+                stack[ply_idx].reduction = 0;
+                stack[ply_idx].laterality = parent_laterality;
 
                 make_move(board, mv, nodes, tt);
 
@@ -1481,8 +1369,8 @@ fn search_node<const CFG: u32, const PV: bool>(
         if let Some(h) = history.as_deref_mut() {
             h.continuation_history.remember(ply_idx, in_check, mv, moved_piece);
         }
-        stack.entries[ply_idx].stat_score = hist;
-        stack.entries[ply_idx].laterality =
+        stack[ply_idx].stat_score = hist;
+        stack[ply_idx].laterality =
             parent_laterality + if move_count > 1 { (move_count.ilog2() as i32 - 1).max(0) } else { 0 };
 
         let mut child_pv = PvLine::new();
@@ -1491,7 +1379,7 @@ fn search_node<const CFG: u32, const PV: bool>(
         let child_depth = depth - 1;
 
         let score = if !selective || move_count == 1 {
-            stack.entries[ply_idx].reduction = 0;
+            stack[ply_idx].reduction = 0;
             -search_node::<CFG, PV>(
                 board,
                 stack,
@@ -1533,7 +1421,7 @@ fn search_node<const CFG: u32, const PV: bool>(
                     - LMR_THREAT_BONUS * creates_threat as i32
                     + LMR_EXACT_BOUND_PENALTY * (bound == Bound::Exact) as i32
                     + LMR_CHILD_CUTOFF_PENALTY
-                        * (ply_idx + 1 < stack.entries.len() && stack.entries[ply_idx + 1].cutoff_count > 2) as i32;
+                        * (ply_idx + 1 < stack.len() && stack[ply_idx + 1].cutoff_count > 2) as i32;
 
                 quotient = raw_reduction / LMR_SCALE;
                 let reduction_plies = if quotient < 0 {
@@ -1545,7 +1433,7 @@ fn search_node<const CFG: u32, const PV: bool>(
             }
 
             let mut scout_pv = PvLine::new();
-            stack.entries[ply_idx].reduction = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
+            stack[ply_idx].reduction = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
             let mut scout = -search_node::<CFG, false>(
                 board,
                 stack,
@@ -1566,7 +1454,7 @@ fn search_node<const CFG: u32, const PV: bool>(
                 history.as_deref_mut(),
             )
             .0;
-            stack.entries[ply_idx].reduction = 0;
+            stack[ply_idx].reduction = 0;
 
             if is_quiet
                 && (quotient > 0 || !lmr_eligible)
@@ -1580,7 +1468,7 @@ fn search_node<const CFG: u32, const PV: bool>(
             if quotient > 0 && scout > alpha && reduced_depth < child_depth {
                 retry_depth = plan_scout_retry(best_score, scout, child_depth, reduced_depth);
                 if retry_depth > reduced_depth {
-                    stack.entries[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
+                    stack[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
                     scout = -search_node::<CFG, false>(
                         board,
                         stack,
@@ -1601,12 +1489,12 @@ fn search_node<const CFG: u32, const PV: bool>(
                         history.as_deref_mut(),
                     )
                     .0;
-                    stack.entries[ply_idx].reduction = 0;
+                    stack[ply_idx].reduction = 0;
                 }
             }
 
             if PV && scout > alpha && beta > alpha + 1 {
-                stack.entries[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
+                stack[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
                 let res = -search_node::<CFG, true>(
                     board,
                     stack,
@@ -1627,7 +1515,7 @@ fn search_node<const CFG: u32, const PV: bool>(
                     history.as_deref_mut(),
                 )
                 .0;
-                stack.entries[ply_idx].reduction = 0;
+                stack[ply_idx].reduction = 0;
                 res
             } else {
                 scout
@@ -1645,7 +1533,7 @@ fn search_node<const CFG: u32, const PV: bool>(
                 }
                 if score >= beta {
                     bound = Bound::Lower;
-                    stack.entries[ply_idx].cutoff_count += 1;
+                    stack[ply_idx].cutoff_count += 1;
                     break;
                 }
                 alpha = score;
@@ -1985,10 +1873,6 @@ fn quiescence<const CFG: u32, const PV: bool>(
     }
 
     best_score
-}
-
-const fn is_decisive(score: i32) -> bool {
-    score.abs() >= MATE_THRESHOLD
 }
 
 fn make_move(board: &mut Board, mv: Move, nodes: &mut u64, tt: Option<&TranspositionTable>) {

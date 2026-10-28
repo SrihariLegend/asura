@@ -3,10 +3,7 @@ use std::{
     sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
 
-use crate::{
-    search::{MATE_SCORE, MATE_THRESHOLD},
-    types::Move,
-};
+use crate::types::{Move, Score};
 
 pub const DEFAULT_TT_SIZE: usize = 16;
 
@@ -107,7 +104,7 @@ impl TtDepth {
     pub const QS_NO_CHECKS: i32 = -2;
     pub const QS_SHALLOW_CHECKS: i32 = -1;
     pub const QS_CHECKS: i32 = 0;
-    pub const NONE_SCORE: i32 = 32_002;
+    pub const NONE_SCORE: i32 = Score::NONE;
 
     const fn from_tt(offset_depth: u8) -> i32 {
         offset_depth as i32 - 6
@@ -360,24 +357,24 @@ const fn index(hash: u64, len: usize) -> usize {
 }
 
 const fn is_decisive_score(score: i32) -> bool {
-    score != TtDepth::NONE_SCORE && score.abs() >= MATE_THRESHOLD
+    score != Score::NONE && score.abs() >= Score::MATE_IN_MAX
 }
 
 const fn score_from_tt(score: i32, ply: isize, halfmove_clock: u8) -> i32 {
-    if score == TtDepth::NONE_SCORE {
-        return TtDepth::NONE_SCORE;
+    if score == Score::NONE {
+        return Score::NONE;
     }
 
-    if score >= MATE_THRESHOLD {
-        if MATE_SCORE - score > 100 - halfmove_clock as i32 {
-            return MATE_THRESHOLD - 1;
+    if score >= Score::MATE_IN_MAX {
+        if Score::MATE - score > 100 - halfmove_clock as i32 {
+            return Score::MATE_IN_MAX - 1;
         }
         return score - ply as i32;
     }
 
-    if score <= -MATE_THRESHOLD {
-        if MATE_SCORE + score > 100 - halfmove_clock as i32 {
-            return -MATE_THRESHOLD + 1;
+    if score <= -Score::MATE_IN_MAX {
+        if Score::MATE + score > 100 - halfmove_clock as i32 {
+            return -Score::MATE_IN_MAX + 1;
         }
         return score + ply as i32;
     }

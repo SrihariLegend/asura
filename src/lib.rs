@@ -10,7 +10,9 @@ pub mod types;
 
 mod evaluation;
 mod lookup;
+mod parameters;
 mod setwise;
+mod stack;
 mod uci;
 
 /// Execute queued commands, or read UCI commands from stdin if the queue is empty.

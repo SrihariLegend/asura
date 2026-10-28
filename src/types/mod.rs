@@ -5,6 +5,7 @@ pub mod keys;
 pub mod movelist;
 pub mod moves;
 pub mod piece;
+pub mod score;
 pub mod square;
 pub mod zobrist;
 
@@ -15,8 +16,12 @@ pub use keys::*;
 pub use movelist::*;
 pub use moves::*;
 pub use piece::*;
+pub use score::*;
 pub use square::*;
 pub use zobrist::*;
+
+/// The maximum number of plies that can be searched.
+pub const MAX_PLY: usize = 256;
 
 /// Fixed move-list capacity, with room above the maximum 218 legal moves.
 pub const MAX_MOVES: usize = 256;
