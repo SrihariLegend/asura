@@ -35,6 +35,7 @@ const CFG_SE: u32 = 1 << 11;
 const CFG_RAZOR: u32 = 1 << 12;
 const CFG_CHECKED_TT_CUT: u32 = 1 << 13;
 const CFG_LQC: u32 = 1 << 14;
+const CFG_QS_HP: u32 = 1 << 15;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -48,7 +49,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_SE
     | CFG_RAZOR
     | CFG_CHECKED_TT_CUT
-    | CFG_LQC;
+    | CFG_LQC
+    | CFG_QS_HP;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -202,6 +204,8 @@ define_diagnostic_searches! {
     search_without_checked_tt_cutoff: CFG_ALL_SELECTIVE & !CFG_CHECKED_TT_CUT;
     /// The selective search with post-move late-quiet closure disabled and recognized draws scored zero.
     search_without_late_quiet_closure: CFG_ALL_SELECTIVE & !CFG_LQC;
+    /// The selective search with quiescence quiet-history pruning disabled and recognized draws scored zero.
+    search_without_qs_history_pruning: CFG_ALL_SELECTIVE & !CFG_QS_HP;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -1414,6 +1418,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
 ) -> (i32, Move) {
     let draw_jitter = (CFG & CFG_DRAW_JITTER) != 0;
     let selective = (CFG & CFG_SELECTIVE) != 0;
+    let use_qs_hp = (CFG & CFG_QS_HP) != 0;
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     debug_assert!(ply <= MAX_PLY && q_depth <= 0);
     td.sel_depth = td.sel_depth.max(ply);
@@ -1536,6 +1541,17 @@ fn quiescence<const CFG: u32, const PV: bool>(
             continue;
         }
         let moved_piece = td.board.moved_piece(mv);
+        if selective
+            && use_qs_hp
+            && best_score > -MATE_THRESHOLD
+            && mv.is_quiet()
+            && td
+                .history
+                .as_deref()
+                .is_some_and(|h| h.conthist(ply as usize, 1, moved_piece, mv.to()) < QS_QUIET_HIST_THRESHOLD)
+        {
+            continue;
+        }
         if let Some(h) = td.history.as_deref_mut() {
             h.continuation_history.remember(ply as usize, in_check, mv, moved_piece);
         }

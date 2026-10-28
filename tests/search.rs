@@ -2,11 +2,11 @@ use asura::{
     board::Board,
     movepick::{MainMovePicker, MainStage},
     search::{
-        lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws,
+        lmr_table_term, search, search_reference, search_with_context, search_with_tt, search_with_zero_draws,
         search_without_checked_tt_cutoff, search_without_fp, search_without_hp, search_without_iir,
         search_without_late_quiet_closure, search_without_lmp, search_without_lmr, search_without_nmp,
-        search_without_probcut, search_without_razoring, search_without_rfp, search_without_se,
-        search_without_see_pruning,
+        search_without_probcut, search_without_qs_history_pruning, search_without_razoring, search_without_rfp,
+        search_without_se, search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -619,4 +619,44 @@ fn post_move_late_quiet_closure_reduces_nodes_and_preserves_tactics() {
     assert_eq!(mate_on.best_move.unwrap().to_uci(&check_mate), "e6e7");
     assert_eq!(mate_on.score, 31_995);
     assert_eq!(mate_on.score, mate_off.score);
+}
+
+#[test]
+fn quiescence_quiet_history_pruning_skips_negative_continuation_checks() {
+    let italian = Board::from_fen("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
+    let on = search_with_zero_draws(&italian, 7);
+    let off = search_without_qs_history_pruning(&italian, 7);
+    assert_eq!(on.best_move, off.best_move);
+    assert_eq!(on.score, off.score);
+    assert!(
+        on.nodes < off.nodes,
+        "Quiescence quiet-history pruning should reduce nodes on Italian ({} vs {})",
+        on.nodes,
+        off.nodes
+    );
+
+    // Direct 1-ply continuation history check in quiescence:
+    // After White's root move, Black is at ply 1 (q_depth = 0) with a quiet
+    // check 1... Rd8-d1+. Seeding the 1-ply continuation entries for
+    // (White root move -> BlackRook to d1) below QS_QUIET_HIST_THRESHOLD (-350)
+    // causes quiescence to skip 1... Rd8-d1+, reducing the depth-1 node count
+    // compared to an unseeded history table.
+    let pos = Board::from_fen("3r2k1/8/8/8/8/8/P7/6KR w - - 0 1").unwrap();
+    let tt_clean = TranspositionTable::new(1);
+    let mut hist_clean = asura::history::HistoryTables::default();
+    let base = search_with_context(&pos, 1, &tt_clean, &mut hist_clean);
+
+    let tt_seeded = TranspositionTable::new(1);
+    let mut hist_seeded = asura::history::HistoryTables::default();
+    for &mv in pos.generate_all_moves().iter() {
+        hist_seeded.continuation_history.remember(0, false, mv, pos.moved_piece(mv));
+        hist_seeded.continuation_history.update(1, 1, asura::types::Piece::BlackRook, Square::D1, -2_000);
+    }
+    let pruned = search_with_context(&pos, 1, &tt_seeded, &mut hist_seeded);
+    assert!(
+        pruned.nodes < base.nodes,
+        "Negative 1-ply continuation history must prune the quiet check in quiescence ({} vs {})",
+        pruned.nodes,
+        base.nodes
+    );
 }

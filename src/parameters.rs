@@ -99,4 +99,7 @@ define! {
     i32, LATE_QUIET_MAX_DEPTH: 7;
     i32, LATE_QUIET_BASE_MARGIN: 60;
     i32, LATE_QUIET_DEPTH_MARGIN: 75;
+
+    // Quiescence quiet-history pruning threshold on the 10_000 = MAX_HISTORY scale.
+    i32, QS_QUIET_HIST_THRESHOLD: -350;
 }
