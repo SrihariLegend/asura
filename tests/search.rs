@@ -2,10 +2,10 @@ use asura::{
     board::Board,
     movepick::{MainMovePicker, MainStage},
     search::{
-        lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws, search_without_fp,
-        search_without_hp, search_without_iir, search_without_lmp, search_without_lmr, search_without_nmp,
-        search_without_probcut, search_without_razoring, search_without_rfp, search_without_se,
-        search_without_see_pruning,
+        lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws,
+        search_without_checked_tt_cutoff, search_without_fp, search_without_hp, search_without_iir, search_without_lmp,
+        search_without_lmr, search_without_nmp, search_without_probcut, search_without_razoring, search_without_rfp,
+        search_without_se, search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -538,4 +538,45 @@ fn razoring_prunes_hopeless_nodes_and_preserves_tactical_refutations() {
     let trap_off = search_without_razoring(&trap, 4);
     assert_eq!(trap_on.best_move, trap_off.best_move);
     assert_eq!(trap_on.score, trap_off.score);
+}
+
+#[test]
+fn checked_tt_capture_cutoff_prunes_verified_check_evasion_captures() {
+    // White has Move 1: 1. a2xb3 (captures a knight), and a checking move
+    // 1. Re1-e8+ where Black's rook on a8 can capture 1... Ra8xe8 (a legal
+    // capture evasion when in check!).
+    // At step 6 (reduced to depth = 4 at ply 1 by root LMR), 1... Ra8xe8 fails
+    // high and stores depth = 3 (4 - 1), Bound::Lower, mv = a8e8 (capture!) in
+    // the TT. At step 7 (reduced to depth = 5 at ply 1 by root LMR, !PV,
+    // in_check == true), entry.depth (3) < 5 (so early TT cutoff does not
+    // fire), but 3 >= 5 - 4 and score >= beta + 200 with tt_move.is_capture(),
+    // so checked TT-capture cutoff returns early without overwriting the TT
+    // entry at depth = 4 (5 - 1).
+    let pos = Board::from_fen("r5k1/5ppp/8/8/8/1n6/P4PPP/4R1K1 w - - 0 1").unwrap();
+    let e1e8 = Move::new(Square::E1, Square::E8, MoveKind::Normal);
+    let a8e8 = Move::new(Square::A8, Square::E8, MoveKind::Capture);
+    let mut child_after_e1e8 = pos.clone();
+    child_after_e1e8.make_move(e1e8);
+    assert!(child_after_e1e8.in_check());
+    assert!(child_after_e1e8.is_legal(a8e8));
+
+    let tt = TranspositionTable::new(4);
+    let _ = search_with_tt(&pos, 7, &tt);
+    let after = tt.read(child_after_e1e8.hash(), 0, 1).unwrap();
+    assert_eq!(after.mv, a8e8);
+    assert_eq!(
+        after.depth, 3,
+        "Checked TT-capture cutoff at depth 5 (step 7 after root LMR) must return before overwriting the depth-3 TT entry"
+    );
+
+    let on = search_with_zero_draws(&pos, 7);
+    let off = search_without_checked_tt_cutoff(&pos, 7);
+    assert_eq!(on.best_move, off.best_move);
+    assert_eq!(on.score, off.score);
+    assert!(
+        on.nodes < off.nodes,
+        "Checked TT-capture cutoff should reduce nodes on checked capture evasions ({} vs {})",
+        on.nodes,
+        off.nodes
+    );
 }

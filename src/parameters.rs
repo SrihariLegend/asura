@@ -89,4 +89,9 @@ define! {
     i32, RAZOR_BASE: 200;
     i32, RAZOR_MARGIN: 250;
     i32, RAZOR_MOVE_MARGIN: 175;
+
+    // Checked TT-capture cutoff constants on the 100 = 1 pawn scale.
+    u8,  CHECKED_TT_CAPTURE_MIN_DEPTH: 5;
+    i32, CHECKED_TT_CAPTURE_MARGIN: 200;
+    i32, CHECKED_TT_CAPTURE_DEPTH_GAP: 4;
 }

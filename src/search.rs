@@ -31,6 +31,7 @@ const CFG_HP: u32 = 1 << 9;
 const CFG_IIR: u32 = 1 << 10;
 const CFG_SE: u32 = 1 << 11;
 const CFG_RAZOR: u32 = 1 << 12;
+const CFG_CHECKED_TT_CUT: u32 = 1 << 13;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -42,7 +43,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_HP
     | CFG_IIR
     | CFG_SE
-    | CFG_RAZOR;
+    | CFG_RAZOR
+    | CFG_CHECKED_TT_CUT;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -513,7 +515,18 @@ pub fn search_without_razoring(position: &Board, depth: u8) -> SearchResult {
     })
 }
 
-/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring.
+/// The selective search with checked TT-capture cutoff disabled and recognized draws scored zero.
+pub fn search_without_checked_tt_cutoff(position: &Board, depth: u8) -> SearchResult {
+    LOCAL_TT.with_borrow_mut(|tt| {
+        LOCAL_HISTORY.with_borrow_mut(|history| {
+            tt.clear(1);
+            history.clear();
+            run_search::<{ CFG_ALL_SELECTIVE & !CFG_CHECKED_TT_CUT }>(position, depth, Some(tt), Some(history))
+        })
+    })
+}
+
+/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
 /// Keeps every evasion and capture eligible for independent minimax comparisons.
 pub fn search_reference(position: &Board, depth: u8) -> SearchResult {
     run_search::<0>(position, depth, None, None)
@@ -963,6 +976,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_iir = (CFG & CFG_IIR) != 0;
     let use_se = (CFG & CFG_SE) != 0;
     let use_razoring = (CFG & CFG_RAZOR) != 0;
+    let use_checked_tt_cut = (CFG & CFG_CHECKED_TT_CUT) != 0;
 
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     if PV {
@@ -1388,6 +1402,29 @@ fn search_node<const CFG: u32, const PV: bool>(
         && (tt_move.is_null() || entry.is_none_or(|e| e.depth + IIR_TT_DEPTH_GAP < depth as i32))
     {
         depth -= 1;
+    }
+
+    // Checked TT-capture cutoff: at non-PV nodes in check, if a legal TT
+    // capture evasion has a recent non-decisive lower/exact bound well above
+    // beta, fail high immediately.
+    if selective
+        && use_checked_tt_cut
+        && !in_singular
+        && !PV
+        && in_check
+        && depth >= CHECKED_TT_CAPTURE_MIN_DEPTH
+        && board.fiftymove_clock() < 90
+        && !is_decisive(beta)
+        && tt_move.is_capture()
+        && entry.is_some_and(|e| {
+            matches!(e.bound, Bound::Lower | Bound::Exact)
+                && e.score != TtDepth::NONE_SCORE
+                && !is_decisive(e.score)
+                && e.score >= beta + CHECKED_TT_CAPTURE_MARGIN
+                && e.depth >= depth as i32 - CHECKED_TT_CAPTURE_DEPTH_GAP
+        })
+    {
+        return (beta + CHECKED_TT_CAPTURE_MARGIN, None);
     }
 
     let node_bias = compute_node_bias(
