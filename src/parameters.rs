@@ -67,4 +67,9 @@ define! {
     i32, FP_HIST_MIN: -60;
     i32, FP_HIST_MAX: 150;
     i32, FP_MIN_MARGIN: 50;
+
+    // Quiet-History Pruning constants on the 10_000 = MAX_HISTORY scale.
+    u8,  HP_MAX_DEPTH: 4;
+    i32, HP_DEPTH_SCALE: -400;
+    i32, HP_IMPROVING_OFFSET: -200;
 }

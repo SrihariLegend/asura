@@ -3,8 +3,8 @@ use asura::{
     movepick::{MainMovePicker, MainStage},
     search::{
         lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws, search_without_fp,
-        search_without_lmp, search_without_lmr, search_without_nmp, search_without_probcut, search_without_rfp,
-        search_without_see_pruning,
+        search_without_hp, search_without_lmp, search_without_lmr, search_without_nmp, search_without_probcut,
+        search_without_rfp, search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -409,4 +409,18 @@ fn main_loop_futility_pruning_reduces_nodes_and_exempts_direct_checks() {
     assert_eq!(cf_on.best_move.unwrap().to_uci(&check_mate), "e6e7");
     assert_eq!(cf_on.score, 31_995);
     assert_eq!(cf_on.score, cf_off.score);
+}
+
+#[test]
+fn quiet_history_pruning_reduces_nodes_and_preserves_tactics() {
+    let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
+    let hp_on = search_with_zero_draws(&midgame, 5);
+    let hp_off = search_without_hp(&midgame, 5);
+    assert_eq!(hp_on.best_move, hp_off.best_move);
+    assert!(
+        hp_on.nodes < hp_off.nodes,
+        "Quiet-history pruning should reduce nodes in the same selective engine ({} vs {})",
+        hp_on.nodes,
+        hp_off.nodes
+    );
 }

@@ -27,7 +27,9 @@ const CFG_PROBCUT: u32 = 1 << 5;
 const CFG_SEE: u32 = 1 << 6;
 const CFG_LMP: u32 = 1 << 7;
 const CFG_FP: u32 = 1 << 8;
-const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE | CFG_LMR | CFG_NMP | CFG_RFP | CFG_PROBCUT | CFG_SEE | CFG_LMP | CFG_FP;
+const CFG_HP: u32 = 1 << 9;
+const CFG_ALL_SELECTIVE: u32 =
+    CFG_SELECTIVE | CFG_LMR | CFG_NMP | CFG_RFP | CFG_PROBCUT | CFG_SEE | CFG_LMP | CFG_FP | CFG_HP;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -454,7 +456,18 @@ pub fn search_without_fp(position: &Board, depth: u8) -> SearchResult {
     })
 }
 
-/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP.
+/// The selective search with Quiet-History Pruning (HP) disabled and recognized draws scored zero.
+pub fn search_without_hp(position: &Board, depth: u8) -> SearchResult {
+    LOCAL_TT.with_borrow_mut(|tt| {
+        LOCAL_HISTORY.with_borrow_mut(|history| {
+            tt.clear(1);
+            history.clear();
+            run_search::<{ CFG_ALL_SELECTIVE & !CFG_HP }>(position, depth, Some(tt), Some(history))
+        })
+    })
+}
+
+/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP.
 /// Keeps every evasion and capture eligible for independent minimax comparisons.
 pub fn search_reference(position: &Board, depth: u8) -> SearchResult {
     run_search::<0>(position, depth, None, None)
@@ -900,6 +913,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_see = (CFG & CFG_SEE) != 0;
     let use_lmp = (CFG & CFG_LMP) != 0;
     let use_fp = (CFG & CFG_FP) != 0;
+    let use_hp = (CFG & CFG_HP) != 0;
 
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     if PV {
@@ -1347,6 +1361,24 @@ fn search_node<const CFG: u32, const PV: bool>(
                 if static_eval + margin <= alpha {
                     continue;
                 }
+            }
+        }
+
+        // Quiet-History Pruning (HP): skip individual non-checking quiet moves
+        // at shallow depths whose combined history is deeply negative.
+        if selective
+            && use_hp
+            && !PV
+            && ply > 0
+            && !in_check
+            && is_quiet
+            && depth <= HP_MAX_DEPTH
+            && best_score > -MATE_THRESHOLD
+            && !board.is_direct_check(mv)
+        {
+            let threshold = HP_DEPTH_SCALE * depth as i32 + HP_IMPROVING_OFFSET * i32::from(improving);
+            if hist < threshold {
+                continue;
             }
         }
 
