@@ -5,8 +5,8 @@ use asura::{
         lmr_table_term, search, search_reference, search_with_context, search_with_tt, search_with_zero_draws,
         search_without_checked_tt_cutoff, search_without_fp, search_without_hp, search_without_iir,
         search_without_late_quiet_closure, search_without_lmp, search_without_lmr, search_without_nmp,
-        search_without_probcut, search_without_qs_history_pruning, search_without_razoring, search_without_rfp,
-        search_without_se, search_without_see_pruning,
+        search_without_probcut, search_without_qs_futility_pruning, search_without_qs_history_pruning,
+        search_without_razoring, search_without_rfp, search_without_se, search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -658,5 +658,68 @@ fn quiescence_quiet_history_pruning_skips_negative_continuation_checks() {
         "Negative 1-ply continuation history must prune the quiet check in quiescence ({} vs {})",
         pruned.nodes,
         base.nodes
+    );
+}
+
+#[test]
+fn quiescence_capture_futility_pruning_reduces_nodes_and_preserves_tactics() {
+    let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+    let kw_on = search_with_zero_draws(&kiwipete, 7);
+    let kw_off = search_without_qs_futility_pruning(&kiwipete, 7);
+    assert_eq!(kw_on.best_move, kw_off.best_move);
+    assert_eq!(kw_on.score, kw_off.score);
+    assert!(
+        kw_on.nodes < kw_off.nodes,
+        "Quiescence capture-futility pruning should reduce nodes on Kiwipete ({} vs {})",
+        kw_on.nodes,
+        kw_off.nodes
+    );
+
+    let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
+    let mid_on = search_with_zero_draws(&midgame, 7);
+    let mid_off = search_without_qs_futility_pruning(&midgame, 7);
+    assert_eq!(mid_on.best_move, mid_off.best_move);
+    assert_eq!(mid_on.score, mid_off.score);
+    assert!(
+        mid_on.nodes < mid_off.nodes,
+        "Quiescence capture-futility pruning should reduce nodes on Midgame ({} vs {})",
+        mid_on.nodes,
+        mid_off.nodes
+    );
+
+    // In this position at depth 1, Move 1 at the root is 1. Rd1xd8 (trades
+    // rooks, score = 0), and Move 2 is 1. Qa4xe4 (captures Black's Queen on
+    // e4, leaving Black with stand_pat = -900 and margin = -700 at ply 1 while
+    // alpha = 0). Black's pawn capture 1... a7xb6 has capture_margin = -600 <=
+    // alpha (0) and is pruned by quiescence delta futility.
+    let delta_pos = Board::from_fen("3r2k1/p7/1P6/8/Q3q3/8/8/K2R4 w - - 0 1").unwrap();
+    let d_on = search_with_zero_draws(&delta_pos, 1);
+    let d_off = search_without_qs_futility_pruning(&delta_pos, 1);
+    assert_eq!(d_on.best_move, d_off.best_move);
+    assert_eq!(d_on.score, d_off.score);
+    assert!(
+        d_on.nodes < d_off.nodes,
+        "Quiescence delta futility must prune 1... a7xb6 after 1. Qa4xe4 ({} vs {})",
+        d_on.nodes,
+        d_off.nodes
+    );
+
+    // Equal-trade SEE futility branch (alpha >= margin && !see_ge(mv, 1)):
+    // White is in check from Rd3+ with only two legal evasions (1. Rb3xd3 and
+    // 1. Kd1xe2). After 1. Rb3xd3 Rxd3 establishes alpha at ply 1, on
+    // 1. Kd1xe2 Black's equal rook trades (1... Ra7xb7 and 1... Rd3xb3) have
+    // capture_margin > alpha (so the first branch never fires anywhere in the
+    // tree) and SEE == 0 < 1, so they are pruned solely by the second branch
+    // (alpha >= margin && !see_ge(mv, 1)).
+    let see_pos = Board::from_fen("1R1r2k1/rR6/8/8/8/1R1r4/2N1n3/2BKB3 w - - 0 1").unwrap();
+    let s_on = search_with_zero_draws(&see_pos, 1);
+    let s_off = search_without_qs_futility_pruning(&see_pos, 1);
+    assert_eq!(s_on.best_move, s_off.best_move);
+    assert_eq!(s_on.score, s_off.score);
+    assert!(
+        s_on.nodes < s_off.nodes,
+        "Quiescence equal-trade SEE futility must prune equal rook trades after 1. Kd1xe2 ({} vs {})",
+        s_on.nodes,
+        s_off.nodes
     );
 }

@@ -10,7 +10,7 @@ use crate::{
     stack::Stack,
     thread::{AspirationKind, AspirationWindow, RootMove, RootMoves, ThreadData},
     transposition::{Bound, TranspositionTable, TtDepth},
-    types::{MAX_PLY as MAX_PLY_USIZE, Move, Piece, Score, Square, is_decisive, is_win},
+    types::{MAX_PLY as MAX_PLY_USIZE, Move, Piece, PieceType, Score, Square, is_decisive, is_win},
 };
 
 pub const MATE_SCORE: i32 = Score::MATE;
@@ -36,6 +36,7 @@ const CFG_RAZOR: u32 = 1 << 12;
 const CFG_CHECKED_TT_CUT: u32 = 1 << 13;
 const CFG_LQC: u32 = 1 << 14;
 const CFG_QS_HP: u32 = 1 << 15;
+const CFG_QS_FP: u32 = 1 << 16;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -50,7 +51,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_RAZOR
     | CFG_CHECKED_TT_CUT
     | CFG_LQC
-    | CFG_QS_HP;
+    | CFG_QS_HP
+    | CFG_QS_FP;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -206,6 +208,8 @@ define_diagnostic_searches! {
     search_without_late_quiet_closure: CFG_ALL_SELECTIVE & !CFG_LQC;
     /// The selective search with quiescence quiet-history pruning disabled and recognized draws scored zero.
     search_without_qs_history_pruning: CFG_ALL_SELECTIVE & !CFG_QS_HP;
+    /// The selective search with quiescence capture-futility pruning disabled and recognized draws scored zero.
+    search_without_qs_futility_pruning: CFG_ALL_SELECTIVE & !CFG_QS_FP;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -1413,12 +1417,25 @@ fn update_histories_on_best_move(
     }
 }
 
+const fn qs_futility_victim(pt: PieceType) -> i32 {
+    match pt {
+        PieceType::Pawn => 100,
+        PieceType::Knight => 320,
+        PieceType::Bishop => 330,
+        PieceType::Rook => 500,
+        PieceType::Queen => 900,
+        PieceType::King => MATE_SCORE,
+        PieceType::None => 0,
+    }
+}
+
 fn quiescence<const CFG: u32, const PV: bool>(
     td: &mut ThreadData<'_>, mut alpha: i32, beta: i32, q_depth: i16, ply: u16, previous: Option<Square>,
 ) -> (i32, Move) {
     let draw_jitter = (CFG & CFG_DRAW_JITTER) != 0;
     let selective = (CFG & CFG_SELECTIVE) != 0;
     let use_qs_hp = (CFG & CFG_QS_HP) != 0;
+    let use_qs_fp = (CFG & CFG_QS_FP) != 0;
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     debug_assert!(ply <= MAX_PLY && q_depth <= 0);
     td.sel_depth = td.sel_depth.max(ply);
@@ -1519,6 +1536,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
         }
         return (best_score, Move::NULL);
     }
+    let stand_pat = best_score;
     alpha = alpha.max(best_score);
 
     let mut best_move = Move::NULL;
@@ -1532,13 +1550,27 @@ fn quiescence<const CFG: u32, const PV: bool>(
         let recapture = mv.is_capture() && previous == Some(mv.capture_sq());
         if selective
             && !in_check
-            && q_depth <= RECAPTURE_ONLY_DEPTH
             && best_score > -MATE_THRESHOLD
             && !recapture
             && !mv.is_promotion()
             && !td.board.gives_check(mv)
         {
-            continue;
+            if q_depth <= RECAPTURE_ONLY_DEPTH {
+                continue;
+            }
+            if use_qs_fp && mv.is_capture() {
+                let victim_val = qs_futility_victim(td.board.type_on(mv.capture_sq()));
+                let margin = stand_pat + QS_FUTILITY_MARGIN;
+                let capture_margin = margin + victim_val;
+                if alpha >= capture_margin {
+                    best_score = best_score.max(capture_margin);
+                    continue;
+                }
+                if alpha >= margin && !td.board.see_ge(mv, 1) {
+                    best_score = best_score.max(margin);
+                    continue;
+                }
+            }
         }
         let moved_piece = td.board.moved_piece(mv);
         if selective

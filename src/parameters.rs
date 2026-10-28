@@ -102,4 +102,7 @@ define! {
 
     // Quiescence quiet-history pruning threshold on the 10_000 = MAX_HISTORY scale.
     i32, QS_QUIET_HIST_THRESHOLD: -350;
+
+    // Quiescence capture-futility margin on the 100 = 1 pawn scale.
+    i32, QS_FUTILITY_MARGIN: 200;
 }
