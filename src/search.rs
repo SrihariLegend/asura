@@ -1,9 +1,12 @@
+use std::cell::RefCell;
+
 use crate::{
     board::Board,
     evaluation::evaluate,
-    movepick::{MainMovePicker, QuiescenceMovePicker},
+    history::HistoryTables,
+    movepick::{MainMovePicker, QuiescenceMovePicker, creates_threat_on_board},
     transposition::{Bound, TranspositionTable, TtDepth},
-    types::{Move, Square},
+    types::{Move, Piece, Square},
 };
 
 pub const MATE_SCORE: i32 = 32_000;
@@ -24,11 +27,11 @@ const ASPIRATION_FAIL_HIGH_WIDEN_NUM: i32 = 50;
 const ASPIRATION_RATIO_DEN: i32 = 100;
 const ASPIRATION_INFINITE_BOUND: i32 = 1_000;
 const EVAL_STABILITY_THRESHOLD: i32 = 10;
-
-use std::cell::RefCell;
+const SCOUT_HISTORY_BONUS: i32 = 50;
 
 thread_local! {
     static LOCAL_TT: RefCell<TranspositionTable> = RefCell::new(TranspositionTable::new(4));
+    static LOCAL_HISTORY: RefCell<HistoryTables> = RefCell::new(HistoryTables::default());
 }
 
 /// Fixed-capacity principal variation buffer stored on the stack without heap allocation.
@@ -286,39 +289,59 @@ impl RootMoves {
 
 /// Iterative-deepening, single-threaded alpha-beta search with aspiration
 /// windows, dedicated root search, principal variation search, transposition
-/// table, and hybrid quiescence leaves.
+/// table, history-based move ordering, and hybrid quiescence leaves.
 pub fn search(position: &Board, depth: u8) -> SearchResult {
     LOCAL_TT.with_borrow_mut(|tt| {
-        tt.clear(1);
-        run_search::<true, true>(position, depth, Some(tt))
+        LOCAL_HISTORY.with_borrow_mut(|history| {
+            tt.clear(1);
+            history.clear();
+            run_search::<true, true>(position, depth, Some(tt), Some(history))
+        })
     })
 }
 
-/// Search using a caller-supplied transposition table (e.g. persistent across UCI moves).
+/// Search using a caller-supplied transposition table.
 pub fn search_with_tt(position: &Board, depth: u8, tt: &TranspositionTable) -> SearchResult {
-    run_search::<true, true>(position, depth, Some(tt))
+    LOCAL_HISTORY.with_borrow_mut(|history| {
+        history.clear();
+        run_search::<true, true>(position, depth, Some(tt), Some(history))
+    })
+}
+
+/// Search using caller-supplied transposition and history tables (persisting across UCI moves).
+pub fn search_with_context(
+    position: &Board, depth: u8, tt: &TranspositionTable, history: &mut HistoryTables,
+) -> SearchResult {
+    run_search::<true, true>(position, depth, Some(tt), Some(history))
 }
 
 /// The normal selective search, with recognized draws scored exactly zero.
 pub fn search_with_zero_draws(position: &Board, depth: u8) -> SearchResult {
     LOCAL_TT.with_borrow_mut(|tt| {
-        tt.clear(1);
-        run_search::<false, true>(position, depth, Some(tt))
+        LOCAL_HISTORY.with_borrow_mut(|history| {
+            tt.clear(1);
+            history.clear();
+            run_search::<false, true>(position, depth, Some(tt), Some(history))
+        })
     })
 }
 
-/// Diagnostic search with zero draw scores and no selective QS pruning or TT cutoffs.
+/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history ordering.
 /// Keeps every evasion and capture eligible for independent minimax comparisons.
 pub fn search_reference(position: &Board, depth: u8) -> SearchResult {
-    run_search::<false, false>(position, depth, None)
+    run_search::<false, false>(position, depth, None, None)
 }
 
 fn run_search<const DRAW_JITTER: bool, const SELECTIVE: bool>(
-    position: &Board, depth: u8, tt: Option<&TranspositionTable>,
+    position: &Board, depth: u8, tt: Option<&TranspositionTable>, mut history: Option<&mut HistoryTables>,
 ) -> SearchResult {
     let mut board = position.clone();
     let mut nodes = 0;
     let mut pv = PvLine::new();
+
+    if let Some(h) = history.as_deref_mut() {
+        h.prepare_search(&board);
+    }
 
     let (score, best_move) = if !SELECTIVE || depth == 0 {
         let mut sel_depth = 0;
@@ -327,12 +350,17 @@ fn run_search<const DRAW_JITTER: bool, const SELECTIVE: bool>(
             depth,
             0,
             None,
+            Move::NULL,
+            false,
+            TtDepth::NONE_SCORE,
+            0,
             -INFINITY,
             INFINITY,
             &mut pv,
             &mut nodes,
             &mut sel_depth,
             tt,
+            history,
         );
         if let Some(mv) = best_move
             && pv.len == 0
@@ -341,7 +369,7 @@ fn run_search<const DRAW_JITTER: bool, const SELECTIVE: bool>(
         }
         (score, best_move)
     } else {
-        run_iterative_search::<DRAW_JITTER>(&mut board, depth, &mut nodes, &mut pv, tt.unwrap())
+        run_iterative_search::<DRAW_JITTER>(&mut board, depth, &mut nodes, &mut pv, tt.unwrap(), history.unwrap())
     };
 
     debug_assert!(board == *position, "search did not undo every move");
@@ -350,6 +378,7 @@ fn run_search<const DRAW_JITTER: bool, const SELECTIVE: bool>(
 
 fn run_iterative_search<const DRAW_JITTER: bool>(
     board: &mut Board, max_depth: u8, nodes: &mut u64, pv: &mut PvLine, tt: &TranspositionTable,
+    history: &mut HistoryTables,
 ) -> (i32, Option<Move>) {
     let mut root_moves = RootMoves::new(board);
     if root_moves.is_empty() {
@@ -393,6 +422,7 @@ fn run_iterative_search<const DRAW_JITTER: bool>(
                 &mut root_moves,
                 nodes,
                 tt,
+                history,
             );
             root_moves.sort_from(pv_idx);
 
@@ -458,7 +488,7 @@ fn run_iterative_search<const DRAW_JITTER: bool>(
 #[allow(clippy::too_many_arguments)]
 fn search_root<const DRAW_JITTER: bool>(
     board: &mut Board, mut alpha: i32, beta: i32, root_effective_depth: u8, pv_idx: usize, work_item: Move,
-    root_moves: &mut RootMoves, nodes: &mut u64, tt: &TranspositionTable,
+    root_moves: &mut RootMoves, nodes: &mut u64, tt: &TranspositionTable, history: &mut HistoryTables,
 ) -> i32 {
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     let hash = board.hash();
@@ -481,13 +511,20 @@ fn search_root<const DRAW_JITTER: bool>(
         ev
     };
 
-    let mut picker = MainMovePicker::new(priority_move, true);
+    history.clear_child_killers(0);
+
+    let mut picker = MainMovePicker::new(priority_move, true, [Move::NULL; 2], Move::NULL);
     let mut best_score = -INFINITY;
     let mut best_move = Move::NULL;
     let mut bound = Bound::Upper;
     let mut move_count = 0usize;
 
-    while let Some(mv) = picker.next(board) {
+    let mut quiet_moves = [Move::NULL; 32];
+    let mut quiet_len = 0usize;
+    let mut noisy_moves = [Move::NULL; 32];
+    let mut noisy_len = 0usize;
+
+    while let Some(mv) = picker.next(board, Some(history), false, 0) {
         if !root_moves.is_eligible_at_root(pv_idx, mv) {
             continue;
         }
@@ -497,6 +534,8 @@ fn search_root<const DRAW_JITTER: bool>(
         let mut child_pv = PvLine::new();
         let mut sel_depth = 1u16;
 
+        let moved_piece = board.moved_piece(mv);
+        history.continuation_history.remember(0, in_check, mv, moved_piece);
         make_move(board, mv, nodes, Some(tt));
 
         let score = if move_count == 1 {
@@ -505,12 +544,17 @@ fn search_root<const DRAW_JITTER: bool>(
                 child_depth,
                 1,
                 Some(mv.to()),
+                mv,
+                false,
+                raw_eval,
+                move_count,
                 -beta,
                 -alpha,
                 &mut child_pv,
                 nodes,
                 &mut sel_depth,
                 Some(tt),
+                Some(history),
             )
             .0
         } else {
@@ -520,12 +564,17 @@ fn search_root<const DRAW_JITTER: bool>(
                 child_depth,
                 1,
                 Some(mv.to()),
+                mv,
+                true,
+                raw_eval,
+                move_count,
                 -alpha - 1,
                 -alpha,
                 &mut scout_pv,
                 nodes,
                 &mut sel_depth,
                 Some(tt),
+                Some(history),
             )
             .0;
             if scout > alpha && beta > alpha + 1 {
@@ -534,12 +583,17 @@ fn search_root<const DRAW_JITTER: bool>(
                     child_depth,
                     1,
                     Some(mv.to()),
+                    mv,
+                    false,
+                    raw_eval,
+                    move_count,
                     -beta,
                     -alpha,
                     &mut child_pv,
                     nodes,
                     &mut sel_depth,
                     Some(tt),
+                    Some(history),
                 )
                 .0
             } else {
@@ -576,6 +630,31 @@ fn search_root<const DRAW_JITTER: bool>(
                 }
             }
         }
+
+        if mv.is_quiet() && quiet_len < 32 {
+            quiet_moves[quiet_len] = mv;
+            quiet_len += 1;
+        } else if mv.is_noisy() && noisy_len < 32 {
+            noisy_moves[noisy_len] = mv;
+            noisy_len += 1;
+        }
+    }
+
+    if best_score >= beta && best_move.is_present() {
+        update_histories_on_best_move(
+            board,
+            history,
+            0,
+            root_effective_depth as i32,
+            false,
+            Move::NULL,
+            0,
+            best_move,
+            best_score,
+            beta,
+            &quiet_moves[..quiet_len],
+            &noisy_moves[..noisy_len],
+        );
     }
 
     if pv_idx == 0 {
@@ -589,8 +668,9 @@ fn search_root<const DRAW_JITTER: bool>(
 
 #[allow(clippy::too_many_arguments)]
 fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
-    board: &mut Board, depth: u8, ply: u16, previous: Option<Square>, mut alpha: i32, beta: i32, pv: &mut PvLine,
-    nodes: &mut u64, sel_depth: &mut u16, tt: Option<&TranspositionTable>,
+    board: &mut Board, depth: u8, ply: u16, previous: Option<Square>, prior_move: Move, cut_node: bool,
+    parent_eval: i32, parent_move_count: usize, mut alpha: i32, beta: i32, pv: &mut PvLine, nodes: &mut u64,
+    sel_depth: &mut u16, tt: Option<&TranspositionTable>, mut history: Option<&mut HistoryTables>,
 ) -> (i32, Option<Move>) {
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     if PV {
@@ -604,7 +684,9 @@ fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
             return (score, None);
         }
         return (
-            quiescence::<DRAW_JITTER, SELECTIVE, PV>(board, 0, ply, previous, alpha, beta, nodes, sel_depth, tt),
+            quiescence::<DRAW_JITTER, SELECTIVE, PV>(
+                board, 0, ply, previous, alpha, beta, nodes, sel_depth, tt, history,
+            ),
             None,
         );
     }
@@ -654,6 +736,24 @@ fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
                 Bound::None => false,
             }
         {
+            if entry.mv.is_quiet()
+                && entry.score >= beta
+                && parent_move_count < 4
+                && let Some(h) = history.as_deref_mut()
+            {
+                let d = depth as i32;
+                let quiet_bonus = (180 * d - 80).min(1_600);
+                let cont_bonus = (95 * d - 70).min(1_200);
+                let creates_threat = creates_threat_on_board(board, entry.mv);
+                h.quiet_history.update(
+                    board.all_threats(),
+                    creates_threat,
+                    board.side_to_move(),
+                    entry.mv,
+                    quiet_bonus,
+                );
+                h.update_continuation_histories(ply as usize, board.moved_piece(entry.mv), entry.mv.to(), cont_bonus);
+            }
             return (entry.score, Some(entry.mv));
         }
     }
@@ -685,16 +785,52 @@ fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
         ev
     };
 
+    // Parent-move quiet history update from static-eval surprise.
+    if SELECTIVE
+        && ply > 0
+        && !in_check
+        && prior_move.is_quiet()
+        && parent_eval != TtDepth::NONE_SCORE
+        && (depth < 6 || entry.is_none())
+        && let Some(h) = history.as_deref_mut()
+    {
+        let eval_delta = -(raw_eval + parent_eval);
+        if eval_delta != 0 {
+            let bonus = (eval_delta * 6).clamp(-150, 300);
+            h.quiet_history.update(board.prior_threats(), false, !board.side_to_move(), prior_move, bonus);
+        }
+    }
+
+    if let Some(h) = history.as_deref_mut() {
+        h.clear_child_killers(ply as usize);
+    }
+
+    let (killers, countermove) = if let Some(h) = history.as_deref() {
+        (h.killers(ply as usize), h.countermove(prior_move))
+    } else {
+        ([Move::NULL; 2], Move::NULL)
+    };
+
     let mut best_score = -INFINITY;
     let mut best_move = None;
     let mut bound = Bound::Upper;
     let mut move_count = 0usize;
 
-    let mut picker = MainMovePicker::new(if SELECTIVE { tt_move } else { Move::NULL }, false);
-    while let Some(mv) = picker.next(board) {
+    let mut quiet_moves = [Move::NULL; 32];
+    let mut quiet_len = 0usize;
+    let mut noisy_moves = [Move::NULL; 32];
+    let mut noisy_len = 0usize;
+
+    let mut picker = MainMovePicker::new(if SELECTIVE { tt_move } else { Move::NULL }, false, killers, countermove);
+    while let Some(mv) = picker.next(board, history.as_deref(), false, ply as usize) {
         move_count += 1;
         if ply == 0 && board.is_draw(0) {
             return (draw, Some(mv));
+        }
+
+        let moved_piece = board.moved_piece(mv);
+        if let Some(h) = history.as_deref_mut() {
+            h.continuation_history.remember(ply as usize, in_check, mv, moved_piece);
         }
 
         let mut child_pv = PvLine::new();
@@ -705,12 +841,17 @@ fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
                 depth - 1,
                 ply + 1,
                 Some(mv.to()),
+                mv,
+                !cut_node,
+                raw_eval,
+                move_count,
                 -beta,
                 -alpha,
                 &mut child_pv,
                 nodes,
                 sel_depth,
                 tt,
+                history.as_deref_mut(),
             )
             .0
         } else {
@@ -720,26 +861,42 @@ fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
                 depth - 1,
                 ply + 1,
                 Some(mv.to()),
+                mv,
+                true,
+                raw_eval,
+                move_count,
                 -alpha - 1,
                 -alpha,
                 &mut scout_pv,
                 nodes,
                 sel_depth,
                 tt,
+                history.as_deref_mut(),
             )
             .0;
+            if mv.is_quiet()
+                && let Some(h) = history.as_deref_mut()
+            {
+                let bonus = if scout > alpha { SCOUT_HISTORY_BONUS } else { -SCOUT_HISTORY_BONUS };
+                h.update_continuation_histories(ply as usize, moved_piece, mv.to(), bonus);
+            }
             if scout > alpha && beta > alpha + 1 {
                 -search_node::<DRAW_JITTER, SELECTIVE, true>(
                     board,
                     depth - 1,
                     ply + 1,
                     Some(mv.to()),
+                    mv,
+                    false,
+                    raw_eval,
+                    move_count,
                     -beta,
                     -alpha,
                     &mut child_pv,
                     nodes,
                     sel_depth,
                     tt,
+                    history.as_deref_mut(),
                 )
                 .0
             } else {
@@ -772,12 +929,77 @@ fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
                 pv.update(mv, &child_pv);
             }
         }
+
+        if mv.is_quiet() && quiet_len < 32 {
+            quiet_moves[quiet_len] = mv;
+            quiet_len += 1;
+        } else if mv.is_noisy() && noisy_len < 32 {
+            noisy_moves[noisy_len] = mv;
+            noisy_len += 1;
+        }
     }
 
     if move_count == 0 {
         let score = if in_check { -MATE_SCORE + i32::from(ply) } else { draw_score::<DRAW_JITTER>(*nodes) };
         return (score, None);
     }
+
+    if SELECTIVE && let Some(h) = history {
+        if best_score >= beta
+            && let Some(best_mv) = best_move
+        {
+            update_histories_on_best_move(
+                board,
+                h,
+                ply as usize,
+                depth as i32,
+                cut_node,
+                prior_move,
+                parent_move_count,
+                best_mv,
+                best_score,
+                beta,
+                &quiet_moves[..quiet_len],
+                &noisy_moves[..noisy_len],
+            );
+        }
+
+        // Child fail-low rewards the parent move that refuted the current side.
+        if ply > 0 && bound == Bound::Upper && (cut_node || PV) && prior_move.is_present() {
+            let d = depth as i32;
+            let prior_threats = board.prior_threats();
+            if prior_move.is_quiet() {
+                let factor = 90
+                    + (15 * parent_move_count as i32).min(225)
+                    + 140 * (!in_check && best_score <= raw_eval - 50) as i32
+                    + 300 * (parent_eval != TtDepth::NONE_SCORE && best_score <= -parent_eval - 70) as i32;
+                let scaled_bonus = factor * (180 * d - 40).min(2_400) / 128;
+                h.quiet_history.update(prior_threats, false, !board.side_to_move(), prior_move, scaled_bonus);
+                if ply >= 2 {
+                    let bonus = (150 * d - 45).min(1_350);
+                    h.continuation_history.update(
+                        ply as usize - 1,
+                        1,
+                        board.piece_on(prior_move.to()),
+                        prior_move.to(),
+                        bonus,
+                    );
+                }
+            } else if prior_move.is_noisy() {
+                let captured_type = board.captured_piece().piece_type();
+                let bonus = (50 * d).min(650);
+                h.noisy_history.update(
+                    prior_threats,
+                    board.piece_on(prior_move.to()),
+                    prior_move.to(),
+                    captured_type,
+                    bonus,
+                );
+            }
+        }
+    }
+
+    tt_pv |= ply > 0 && bound == Bound::Upper && move_count > 2;
 
     if SELECTIVE && let Some(t) = tt {
         let store_mv = if bound == Bound::Upper { Move::NULL } else { best_move.unwrap_or(Move::NULL) };
@@ -789,9 +1011,75 @@ fn search_node<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn update_histories_on_best_move(
+    board: &Board, history: &mut HistoryTables, ply: usize, depth: i32, cut_node: bool, prior_move: Move,
+    parent_move_count: usize, best_move: Move, best_score: i32, beta: i32, quiet_moves: &[Move], noisy_moves: &[Move],
+) {
+    let stm = board.side_to_move();
+    let threats = board.all_threats();
+    let pawn_key = board.pawn_key();
+
+    let noisy_bonus = (100 * depth).min(900) - 40 - 80 * cut_node as i32;
+    let noisy_malus = (170 * depth).min(1_200) - 50 - 15 * noisy_moves.len() as i32;
+
+    let quiet_bonus = (180 * depth).min(1_700) - 70 - 40 * cut_node as i32;
+    let quiet_malus = (170 * depth).min(1_100) - 45 - 30 * quiet_moves.len() as i32;
+
+    let cont_bonus = (100 * depth).min(1_100) - 70 - 45 * cut_node as i32;
+    let cont_malus = (400 * depth).min(950) - 50 - 15 * quiet_moves.len() as i32;
+
+    if best_move.is_noisy() {
+        history.noisy_history.update(
+            threats,
+            board.moved_piece(best_move),
+            best_move.to(),
+            board.type_on(best_move.capture_sq()),
+            noisy_bonus,
+        );
+    } else {
+        if best_score >= beta {
+            history.update_killer_and_countermove(ply, prior_move, best_move);
+        }
+        let best_piece = board.moved_piece(best_move);
+        let best_creates_threat = creates_threat_on_board(board, best_move);
+        history.quiet_history.update(threats, best_creates_threat, stm, best_move, quiet_bonus);
+        history.pawn_history.update(pawn_key, best_piece, best_move.to(), quiet_bonus);
+        history.update_continuation_histories(ply, best_piece, best_move.to(), cont_bonus);
+
+        for (i, &mv) in quiet_moves.iter().enumerate() {
+            let denom = 1_000 + 45 * i as i32;
+            let scale = 1_000_i32 * 1_000 / (denom * denom / 1_000);
+            let piece = board.moved_piece(mv);
+            let creates_threat = creates_threat_on_board(board, mv);
+            history.quiet_history.update(threats, creates_threat, stm, mv, -quiet_malus * scale / 1_000);
+            history.pawn_history.update(pawn_key, piece, mv.to(), -quiet_malus * scale / 1_000);
+            history.update_continuation_histories(ply, piece, mv.to(), -cont_malus * scale / 1_000);
+        }
+    }
+
+    for &mv in noisy_moves {
+        history.noisy_history.update(
+            threats,
+            board.moved_piece(mv),
+            mv.to(),
+            board.type_on(mv.capture_sq()),
+            -noisy_malus,
+        );
+    }
+
+    if ply > 0 && prior_move.is_quiet() && parent_move_count < 2 {
+        let malus = (90 * depth - 50).min(900);
+        let prior_piece = board.piece_on(prior_move.to());
+        if prior_piece != Piece::None {
+            history.update_continuation_histories(ply - 1, prior_piece, prior_move.to(), -malus);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
     board: &mut Board, q_depth: i16, ply: u16, previous: Option<Square>, mut alpha: i32, beta: i32, nodes: &mut u64,
-    sel_depth: &mut u16, tt: Option<&TranspositionTable>,
+    sel_depth: &mut u16, tt: Option<&TranspositionTable>, mut history: Option<&mut HistoryTables>,
 ) -> i32 {
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     debug_assert!(ply <= MAX_PLY && q_depth <= 0);
@@ -896,7 +1184,9 @@ fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
 
     let mut best_move = Move::NULL;
     let mut picker = QuiescenceMovePicker::new(if SELECTIVE { tt_move } else { Move::NULL }, in_check, q_depth >= -1);
-    while let Some(mv) = picker.next(board, SELECTIVE && in_check && best_score > -MATE_THRESHOLD) {
+    while let Some(mv) =
+        picker.next(board, history.as_deref(), SELECTIVE && in_check && best_score > -MATE_THRESHOLD, ply as usize)
+    {
         let recapture = mv.is_capture() && previous == Some(mv.capture_sq());
         if SELECTIVE
             && !in_check
@@ -907,6 +1197,10 @@ fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
             && !board.gives_check(mv)
         {
             continue;
+        }
+        let moved_piece = board.moved_piece(mv);
+        if let Some(h) = history.as_deref_mut() {
+            h.continuation_history.remember(ply as usize, in_check, mv, moved_piece);
         }
         make_move(board, mv, nodes, tt);
         let score = -quiescence::<DRAW_JITTER, SELECTIVE, PV>(
@@ -919,6 +1213,7 @@ fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
             nodes,
             sel_depth,
             tt,
+            history.as_deref_mut(),
         );
         undo_move(board, mv);
         if score > best_score {
@@ -935,6 +1230,20 @@ fn quiescence<const DRAW_JITTER: bool, const SELECTIVE: bool, const PV: bool>(
 
     if in_check && best_score == -INFINITY {
         return -MATE_SCORE + i32::from(ply);
+    }
+
+    if SELECTIVE
+        && best_score >= beta
+        && best_move.is_noisy()
+        && let Some(h) = history
+    {
+        h.noisy_history.update(
+            board.all_threats(),
+            board.moved_piece(best_move),
+            best_move.to(),
+            board.type_on(best_move.capture_sq()),
+            100,
+        );
     }
 
     if SELECTIVE && let Some(t) = tt {

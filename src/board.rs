@@ -33,10 +33,14 @@ struct InternalState {
     plies_from_null: usize,
     repetition: i32,
     captured: Piece,
+    last_move: Move,
+    moved: Piece,
     piece_threats: [Bitboard; PieceType::NUM],
     all_threats: Bitboard,
     pinned: [Bitboard; Color::NUM],
+    pinners: [Bitboard; Color::NUM],
     checkers: Bitboard,
+    checking_squares: [Bitboard; PieceType::NUM],
 }
 
 /// A position and its reversible history. Equality compares all saved state,
@@ -115,6 +119,14 @@ impl Board {
         self.state.pinned[color as usize]
     }
 
+    pub const fn pinners(&self, color: Color) -> Bitboard {
+        self.state.pinners[color as usize]
+    }
+
+    pub const fn checking_squares(&self, pt: PieceType) -> Bitboard {
+        self.state.checking_squares[pt as usize]
+    }
+
     pub const fn checkers(&self) -> Bitboard {
         self.state.checkers
     }
@@ -127,8 +139,43 @@ impl Board {
         self.state.piece_threats[pt as usize]
     }
 
+    pub fn prior_threats(&self) -> Bitboard {
+        debug_assert!(!self.state_stack.is_empty());
+        self.state_stack[self.state_stack.len() - 1].all_threats
+    }
+
     pub const fn captured_piece(&self) -> Piece {
         self.state.captured
+    }
+
+    pub const fn last_move(&self) -> Move {
+        self.state.last_move
+    }
+
+    pub const fn last_moved_piece(&self) -> Piece {
+        self.state.moved
+    }
+
+    /// Retrieve the (move, moved_piece, was_in_check) played distance plies
+    /// before the current board position (distance = 1 is the most recent move).
+    /// Returns None if fewer than distance moves exist or if a null move
+    /// interrupted the sequence.
+    pub fn recent_move_from_root(&self, distance: usize) -> Option<(Move, Piece, bool)> {
+        if distance == 0 || distance > self.state_stack.len() {
+            return None;
+        }
+        let len = self.state_stack.len();
+        for step in 1..=distance {
+            let state_after = if step == 1 { &self.state } else { &self.state_stack[len - (step - 1)] };
+            if state_after.last_move.is_null() || state_after.moved == Piece::None {
+                return None;
+            }
+            if step == distance {
+                let state_before = &self.state_stack[len - step];
+                return Some((state_after.last_move, state_after.moved, !state_before.checkers.is_empty()));
+            }
+        }
+        None
     }
 
     pub const fn en_passant(&self) -> Square {
@@ -399,6 +446,10 @@ impl Board {
     /// Test a legal move for check using its resulting occupancy, without
     /// making the move or changing position history. Includes discovered and
     /// special-move checks, including overlapping Chess960 castling squares.
+    pub fn is_direct_check(&self, mv: Move) -> bool {
+        self.checking_squares(self.moved_piece(mv).piece_type()).contains(mv.to())
+    }
+
     pub fn gives_check(&self, mv: Move) -> bool {
         debug_assert!(self.is_legal(mv));
         let side = self.side_to_move();
@@ -461,6 +512,7 @@ impl Board {
         let orthogonal = self.pieces2(PieceType::Rook, PieceType::Queen);
 
         self.state.pinned = [Bitboard::default(); 2];
+        self.state.pinners = [Bitboard::default(); 2];
 
         for color in [Color::White, Color::Black] {
             let king = self.king_square(color);
@@ -468,6 +520,13 @@ impl Board {
             if color == stm {
                 self.state.checkers = (pawn_attacks(king, stm) & self.colored_pieces(!stm, PieceType::Pawn))
                     | (knight_attacks(king) & self.colored_pieces(!stm, PieceType::Knight));
+            } else {
+                self.state.checking_squares[PieceType::Pawn] = pawn_attacks(king, !stm);
+                self.state.checking_squares[PieceType::Knight] = knight_attacks(king);
+                self.state.checking_squares[PieceType::Bishop] = bishop_attacks(king, self.occupancies());
+                self.state.checking_squares[PieceType::Rook] = rook_attacks(king, self.occupancies());
+                self.state.checking_squares[PieceType::Queen] =
+                    self.checking_squares(PieceType::Bishop) | self.checking_squares(PieceType::Rook);
             }
 
             let diagonal = diagonal & bishop_attacks(king, self.colors(!color)) & self.colors(!color);
@@ -480,7 +539,10 @@ impl Board {
                         debug_assert_eq!(color, stm);
                         self.state.checkers.set(square);
                     }
-                    1 => self.state.pinned[color] |= blockers,
+                    1 => {
+                        self.state.pinners[!color].set(square);
+                        self.state.pinned[color] |= blockers;
+                    }
                     _ => (),
                 }
             }

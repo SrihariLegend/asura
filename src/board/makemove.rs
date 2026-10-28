@@ -18,6 +18,8 @@ impl Board {
         self.increment_stack();
         self.state.plies_from_null = 0;
         self.state.captured = Piece::None;
+        self.state.last_move = Move::NULL;
+        self.state.moved = Piece::None;
         self.update_threats();
     }
 
@@ -40,6 +42,8 @@ impl Board {
 
         self.increment_stack();
         self.state.captured = Piece::None;
+        self.state.last_move = mv;
+        self.state.moved = piece;
         self.state.plies_from_null += 1;
 
         if mv.is_capture() || piece.piece_type() == PieceType::Pawn {
