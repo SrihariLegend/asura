@@ -29,8 +29,9 @@ const CFG_LMP: u32 = 1 << 7;
 const CFG_FP: u32 = 1 << 8;
 const CFG_HP: u32 = 1 << 9;
 const CFG_IIR: u32 = 1 << 10;
+const CFG_SE: u32 = 1 << 11;
 const CFG_ALL_SELECTIVE: u32 =
-    CFG_SELECTIVE | CFG_LMR | CFG_NMP | CFG_RFP | CFG_PROBCUT | CFG_SEE | CFG_LMP | CFG_FP | CFG_HP | CFG_IIR;
+    CFG_SELECTIVE | CFG_LMR | CFG_NMP | CFG_RFP | CFG_PROBCUT | CFG_SEE | CFG_LMP | CFG_FP | CFG_HP | CFG_IIR | CFG_SE;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -479,7 +480,18 @@ pub fn search_without_iir(position: &Board, depth: u8) -> SearchResult {
     })
 }
 
-/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR.
+/// The selective search with Singular Extensions (SE) disabled and recognized draws scored zero.
+pub fn search_without_se(position: &Board, depth: u8) -> SearchResult {
+    LOCAL_TT.with_borrow_mut(|tt| {
+        LOCAL_HISTORY.with_borrow_mut(|history| {
+            tt.clear(1);
+            history.clear();
+            run_search::<{ CFG_ALL_SELECTIVE & !CFG_SE }>(position, depth, Some(tt), Some(history))
+        })
+    })
+}
+
+/// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE.
 /// Keeps every evasion and capture eligible for independent minimax comparisons.
 pub fn search_reference(position: &Board, depth: u8) -> SearchResult {
     run_search::<0>(position, depth, None, None)
@@ -927,6 +939,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_fp = (CFG & CFG_FP) != 0;
     let use_hp = (CFG & CFG_HP) != 0;
     let use_iir = (CFG & CFG_IIR) != 0;
+    let use_se = (CFG & CFG_SE) != 0;
 
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     if PV {
@@ -967,8 +980,14 @@ fn search_node<const CFG: u32, const PV: bool>(
     }
 
     let ply_idx = ply as usize;
+    let excluded_move = stack[ply_idx].excluded_move;
+    let in_singular = excluded_move.is_present();
     let hash = board.hash();
-    let entry = if selective { tt.and_then(|t| t.read(hash, board.fiftymove_clock(), ply as isize)) } else { None };
+    let entry = if selective && !in_singular {
+        tt.and_then(|t| t.read(hash, board.fiftymove_clock(), ply as isize))
+    } else {
+        None
+    };
     let mut tt_move = Move::NULL;
     let mut tt_pv = PV;
 
@@ -1008,6 +1027,8 @@ fn search_node<const CFG: u32, const PV: bool>(
 
     let raw_eval = if in_check {
         TtDepth::NONE_SCORE
+    } else if in_singular {
+        stack[ply_idx].static_eval
     } else if let Some(entry) = &entry
         && entry.raw_eval != TtDepth::NONE_SCORE
     {
@@ -1041,6 +1062,7 @@ fn search_node<const CFG: u32, const PV: bool>(
 
     // Parent-move quiet history update from static-eval surprise.
     if selective
+        && !in_singular
         && ply > 0
         && !in_check
         && prior_move.is_quiet()
@@ -1065,9 +1087,24 @@ fn search_node<const CFG: u32, const PV: bool>(
     let parent_reduction = if ply_idx > 0 { stack[ply_idx - 1].reduction } else { 0 };
     let parent_laterality = if ply_idx > 0 { stack[ply_idx - 1].laterality } else { 0 };
 
+    let potential_singularity = selective
+        && use_se
+        && !in_singular
+        && ply > 0
+        && ply_idx < MAX_PLY_USIZE / 2
+        && depth >= SE_MIN_DEPTH
+        && tt_move.is_present()
+        && entry.is_some_and(|e| {
+            e.depth >= depth as i32 - 3
+                && matches!(e.bound, Bound::Lower | Bound::Exact)
+                && e.score != TtDepth::NONE_SCORE
+                && !is_decisive(e.score)
+        });
+
     // Reverse Futility Pruning (RFP)
     if selective
         && use_rfp
+        && !in_singular
         && !tt_pv
         && !in_check
         && depth <= RFP_MAX_DEPTH
@@ -1093,6 +1130,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     // Null Move Pruning (NMP)
     if selective
         && use_nmp
+        && !in_singular
         && !PV
         && !in_check
         && prior_move.is_present()
@@ -1198,6 +1236,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     // ProbCut
     if selective
         && use_probcut
+        && !in_singular
         && cut_node
         && !in_check
         && depth >= PROBCUT_MIN_DEPTH
@@ -1284,6 +1323,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     // or a TT entry too shallow to trust, reduce depth by 1 ply.
     if selective
         && use_iir
+        && !in_singular
         && !PV
         && cut_node
         && depth >= IIR_MIN_DEPTH
@@ -1324,6 +1364,9 @@ fn search_node<const CFG: u32, const PV: bool>(
     let mut skip_quiets = false;
     let mut picker = MainMovePicker::new(if selective { tt_move } else { Move::NULL }, false, killers, countermove);
     while let Some(mv) = picker.next(board, history.as_deref(), skip_quiets, ply_idx) {
+        if mv == excluded_move {
+            continue;
+        }
         let emitted_stage = picker.emitted_stage();
         move_count += 1;
         if ply == 0 && board.is_draw(0) {
@@ -1418,6 +1461,60 @@ fn search_node<const CFG: u32, const PV: bool>(
             }
         }
 
+        // Singular Extensions (SE): verify whether the TT move is uniquely best
+        // by searching all alternatives at reduced depth with a lowered beta.
+        let mut extension = 0i32;
+        if potential_singularity
+            && mv == tt_move
+            && let Some(e) = &entry
+        {
+            let s_beta = (e.score.min(beta + SE_BETA_MARGIN) - depth as i32 * SE_DEPTH_MARGIN).max(-MATE_THRESHOLD + 1);
+            let s_depth = ((9 * (depth as i32 - 1)) / 16).max(1) as u8;
+            let mut verify_pv = PvLine::new();
+
+            stack[ply_idx].excluded_move = mv;
+            let verify = search_node::<CFG, false>(
+                board,
+                stack,
+                s_depth,
+                ply,
+                last_critical_ply,
+                previous,
+                prior_move,
+                true,
+                parent_eval,
+                parent_move_count,
+                s_beta - 1,
+                s_beta,
+                &mut verify_pv,
+                nodes,
+                sel_depth,
+                tt,
+                history.as_deref_mut(),
+            )
+            .0;
+            stack[ply_idx].excluded_move = Move::NULL;
+            if let Some(h) = history.as_deref_mut() {
+                h.clear_child_killers(ply_idx);
+            }
+
+            if verify < s_beta {
+                extension = if PV {
+                    1
+                } else {
+                    1 + i32::from(verify < s_beta - SE_DOUBLE_GAP) + i32::from(verify < s_beta - SE_TRIPLE_GAP)
+                };
+            } else if verify >= beta && !is_decisive(verify) {
+                return (verify, None);
+            } else if PV {
+                if e.score >= beta {
+                    extension = -1;
+                }
+            } else {
+                extension = if cut_node { -2 } else { -1 };
+            }
+        }
+
         if let Some(h) = history.as_deref_mut() {
             h.continuation_history.remember(ply_idx, in_check, mv, moved_piece);
         }
@@ -1428,11 +1525,13 @@ fn search_node<const CFG: u32, const PV: bool>(
         let mut child_pv = PvLine::new();
         make_move(board, mv, nodes, tt);
         let gives_check = board.in_check();
-        let child_depth = depth - 1;
+        let base_child_depth = depth as i32 - 1;
+        let max_child_depth = (MAX_PLY_USIZE as i32 - 1 - ply as i32).clamp(0, i32::from(u8::MAX));
+        let child_depth = (base_child_depth + extension).clamp(0, max_child_depth) as u8;
 
         let score = if !selective || move_count == 1 {
-            stack[ply_idx].reduction = 0;
-            -search_node::<CFG, PV>(
+            stack[ply_idx].reduction = (base_child_depth - child_depth as i32) * LMR_SCALE;
+            let res = -search_node::<CFG, PV>(
                 board,
                 stack,
                 child_depth,
@@ -1451,7 +1550,9 @@ fn search_node<const CFG: u32, const PV: bool>(
                 tt,
                 history.as_deref_mut(),
             )
-            .0
+            .0;
+            stack[ply_idx].reduction = 0;
+            res
         } else {
             let lmr_eligible = use_lmr && depth >= 2 && (is_quiet || !PV);
             let mut reduced_depth = child_depth;
@@ -1611,6 +1712,9 @@ fn search_node<const CFG: u32, const PV: bool>(
     }
 
     if move_count == 0 {
+        if in_singular {
+            return (alpha, None);
+        }
         let score = if in_check { -MATE_SCORE + i32::from(ply) } else { draw_score(draw_jitter, *nodes) };
         return (score, None);
     }
@@ -1672,7 +1776,10 @@ fn search_node<const CFG: u32, const PV: bool>(
 
     tt_pv |= ply > 0 && bound == Bound::Upper && move_count > 2;
 
-    if selective && let Some(t) = tt {
+    if selective
+        && !in_singular
+        && let Some(t) = tt
+    {
         let store_mv = if bound == Bound::Upper { Move::NULL } else { best_move.unwrap_or(Move::NULL) };
         let store_depth = (depth as i32 - i32::from(bound == Bound::Lower)).max(1);
         t.write(hash, store_depth, raw_eval, best_score, bound, store_mv, ply as isize, tt_pv, PV);

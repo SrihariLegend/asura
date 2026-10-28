@@ -1,9 +1,10 @@
 use std::ops::{Index, IndexMut};
 
-use crate::types::{MAX_PLY, Score, is_valid};
+use crate::types::{MAX_PLY, Move, Score, is_valid};
 
 #[derive(Copy, Clone)]
 pub struct StackEntry {
+    pub excluded_move: Move,
     pub static_eval: i32,
     pub stat_score: i32,
     pub reduction: i32,
@@ -14,6 +15,7 @@ pub struct StackEntry {
 impl Default for StackEntry {
     fn default() -> Self {
         Self {
+            excluded_move: Move::NULL,
             static_eval: Score::NONE,
             stat_score: 0,
             reduction: 0,

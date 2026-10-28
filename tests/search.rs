@@ -4,7 +4,7 @@ use asura::{
     search::{
         lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws, search_without_fp,
         search_without_hp, search_without_iir, search_without_lmp, search_without_lmr, search_without_nmp,
-        search_without_probcut, search_without_rfp, search_without_see_pruning,
+        search_without_probcut, search_without_rfp, search_without_se, search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -454,4 +454,49 @@ fn internal_iterative_reduction_reduces_cut_node_work_without_tt_move() {
     let res_null = search_with_tt(&kiwipete, 4, &tt_null);
     assert_eq!(res_illegal.nodes, res_null.nodes);
     assert_eq!(res_illegal.best_move, res_null.best_move);
+}
+
+#[test]
+fn singular_extensions_extend_unique_tt_moves_and_multi_cut_alternatives() {
+    // 1. On Midgame at depth 7, Multi-Cut and negative extensions reduce nodes
+    // while preserving the exact score and best move.
+    let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
+    let se_on = search_with_zero_draws(&midgame, 7);
+    let se_off = search_without_se(&midgame, 7);
+    assert_eq!(se_on.best_move, se_off.best_move);
+    assert_eq!(se_on.score, se_off.score);
+    assert!(
+        se_on.nodes < se_off.nodes,
+        "SE multi-cut and negative extensions should reduce nodes on Midgame ({} vs {})",
+        se_on.nodes,
+        se_off.nodes
+    );
+
+    // 2. Direct Multi-Cut verification (verify >= beta):
+    // After the noisy root move c2xd3 (not reduced by root LMR), at ply 1
+    // (depth = 6 at step 7, !PV) Black has two independent queen-winning knight
+    // captures (d6xe4 and f6xg4). At step 6 (depth = 5 at ply 1), d6xe4 fails
+    // high and stores depth = 4 (5 - 1) in the TT. At step 7 (depth = 6 at
+    // ply 1), the excluded-move verification search (excluding d6xe4) finds
+    // f6xg4 >= beta and returns a Multi-Cut early without overwriting the TT
+    // entry at depth = 5 (6 - 1).
+    let mc_pos = Board::from_fen("r1r5/1rp5/1k1n1n2/8/4Q1Q1/1p1p4/P1P5/K7 w - - 0 1").unwrap();
+    let d6e4 = Move::new(Square::D6, Square::E4, MoveKind::Capture);
+    let c2d3 = Move::new(Square::C2, Square::D3, MoveKind::Capture);
+    let mut child_after_c2d3 = mc_pos.clone();
+    child_after_c2d3.make_move(c2d3);
+    assert!(child_after_c2d3.is_legal(d6e4));
+
+    let tt_mc = TranspositionTable::new(4);
+    tt_mc.write(child_after_c2d3.hash(), 5, -200, 500, Bound::Lower, d6e4, 1, false, false);
+    let _ = search_with_tt(&mc_pos, 7, &tt_mc);
+    let after = tt_mc.read(child_after_c2d3.hash(), 0, 1).unwrap();
+    assert_eq!(after.depth, 4, "Multi-Cut at depth 6 must return before overwriting TT at depth 5");
+
+    // 3. On Kiwipete at depth 7, extending singular tactical moves resolves a
+    // deeper tactical line (-20 vs -90 without SE).
+    let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+    let kw_on = search_with_zero_draws(&kiwipete, 7);
+    let kw_off = search_without_se(&kiwipete, 7);
+    assert!(kw_on.score > kw_off.score);
 }

@@ -76,4 +76,11 @@ define! {
     // Internal Iterative Reduction constants.
     u8,  IIR_MIN_DEPTH: 3;
     i32, IIR_TT_DEPTH_GAP: 4;
+
+    // Singular Extension constants on the 100 = 1 pawn scale.
+    u8,  SE_MIN_DEPTH: 6;
+    i32, SE_BETA_MARGIN: 30;
+    i32, SE_DEPTH_MARGIN: 3;
+    i32, SE_DOUBLE_GAP: 25;
+    i32, SE_TRIPLE_GAP: 100;
 }
