@@ -3,9 +3,10 @@ use asura::{
     movepick::{MainMovePicker, MainStage},
     search::{
         lmr_table_term, search, search_reference, search_with_tt, search_with_zero_draws,
-        search_without_checked_tt_cutoff, search_without_fp, search_without_hp, search_without_iir, search_without_lmp,
-        search_without_lmr, search_without_nmp, search_without_probcut, search_without_razoring, search_without_rfp,
-        search_without_se, search_without_see_pruning,
+        search_without_checked_tt_cutoff, search_without_fp, search_without_hp, search_without_iir,
+        search_without_late_quiet_closure, search_without_lmp, search_without_lmr, search_without_nmp,
+        search_without_probcut, search_without_razoring, search_without_rfp, search_without_se,
+        search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -579,4 +580,43 @@ fn checked_tt_capture_cutoff_prunes_verified_check_evasion_captures() {
         on.nodes,
         off.nodes
     );
+}
+
+#[test]
+fn post_move_late_quiet_closure_reduces_nodes_and_preserves_tactics() {
+    let italian = Board::from_fen("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
+    let on = search_with_zero_draws(&italian, 7);
+    let off = search_without_late_quiet_closure(&italian, 7);
+    assert_eq!(on.best_move, off.best_move);
+    assert_eq!(on.score, off.score);
+    assert!(
+        on.nodes < off.nodes,
+        "Post-move late-quiet closure should reduce nodes on Italian ({} vs {})",
+        on.nodes,
+        off.nodes
+    );
+
+    let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
+    let mid_on = search_with_zero_draws(&midgame, 7);
+    let mid_off = search_without_late_quiet_closure(&midgame, 7);
+    assert_eq!(mid_on.best_move, mid_off.best_move);
+    assert_eq!(mid_on.score, mid_off.score);
+    assert!(
+        mid_on.nodes < mid_off.nodes,
+        "Post-move late-quiet closure should reduce nodes on Midgame ({} vs {})",
+        mid_on.nodes,
+        mid_off.nodes
+    );
+
+    // At ply 2 (depth = 1) after 1. Re6xe7+ Kxe7, non-checking quiets are
+    // skipped pre-move by FP, so the first searched Quiet-stage move is the
+    // non-mating check 2. Ra3-a7+. The !gives_check guard prevents that
+    // searched checking quiet from closing the Quiet stage before the mating
+    // check 2. Nc3-d5+ is reached.
+    let check_mate = Board::from_fen("nr1rkr2/pp1ppp2/3pR1p1/5P2/8/R1N5/8/7K w - - 0 1").unwrap();
+    let mate_on = search_with_zero_draws(&check_mate, 3);
+    let mate_off = search_without_late_quiet_closure(&check_mate, 3);
+    assert_eq!(mate_on.best_move.unwrap().to_uci(&check_mate), "e6e7");
+    assert_eq!(mate_on.score, 31_995);
+    assert_eq!(mate_on.score, mate_off.score);
 }

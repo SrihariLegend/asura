@@ -34,6 +34,7 @@ const CFG_IIR: u32 = 1 << 10;
 const CFG_SE: u32 = 1 << 11;
 const CFG_RAZOR: u32 = 1 << 12;
 const CFG_CHECKED_TT_CUT: u32 = 1 << 13;
+const CFG_LQC: u32 = 1 << 14;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -46,7 +47,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_IIR
     | CFG_SE
     | CFG_RAZOR
-    | CFG_CHECKED_TT_CUT;
+    | CFG_CHECKED_TT_CUT
+    | CFG_LQC;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -198,6 +200,8 @@ define_diagnostic_searches! {
     search_without_razoring: CFG_ALL_SELECTIVE & !CFG_RAZOR;
     /// The selective search with checked TT-capture cutoff disabled and recognized draws scored zero.
     search_without_checked_tt_cutoff: CFG_ALL_SELECTIVE & !CFG_CHECKED_TT_CUT;
+    /// The selective search with post-move late-quiet closure disabled and recognized draws scored zero.
+    search_without_late_quiet_closure: CFG_ALL_SELECTIVE & !CFG_LQC;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -546,6 +550,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_se = (CFG & CFG_SE) != 0;
     let use_razoring = (CFG & CFG_RAZOR) != 0;
     let use_checked_tt_cut = (CFG & CFG_CHECKED_TT_CUT) != 0;
+    let use_lqc = (CFG & CFG_LQC) != 0;
 
     let ply_idx = ply as usize;
     let prior_move = if ply_idx > 0 { td.stack[ply_idx - 1].mv } else { Move::NULL };
@@ -1107,6 +1112,9 @@ fn search_node<const CFG: u32, const PV: bool>(
         let max_child_depth = (MAX_PLY_USIZE as i32 - 1 - ply as i32).clamp(0, i32::from(u8::MAX));
         let child_depth = (base_child_depth + extension).clamp(0, max_child_depth) as u8;
 
+        let mut gate_child_depth = child_depth;
+        let mut lmr_quotient = 0i32;
+
         let score = if !selective || move_count == 1 {
             td.stack[ply_idx].reduction = (base_child_depth - child_depth as i32) * LMR_SCALE;
             let res = -search_node::<CFG, PV>(
@@ -1184,6 +1192,9 @@ fn search_node<const CFG: u32, const PV: bool>(
                 }
             }
 
+            gate_child_depth = retry_depth;
+            lmr_quotient = quotient;
+
             if PV && scout > alpha && beta > alpha + 1 {
                 td.stack[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
                 let res =
@@ -1195,6 +1206,24 @@ fn search_node<const CFG: u32, const PV: bool>(
             }
         };
         td.undo_move(mv);
+
+        // Post-move late-quiet closure: after searching a move from the Quiet
+        // stage, close the remaining quiet moves if static evaluation is still
+        // far below alpha at shallow LMR-adjusted depth.
+        let margin_depth = gate_child_depth as i32 - lmr_quotient;
+        if selective
+            && use_lqc
+            && ply > 0
+            && !in_check
+            && !gives_check
+            && emitted_stage == MainStage::Quiet
+            && margin_depth <= LATE_QUIET_MAX_DEPTH
+            && score.max(best_score) > -MATE_THRESHOLD
+            && !is_decisive(alpha)
+            && static_eval < alpha - LATE_QUIET_BASE_MARGIN - LATE_QUIET_DEPTH_MARGIN * margin_depth.max(0)
+        {
+            skip_quiets = true;
+        }
 
         if score > best_score {
             best_score = score;

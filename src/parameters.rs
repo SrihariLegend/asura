@@ -94,4 +94,9 @@ define! {
     u8,  CHECKED_TT_CAPTURE_MIN_DEPTH: 5;
     i32, CHECKED_TT_CAPTURE_MARGIN: 200;
     i32, CHECKED_TT_CAPTURE_DEPTH_GAP: 4;
+
+    // Post-move late-quiet closure constants on the 100 = 1 pawn scale.
+    i32, LATE_QUIET_MAX_DEPTH: 7;
+    i32, LATE_QUIET_BASE_MARGIN: 60;
+    i32, LATE_QUIET_DEPTH_MARGIN: 75;
 }
