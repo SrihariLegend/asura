@@ -3,6 +3,7 @@ use crate::{
     history::HistoryTables,
     parameters::*,
     stack::Stack,
+    time::{Limits, TimeManager},
     transposition::TranspositionTable,
     types::{MAX_PLY, Move, Score},
 };
@@ -215,8 +216,17 @@ pub struct RootMoves {
 
 impl RootMoves {
     pub fn new(board: &Board) -> Self {
+        Self::with_filter(board, None)
+    }
+
+    pub fn with_filter(board: &Board, filter: Option<&[Move]>) -> Self {
         let moves = board.generate_all_moves();
-        let records = moves.iter().copied().map(RootMove::new).collect();
+        let records = moves
+            .iter()
+            .copied()
+            .filter(|mv| filter.is_none_or(|allowed| allowed.contains(mv)))
+            .map(RootMove::new)
+            .collect();
         Self { records, best_move_changes: 0 }
     }
 
@@ -288,15 +298,31 @@ pub struct ThreadData<'a> {
     pub stack: Stack,
     pub pv_table: PrincipalVariationTable,
     pub root_moves: RootMoves,
+    pub time_manager: TimeManager,
     pub nodes: u64,
     pub sel_depth: u16,
+    pub completed_depth: u8,
+    pub stopped: bool,
     pub tt: Option<&'a TranspositionTable>,
     pub history: Option<&'a mut HistoryTables>,
 }
 
 impl<'a> ThreadData<'a> {
-    pub fn new(
-        position: &Board, tt: Option<&'a TranspositionTable>, mut history: Option<&'a mut HistoryTables>,
+    pub fn new(position: &Board, tt: Option<&'a TranspositionTable>, history: Option<&'a mut HistoryTables>) -> Self {
+        Self::with_limits(position, Limits::Infinite, DEFAULT_MOVE_OVERHEAD_MS, tt, history)
+    }
+
+    pub fn with_limits(
+        position: &Board, limits: Limits, move_overhead_ms: u64, tt: Option<&'a TranspositionTable>,
+        history: Option<&'a mut HistoryTables>,
+    ) -> Self {
+        let time_manager = TimeManager::new(limits, position.fullmove_number(), move_overhead_ms);
+        Self::with_time_manager(position, time_manager, tt, history)
+    }
+
+    pub fn with_time_manager(
+        position: &Board, time_manager: TimeManager, tt: Option<&'a TranspositionTable>,
+        mut history: Option<&'a mut HistoryTables>,
     ) -> Self {
         let board = position.clone();
         if let Some(h) = history.as_deref_mut() {
@@ -307,11 +333,26 @@ impl<'a> ThreadData<'a> {
             stack: Stack::default(),
             pv_table: PrincipalVariationTable::default(),
             root_moves: RootMoves::default(),
+            time_manager,
             nodes: 0,
             sel_depth: 0,
+            completed_depth: 0,
+            stopped: false,
             tt,
             history,
         }
+    }
+
+    #[inline]
+    pub fn check_limits(&mut self) -> bool {
+        if self.stopped {
+            return true;
+        }
+        if self.time_manager.check_hard_limit(self.completed_depth, self.nodes) {
+            self.stopped = true;
+            return true;
+        }
+        false
     }
 
     pub fn make_move(&mut self, mv: Move) {

@@ -136,4 +136,35 @@ define! {
 
     // Clear-cutoff history depth bonus margin on the 100 = 1 pawn scale.
     i32, CLEAR_CUTOFF_MARGIN: 50;
+
+    // Time-management constants (ms, moves, and 1_000 = 1.0x fixed-point scale).
+    u64, DEFAULT_MOVE_OVERHEAD_MS: 15;
+    u64, SINGLE_MOVE_SOFT_CAP_MS: 500;
+    u64, TIME_CHECK_NODE_MASK: 1_023;
+    u64, HORIZON_OPENING_MOVES: 36;
+    u64, HORIZON_MIN_MOVES: 24;
+    u64, INCREMENT_SHARE_NUM: 3;
+    u64, INCREMENT_SHARE_DEN: 4;
+    u64, SOFT_CLOCK_CAP_DIV: 5;
+    u64, HARD_SOFT_MULTIPLIER: 5;
+    u64, HARD_CLOCK_CAP_NUM: 3;
+    u64, HARD_CLOCK_CAP_DEN: 4;
+
+    i64, TM_SCALE_UNIT: 1_000;
+    i64, TM_MIN_SCALE: 400;
+    i64, TM_MAX_SCALE: 3_500;
+    i64, TM_NODE_BASE: 500;
+    i64, TM_NODE_SLOPE_NUM: 3;
+    i64, TM_NODE_SLOPE_DEN: 2;
+    i64, TM_STABILITY_BASE: 1_250;
+    i64, TM_PV_STABILITY_STEP: 60;
+    i64, TM_PV_STABILITY_MAX: 6;
+    i64, TM_EVAL_STABILITY_STEP: 20;
+    i64, TM_EVAL_STABILITY_MAX: 5;
+    i64, TM_STABILITY_FLOOR: 800;
+    i64, TM_TURNOVER_STEP: 150;
+    i64, TM_TURNOVER_MAX: 4;
+    i64, TM_TREND_SLOPE: 5;
+    i64, TM_TREND_MIN_DIFF: -20;
+    i64, TM_TREND_MAX_DIFF: 200;
 }

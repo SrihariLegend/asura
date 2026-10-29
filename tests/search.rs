@@ -2,16 +2,18 @@ use asura::{
     board::Board,
     movepick::{MainMovePicker, MainStage},
     search::{
-        lmr_table_term, search, search_reference, search_with_context, search_with_tt, search_with_zero_draws,
-        search_without_alpha_reduce, search_without_checked_tt_cutoff, search_without_clear_cutoff_bonus,
-        search_without_correction_history, search_without_fp, search_without_hindsight, search_without_hp,
-        search_without_iir, search_without_late_quiet_closure, search_without_lmp, search_without_lmr,
-        search_without_multi_threat_closure, search_without_nmp, search_without_probcut,
-        search_without_qs_bound_averaging, search_without_qs_early_cutoff, search_without_qs_futility_pruning,
-        search_without_qs_history_pruning, search_without_qs_late_capture_pruning, search_without_qs_see_pruning,
-        search_without_qs_standpat_handling, search_without_razoring, search_without_rfp, search_without_root_iir,
-        search_without_se, search_without_se_hindsight, search_without_see_pruning, search_without_tt_store_discount,
+        lmr_table_term, search, search_reference, search_with_context, search_with_limits, search_with_tt,
+        search_with_zero_draws, search_without_alpha_reduce, search_without_checked_tt_cutoff,
+        search_without_clear_cutoff_bonus, search_without_correction_history, search_without_fp,
+        search_without_hindsight, search_without_hp, search_without_iir, search_without_late_quiet_closure,
+        search_without_lmp, search_without_lmr, search_without_multi_threat_closure, search_without_nmp,
+        search_without_probcut, search_without_qs_bound_averaging, search_without_qs_early_cutoff,
+        search_without_qs_futility_pruning, search_without_qs_history_pruning, search_without_qs_late_capture_pruning,
+        search_without_qs_see_pruning, search_without_qs_standpat_handling, search_without_razoring,
+        search_without_rfp, search_without_root_iir, search_without_se, search_without_se_hindsight,
+        search_without_see_pruning, search_without_tt_store_discount,
     },
+    time::Limits,
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
 };
@@ -1028,4 +1030,33 @@ fn depth_one_multi_threat_closure_preserves_tactics() {
     let kw_off = search_without_multi_threat_closure(&kiwipete, 6);
     assert_eq!(kw_on.best_move, kw_off.best_move);
     assert_eq!(kw_on.score, kw_off.score);
+}
+
+#[test]
+fn time_manager_stops_on_node_mate_and_clock_limits_while_preserving_board_and_best_move() {
+    let start = Board::starting_position();
+    let original = start.clone();
+
+    // 1. Node-limited search stops cleanly near the requested node budget,
+    //    always completes at least depth 1, and restores the board.
+    let tt_nodes = TranspositionTable::new(1);
+    let mut hist_nodes = asura::history::HistoryTables::default();
+    let res_nodes = search_with_limits(&start, Limits::Nodes(250), &tt_nodes, &mut hist_nodes);
+    assert!(res_nodes.best_move.is_some());
+    assert!(res_nodes.nodes <= 300, "node budget 250 exceeded: {}", res_nodes.nodes);
+    assert!(start == original);
+
+    // 2. Tiny clock budget (wtime = 1 ms) still completes depth 1 and returns a legal move.
+    let tt_clock = TranspositionTable::new(1);
+    let mut hist_clock = asura::history::HistoryTables::default();
+    let res_clock = search_with_limits(&start, Limits::Fischer { main_ms: 1, inc_ms: 0 }, &tt_clock, &mut hist_clock);
+    assert!(res_clock.best_move.is_some());
+    assert!(start == original);
+
+    // 3. Mate limit stops as soon as mate in 1 is found.
+    let mate_pos = Board::from_fen("7k/5Q2/6K1/8/8/8/8/8 w - - 0 1").unwrap();
+    let tt_mate = TranspositionTable::new(1);
+    let mut hist_mate = asura::history::HistoryTables::default();
+    let res_mate = search_with_limits(&mate_pos, Limits::Mate(1), &tt_mate, &mut hist_mate);
+    assert_eq!(res_mate.score, 31_999);
 }

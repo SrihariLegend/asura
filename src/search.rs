@@ -9,6 +9,7 @@ use crate::{
     parameters::*,
     stack::Stack,
     thread::{AspirationKind, AspirationWindow, RootMove, RootMoves, ThreadData},
+    time::{DynamicTimeState, Limits, TimeManager},
     transposition::{Bound, Entry as TtEntry, TranspositionTable, TtDepth},
     types::{MAX_PLY as MAX_PLY_USIZE, Move, Piece, PieceType, Score, Square, is_decisive, is_win},
 };
@@ -186,6 +187,26 @@ pub fn search_with_context(
     run_search::<CFG_STANDARD>(position, depth, Some(tt), Some(history))
 }
 
+/// Search a position under explicit time, node, mate, or depth limits.
+pub fn search_with_limits(
+    position: &Board, limits: Limits, tt: &TranspositionTable, history: &mut HistoryTables,
+) -> SearchResult {
+    let tm = TimeManager::new(limits, position.fullmove_number(), DEFAULT_MOVE_OVERHEAD_MS);
+    search_with_time_manager(position, tm, tt, history)
+}
+
+/// Search a position using a fully configured TimeManager (supporting combined limits and searchmoves).
+pub fn search_with_time_manager(
+    position: &Board, time_manager: TimeManager, tt: &TranspositionTable, history: &mut HistoryTables,
+) -> SearchResult {
+    let mut td = ThreadData::with_time_manager(position, time_manager, Some(tt), Some(history));
+    let mut pv = PvLine::new();
+    let max_depth = td.time_manager.max_depth();
+    let (score, best_move) = run_iterative_search::<CFG_STANDARD>(&mut td, max_depth, &mut pv);
+    debug_assert!(td.board == *position, "search did not undo every move");
+    SearchResult { best_move, score, nodes: td.nodes, pv }
+}
+
 macro_rules! define_diagnostic_searches {
     ($($(#[$attr:meta])* $name:ident: $cfg:expr;)*) => {
         $(
@@ -300,7 +321,7 @@ fn run_iterative_search<const CFG: u32>(
     td: &mut ThreadData<'_>, max_depth: u8, pv: &mut PvLine,
 ) -> (i32, Option<Move>) {
     let draw_jitter = (CFG & CFG_DRAW_JITTER) != 0;
-    td.root_moves = RootMoves::new(&td.board);
+    td.root_moves = RootMoves::with_filter(&td.board, td.time_manager.search_moves());
     if td.root_moves.is_empty() {
         let score = if td.board.in_check() { -MATE_SCORE } else { draw_score(draw_jitter, td.nodes) };
         return (score, None);
@@ -329,6 +350,9 @@ fn run_iterative_search<const CFG: u32>(
             let root_effective_depth = aspiration_depth.max(1);
             let score = search_root::<CFG>(td, window.alpha, window.beta, root_effective_depth, pv_idx, root_pv_move);
             td.root_moves.sort_from(pv_idx);
+            if td.stopped {
+                break;
+            }
 
             match window.on_result(score) {
                 AspirationKind::FailHigh => {
@@ -369,7 +393,9 @@ fn run_iterative_search<const CFG: u32>(
                 && (top.current.score.abs() < last_score.abs() || top.current.upperbound || top.current.lowerbound)
         });
 
-        if is_forgotten_mate {
+        let is_aborted_incomplete = td.stopped && (!top.searched_this_iteration || top.current.upperbound);
+
+        if is_forgotten_mate || is_aborted_incomplete {
             if let Some(last) = last_best_rootmove
                 && let Some(pos) = td.root_moves.records.iter().position(|rm| rm.mv == last.mv)
             {
@@ -380,6 +406,33 @@ fn run_iterative_search<const CFG: u32>(
             }
         } else {
             last_best_rootmove = Some(top);
+        }
+
+        if td.stopped {
+            break;
+        }
+        td.completed_depth = step;
+
+        let winner = *td.root_moves.at(0);
+        if let Some(mate_moves) = td.time_manager.mate_moves()
+            && is_decisive(winner.current.score)
+            && MATE_SCORE - winner.current.score.abs() <= i32::from(mate_moves) * 2
+        {
+            break;
+        }
+
+        let tm_state = DynamicTimeState {
+            cur_score: winner.current.score,
+            prev_score: prev_score.last,
+            best_move_nodes: winner.nodes,
+            total_nodes: td.nodes,
+            pv_stability,
+            eval_stability,
+            best_move_changes: td.root_moves.best_move_changes,
+            legal_root_moves: td.root_moves.records.len(),
+        };
+        if td.time_manager.should_stop_soft_now(&tm_state) {
+            break;
         }
     }
 
@@ -537,6 +590,9 @@ fn search_root<const CFG: u32>(
         };
 
         td.undo_move(mv);
+        if td.stopped {
+            break;
+        }
 
         let move_nodes = td.nodes - nodes_before;
         let sel_depth = td.sel_depth;
@@ -672,6 +728,9 @@ fn search_node<const CFG: u32, const PV: bool>(
     if PV {
         td.pv_table.clear(ply_idx);
         td.sel_depth = td.sel_depth.max(ply);
+    }
+    if td.check_limits() {
+        return (0, None);
     }
 
     if depth == 0 {
@@ -1367,6 +1426,9 @@ fn search_node<const CFG: u32, const PV: bool>(
             }
         };
         td.undo_move(mv);
+        if td.stopped {
+            return (0, None);
+        }
 
         // Post-move late-quiet closure: after searching a move from the Quiet
         // stage, close the remaining quiet moves if static evaluation is still
@@ -1617,6 +1679,9 @@ fn quiescence<const CFG: u32, const PV: bool>(
     let use_corrhist = (CFG & CFG_CORRHIST) != 0;
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     debug_assert!(ply <= MAX_PLY && q_depth <= 0);
+    if td.check_limits() {
+        return (0, Move::NULL);
+    }
     td.sel_depth = td.sel_depth.max(ply);
     let draw = draw_score(draw_jitter, td.nodes);
     if ply > 0 && alpha < draw && td.board.upcoming_repetition(ply as usize) {
@@ -1807,6 +1872,9 @@ fn quiescence<const CFG: u32, const PV: bool>(
         td.make_move(mv);
         let score = -quiescence::<CFG, PV>(td, -beta, -alpha, q_depth - 1, ply + 1, Some(mv.to())).0;
         td.undo_move(mv);
+        if td.stopped {
+            return (0, Move::NULL);
+        }
         if score > best_score {
             best_score = score;
             if score > alpha {
