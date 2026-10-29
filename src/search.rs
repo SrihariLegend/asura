@@ -42,6 +42,7 @@ const CFG_QS_EARLY_CUT: u32 = 1 << 18;
 const CFG_QS_SEE: u32 = 1 << 19;
 const CFG_ROOT_IIR: u32 = 1 << 20;
 const CFG_QS_STANDPAT: u32 = 1 << 21;
+const CFG_QS_BOUND_AVG: u32 = 1 << 22;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -62,7 +63,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_QS_EARLY_CUT
     | CFG_QS_SEE
     | CFG_ROOT_IIR
-    | CFG_QS_STANDPAT;
+    | CFG_QS_STANDPAT
+    | CFG_QS_BOUND_AVG;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -230,6 +232,8 @@ define_diagnostic_searches! {
     search_without_root_iir: CFG_ALL_SELECTIVE & !CFG_ROOT_IIR;
     /// The selective search with quiescence stand-pat fail-high handling disabled and recognized draws scored zero.
     search_without_qs_standpat_handling: CFG_ALL_SELECTIVE & !CFG_QS_STANDPAT;
+    /// The selective search with quiescence post-loop bound-score averaging disabled and recognized draws scored zero.
+    search_without_qs_bound_averaging: CFG_ALL_SELECTIVE & !CFG_QS_BOUND_AVG;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -1470,6 +1474,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
     let use_qs_early_cut = (CFG & CFG_QS_EARLY_CUT) != 0;
     let use_qs_see = (CFG & CFG_QS_SEE) != 0;
     let use_qs_standpat = (CFG & CFG_QS_STANDPAT) != 0;
+    let use_qs_bound_avg = (CFG & CFG_QS_BOUND_AVG) != 0;
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     debug_assert!(ply <= MAX_PLY && q_depth <= 0);
     td.sel_depth = td.sel_depth.max(ply);
@@ -1692,8 +1697,17 @@ fn quiescence<const CFG: u32, const PV: bool>(
         );
     }
 
+    let bound = if best_score >= beta { Bound::Lower } else { Bound::Upper };
+    if selective && use_qs_bound_avg {
+        if best_score > beta && !is_decisive(best_score) && !is_decisive(beta) {
+            let cutoff = (beta + best_score) / 2;
+            best_score = (best_score + cutoff) / 2;
+        } else if best_score < alpha && !is_decisive(best_score) && !is_decisive(alpha) {
+            best_score = (alpha + best_score) / 2;
+        }
+    }
+
     if selective && let Some(t) = td.tt {
-        let bound = if best_score >= beta { Bound::Lower } else { Bound::Upper };
         t.write(hash, tt_depth, raw_eval, best_score, bound, best_move, ply as isize, tt_pv, false);
     }
 
@@ -1831,5 +1845,46 @@ mod tests {
             quiescence::<{ CFG_ALL_SELECTIVE & !CFG_QS_STANDPAT }, false>(&mut td_off, 299, 300, 0, 1, None);
         assert_eq!(score_off, 900);
         assert_eq!(tt_off.read(pos.hash(), 0, 1).unwrap().bound, Bound::Lower);
+    }
+
+    #[test]
+    fn qs_post_loop_bound_averaging_damps_fail_high_and_fail_low_scores() {
+        // 1. Post-loop fail-high (best_score > beta):
+        //    White starts at raw_eval = 0 (Rook vs Rook) and captures 1. Ra1xa8.
+        //    With alpha = 99, beta = 100: the child at ply 2 (alpha = -100, raw_eval = -500)
+        //    damps its fail-low to (-100 + -500) / 2 = -300, so 1. Ra1xa8 returns +300 > beta.
+        //    Then ply 1 damps its fail-high: cutoff = (100 + 300) / 2 = 200; (300 + 200) / 2 = 250.
+        let fh_pos = Board::from_fen("r6k/8/8/8/8/8/8/R6K w - - 0 1").unwrap();
+        let tt_fh = TranspositionTable::new(1);
+        let mut hist_fh = HistoryTables::default();
+        let mut td_fh = ThreadData::new(&fh_pos, Some(&tt_fh), Some(&mut hist_fh));
+        let (score_fh, mv_fh) = quiescence::<CFG_ALL_SELECTIVE, false>(&mut td_fh, 99, 100, 0, 1, None);
+        assert_eq!(score_fh, 250);
+        assert_ne!(mv_fh, Move::NULL);
+        let entry_fh = tt_fh.read(fh_pos.hash(), 0, 1).unwrap();
+        assert_eq!(entry_fh.bound, Bound::Lower);
+        assert_eq!(entry_fh.score, 250);
+
+        // When CFG_QS_BOUND_AVG is disabled, returns undamped 500.
+        let tt_fh_off = TranspositionTable::new(1);
+        let mut hist_fh_off = HistoryTables::default();
+        let mut td_fh_off = ThreadData::new(&fh_pos, Some(&tt_fh_off), Some(&mut hist_fh_off));
+        let (score_fh_off, _) =
+            quiescence::<{ CFG_ALL_SELECTIVE & !CFG_QS_BOUND_AVG }, false>(&mut td_fh_off, 99, 100, 0, 1, None);
+        assert_eq!(score_fh_off, 500);
+
+        // 2. Post-loop fail-low (best_score < alpha):
+        //    White starts at raw_eval = 0 with no captures and alpha = 200, beta = 201.
+        //    stand_pat = 0 < alpha; damped = (200 + 0) / 2 = 100 (Bound::Upper).
+        let fl_pos = Board::from_fen("7k/7p/8/8/8/8/7P/7K w - - 0 1").unwrap();
+        let tt_fl = TranspositionTable::new(1);
+        let mut hist_fl = HistoryTables::default();
+        let mut td_fl = ThreadData::new(&fl_pos, Some(&tt_fl), Some(&mut hist_fl));
+        let (score_fl, mv_fl) = quiescence::<CFG_ALL_SELECTIVE, false>(&mut td_fl, 200, 201, 0, 1, None);
+        assert_eq!(score_fl, 100);
+        assert_eq!(mv_fl, Move::NULL);
+        let entry_fl = tt_fl.read(fl_pos.hash(), 0, 1).unwrap();
+        assert_eq!(entry_fl.bound, Bound::Upper);
+        assert_eq!(entry_fl.score, 100);
     }
 }

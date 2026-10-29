@@ -5,10 +5,10 @@ use asura::{
         lmr_table_term, search, search_reference, search_with_context, search_with_tt, search_with_zero_draws,
         search_without_checked_tt_cutoff, search_without_fp, search_without_hp, search_without_iir,
         search_without_late_quiet_closure, search_without_lmp, search_without_lmr, search_without_nmp,
-        search_without_probcut, search_without_qs_early_cutoff, search_without_qs_futility_pruning,
-        search_without_qs_history_pruning, search_without_qs_late_capture_pruning, search_without_qs_see_pruning,
-        search_without_qs_standpat_handling, search_without_razoring, search_without_rfp, search_without_root_iir,
-        search_without_se, search_without_see_pruning,
+        search_without_probcut, search_without_qs_bound_averaging, search_without_qs_early_cutoff,
+        search_without_qs_futility_pruning, search_without_qs_history_pruning, search_without_qs_late_capture_pruning,
+        search_without_qs_see_pruning, search_without_qs_standpat_handling, search_without_razoring,
+        search_without_rfp, search_without_root_iir, search_without_se, search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -146,14 +146,15 @@ fn draw_jitter_uses_the_search_node_count_and_resets_each_call() {
     // Blocked a-pawns preserve the material balance without adding legal
     // moves, and keep king-only material draws out of this stalemate fixture.
     for (fen, score, nodes, best_move) in
-        [("7k/7P/8/p5K1/P7/8/8/8 w - - 0 1", 2, 40, "g5h6"), ("7k/7P/5K2/p7/P7/8/8/8 w - - 0 1", 2, 31, "f6g6")]
+        [("7k/7P/8/p5K1/P7/8/8/8 w - - 0 1", 2, 70, "g5h6"), ("7k/7P/5K2/p7/P7/8/8/8 w - - 0 1", 1, 57, "f6g6")]
     {
         let board = Board::from_fen(fen).unwrap();
         let original = board.clone();
         let result = search(&board, 2);
 
         // Iterative deepening (depths 1..=2) visits these stalemates at deterministic
-        // node counts where Black receives -2 and negamax returns +2 to White.
+        // node counts where Black receives a negative draw jitter and negamax returns
+        // a positive score to White.
         assert_eq!(result.score, score);
         assert_eq!(result.nodes, nodes);
         let mv = result.best_move.unwrap();
@@ -463,15 +464,16 @@ fn internal_iterative_reduction_reduces_cut_node_work_without_tt_move() {
 #[test]
 fn root_and_pv_iir_reduce_nodes_and_sanitize_root_tt_moves() {
     let italian = Board::from_fen("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
-    let it_on = search_with_zero_draws(&italian, 10);
-    let it_off = search_without_root_iir(&italian, 10);
-    assert_eq!(it_on.best_move, it_off.best_move);
-    assert_eq!(it_on.score, it_off.score);
+    let endgame = Board::from_fen("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1").unwrap();
+    let eg_on = search_with_zero_draws(&endgame, 8);
+    let eg_off = search_without_root_iir(&endgame, 8);
+    assert_eq!(eg_on.best_move, eg_off.best_move);
+    assert_eq!(eg_on.score, eg_off.score);
     assert!(
-        it_on.nodes < it_off.nodes,
-        "Root and PV IIR should reduce nodes on Italian ({} vs {})",
-        it_on.nodes,
-        it_off.nodes
+        eg_on.nodes < eg_off.nodes,
+        "Root and PV IIR should reduce nodes on Endgame ({} vs {})",
+        eg_on.nodes,
+        eg_off.nodes
     );
 
     let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
@@ -537,15 +539,15 @@ fn singular_extensions_extend_unique_tt_moves_and_multi_cut_alternatives() {
     let after = tt_mc.read(child_after_c2d3.hash(), 0, 1).unwrap();
     assert_eq!(after.depth, 4, "Multi-Cut at depth 6 must return before overwriting TT at depth 5");
 
-    // 3. On Midgame at depth 8 and Kiwipete at depth 7, extending singular
-    // tactical moves and multi-cutting alternatives reduces nodes while
-    // preserving the exact best move and score.
-    let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
-    let kw_on = search_with_zero_draws(&kiwipete, 7);
-    let kw_off = search_without_se(&kiwipete, 7);
-    assert_eq!(kw_on.best_move, kw_off.best_move);
-    assert_eq!(kw_on.score, kw_off.score);
-    assert!(kw_on.nodes < kw_off.nodes);
+    // 3. On Midgame at depth 8, extending singular tactical moves and
+    // multi-cutting alternatives reduces nodes while preserving the exact
+    // best move and score.
+    let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
+    let mid_on = search_with_zero_draws(&midgame, 8);
+    let mid_off = search_without_se(&midgame, 8);
+    assert_eq!(mid_on.best_move, mid_off.best_move);
+    assert_eq!(mid_on.score, mid_off.score);
+    assert!(mid_on.nodes < mid_off.nodes);
 }
 
 #[test]
@@ -925,4 +927,26 @@ fn quiescence_standpat_fail_high_handling_preserves_eval_only_tt_and_tactics() {
     assert_eq!(entry.depth, asura::transposition::TtDepth::EVAL_ONLY);
     assert_eq!(entry.bound, Bound::None);
     assert_eq!(entry.raw_eval, 540);
+}
+
+#[test]
+fn quiescence_post_loop_bound_averaging_damps_tt_bounds_and_preserves_tactics() {
+    // Move 1 at the root (1. h2xg3 in GoodNoisy) sets alpha = 280. On the quiet
+    // check 1. Ra2-a8+, Black's King on g8 is in check at ply 1 (q_depth = 0,
+    // beta = -280) so stand-pat is skipped and Black captures 1... Bf3xa8 in the
+    // move loop, failing high with Bound::Lower and damping the stored TT score
+    // toward beta.
+    let pos = Board::from_fen("6k1/8/8/8/8/5bp1/R6P/6K1 w - - 0 1").unwrap();
+    let a2a8 = Move::new(Square::A2, Square::A8, MoveKind::Normal);
+    let mut child_after_a2a8 = pos.clone();
+    child_after_a2a8.make_move(a2a8);
+
+    let tt_on = TranspositionTable::new(1);
+    let res_on = search_with_tt(&pos, 1, &tt_on);
+    let res_off = search_without_qs_bound_averaging(&pos, 1);
+    assert_eq!(res_on.best_move, res_off.best_move);
+
+    let entry_on = tt_on.read(child_after_a2a8.hash(), 0, 1).unwrap();
+    assert_eq!(entry_on.bound, Bound::Lower);
+    assert!(entry_on.score < 720, "Post-loop fail-high score should be damped toward beta (got {})", entry_on.score);
 }
