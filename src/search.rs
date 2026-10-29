@@ -9,7 +9,7 @@ use crate::{
     parameters::*,
     stack::Stack,
     thread::{AspirationKind, AspirationWindow, RootMove, RootMoves, ThreadData},
-    transposition::{Bound, TranspositionTable, TtDepth},
+    transposition::{Bound, Entry as TtEntry, TranspositionTable, TtDepth},
     types::{MAX_PLY as MAX_PLY_USIZE, Move, Piece, PieceType, Score, Square, is_decisive, is_win},
 };
 
@@ -40,6 +40,7 @@ const CFG_QS_FP: u32 = 1 << 16;
 const CFG_QS_LMP: u32 = 1 << 17;
 const CFG_QS_EARLY_CUT: u32 = 1 << 18;
 const CFG_QS_SEE: u32 = 1 << 19;
+const CFG_ROOT_IIR: u32 = 1 << 20;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -58,7 +59,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_QS_FP
     | CFG_QS_LMP
     | CFG_QS_EARLY_CUT
-    | CFG_QS_SEE;
+    | CFG_QS_SEE
+    | CFG_ROOT_IIR;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -202,7 +204,7 @@ define_diagnostic_searches! {
     search_without_fp: CFG_ALL_SELECTIVE & !CFG_FP;
     /// The selective search with Quiet-History Pruning (HP) disabled and recognized draws scored zero.
     search_without_hp: CFG_ALL_SELECTIVE & !CFG_HP;
-    /// The selective search with Internal Iterative Reduction (IIR) disabled and recognized draws scored zero.
+    /// The selective search with cut-node Internal Iterative Reduction (IIR) disabled and recognized draws scored zero.
     search_without_iir: CFG_ALL_SELECTIVE & !CFG_IIR;
     /// The selective search with Singular Extensions (SE) disabled and recognized draws scored zero.
     search_without_se: CFG_ALL_SELECTIVE & !CFG_SE;
@@ -222,6 +224,8 @@ define_diagnostic_searches! {
     search_without_qs_early_cutoff: CFG_ALL_SELECTIVE & !CFG_QS_EARLY_CUT;
     /// The selective search with quiescence SEE pruning disabled and recognized draws scored zero.
     search_without_qs_see_pruning: CFG_ALL_SELECTIVE & !CFG_QS_SEE;
+    /// The selective search with root and PV Internal Iterative Reduction (IIR) disabled and recognized draws scored zero.
+    search_without_root_iir: CFG_ALL_SELECTIVE & !CFG_ROOT_IIR;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -349,13 +353,21 @@ fn run_iterative_search<const CFG: u32>(
     (result.score, Some(winner.mv))
 }
 
+#[inline]
+fn reserves_tt_verification_ply(depth: u8, has_move: bool, entry: Option<TtEntry>) -> bool {
+    depth >= IIR_MIN_DEPTH && (!has_move || entry.is_none_or(|e| e.depth + IIR_TT_DEPTH_GAP < depth as i32))
+}
+
 fn search_root<const CFG: u32>(
-    td: &mut ThreadData<'_>, mut alpha: i32, beta: i32, root_effective_depth: u8, pv_idx: usize, work_item: Move,
+    td: &mut ThreadData<'_>, mut alpha: i32, beta: i32, mut root_effective_depth: u8, pv_idx: usize, work_item: Move,
 ) -> i32 {
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
+    let selective = (CFG & CFG_SELECTIVE) != 0;
+    let use_root_iir = (CFG & CFG_ROOT_IIR) != 0;
     let hash = td.board.hash();
     let entry = td.tt.and_then(|t| t.read(hash, td.board.fiftymove_clock(), 0));
-    let tt_move = entry.map(|e| e.mv).unwrap_or(Move::NULL);
+    let tt_move = entry.map(|e| e.mv).filter(|&mv| mv.is_present() && td.board.is_legal(mv)).unwrap_or(Move::NULL);
+    let work_item = if work_item.is_present() && td.board.is_legal(work_item) { work_item } else { Move::NULL };
     let priority_move = if work_item.is_present() { work_item } else { tt_move };
 
     let in_check = td.board.in_check();
@@ -381,6 +393,10 @@ fn search_root<const CFG: u32>(
     td.stack[2].cutoff_count = 0;
     if let Some(h) = td.history.as_deref_mut() {
         h.clear_child_killers(0);
+    }
+
+    if selective && use_root_iir && reserves_tt_verification_ply(root_effective_depth, work_item.is_present(), entry) {
+        root_effective_depth -= 1;
     }
 
     let node_bias = compute_node_bias(true, in_check, false, true, false, priority_move.is_capture(), 0, 0, 0, 0);
@@ -567,6 +583,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_fp = (CFG & CFG_FP) != 0;
     let use_hp = (CFG & CFG_HP) != 0;
     let use_iir = (CFG & CFG_IIR) != 0;
+    let use_root_iir = (CFG & CFG_ROOT_IIR) != 0;
     let use_se = (CFG & CFG_SE) != 0;
     let use_razoring = (CFG & CFG_RAZOR) != 0;
     let use_checked_tt_cut = (CFG & CFG_CHECKED_TT_CUT) != 0;
@@ -738,20 +755,6 @@ fn search_node<const CFG: u32, const PV: bool>(
     let parent_stat_score = if ply_idx > 0 { td.stack[ply_idx - 1].stat_score } else { 0 };
     let parent_reduction = if ply_idx > 0 { td.stack[ply_idx - 1].reduction } else { 0 };
     let parent_laterality = if ply_idx > 0 { td.stack[ply_idx - 1].laterality } else { 0 };
-
-    let potential_singularity = selective
-        && use_se
-        && !in_singular
-        && ply > 0
-        && ply_idx < MAX_PLY_USIZE / 2
-        && depth >= SE_MIN_DEPTH
-        && tt_move.is_present()
-        && entry.is_some_and(|e| {
-            e.depth >= depth as i32 - 3
-                && matches!(e.bound, Bound::Lower | Bound::Exact)
-                && e.score != TtDepth::NONE_SCORE
-                && !is_decisive(e.score)
-        });
 
     // Razoring
     if selective
@@ -931,15 +934,26 @@ fn search_node<const CFG: u32, const PV: bool>(
 
     // Internal Iterative Reduction (IIR)
     if selective
-        && use_iir
         && !in_singular
-        && !PV
-        && cut_node
-        && depth >= IIR_MIN_DEPTH
-        && (tt_move.is_null() || entry.is_none_or(|e| e.depth + IIR_TT_DEPTH_GAP < depth as i32))
+        && ((PV && use_root_iir) || (!PV && cut_node && use_iir))
+        && reserves_tt_verification_ply(depth, tt_move.is_present(), entry)
     {
         depth -= 1;
     }
+
+    let potential_singularity = selective
+        && use_se
+        && !in_singular
+        && ply > 0
+        && ply_idx < MAX_PLY_USIZE / 2
+        && depth >= SE_MIN_DEPTH
+        && tt_move.is_present()
+        && entry.is_some_and(|e| {
+            e.depth >= depth as i32 - 3
+                && matches!(e.bound, Bound::Lower | Bound::Exact)
+                && e.score != TtDepth::NONE_SCORE
+                && !is_decisive(e.score)
+        });
 
     // Checked TT-capture cutoff
     if selective
@@ -1675,4 +1689,98 @@ fn quiescence<const CFG: u32, const PV: bool>(
 
 const fn draw_score(draw_jitter: bool, nodes: u64) -> i32 {
     if draw_jitter { (nodes % 5) as i32 - 2 } else { 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::MoveKind;
+
+    #[test]
+    fn root_iir_reduces_effective_depth_when_tt_is_shallow_or_work_item_missing() {
+        let pos = Board::starting_position();
+        let legal_work_item = pos.generate_all_moves()[0];
+        let illegal_work_item = Move::new(Square::A1, Square::H8, MoveKind::Normal);
+
+        // 1. Cold/missing TT entry at depth 4: Root IIR reduces effective depth from 4 to 3.
+        let tt_on = TranspositionTable::new(1);
+        let mut hist_on = HistoryTables::default();
+        let mut td_on = ThreadData::new(&pos, Some(&tt_on), Some(&mut hist_on));
+        td_on.root_moves = RootMoves::new(&pos);
+        td_on.root_moves.begin_depth_iteration(4);
+        let _ = search_root::<CFG_ALL_SELECTIVE>(&mut td_on, -INFINITY, INFINITY, 4, 0, legal_work_item);
+        assert_eq!(tt_on.read(pos.hash(), 0, 0).unwrap().depth, 3);
+
+        let tt_off = TranspositionTable::new(1);
+        let mut hist_off = HistoryTables::default();
+        let mut td_off = ThreadData::new(&pos, Some(&tt_off), Some(&mut hist_off));
+        td_off.root_moves = RootMoves::new(&pos);
+        td_off.root_moves.begin_depth_iteration(4);
+        let _ = search_root::<{ CFG_ALL_SELECTIVE & !CFG_ROOT_IIR }>(
+            &mut td_off,
+            -INFINITY,
+            INFINITY,
+            4,
+            0,
+            legal_work_item,
+        );
+        assert_eq!(tt_off.read(pos.hash(), 0, 0).unwrap().depth, 4);
+        assert!(td_on.nodes < td_off.nodes);
+
+        // 2. Sufficiently deep TT entry (depth = 1, 1 + 4 >= 5) with legal work_item: Root IIR does not reduce.
+        let tt_deep = TranspositionTable::new(1);
+        tt_deep.write(pos.hash(), 1, 0, 0, Bound::Exact, legal_work_item, 0, true, true);
+        let mut hist_deep = HistoryTables::default();
+        let mut td_deep = ThreadData::new(&pos, Some(&tt_deep), Some(&mut hist_deep));
+        td_deep.root_moves = RootMoves::new(&pos);
+        td_deep.root_moves.begin_depth_iteration(5);
+        let _ = search_root::<CFG_ALL_SELECTIVE>(&mut td_deep, -INFINITY, INFINITY, 5, 0, legal_work_item);
+        assert_eq!(tt_deep.read(pos.hash(), 0, 0).unwrap().depth, 5);
+
+        // 3. Even with a deep TT entry (depth = 4), an absent or illegal work_item triggers Root IIR (5 -> 4).
+        let tt_no_work = TranspositionTable::new(1);
+        tt_no_work.write(pos.hash(), 4, 0, 0, Bound::Exact, legal_work_item, 0, true, true);
+        let mut hist_no_work = HistoryTables::default();
+        let mut td_no_work = ThreadData::new(&pos, Some(&tt_no_work), Some(&mut hist_no_work));
+        td_no_work.root_moves = RootMoves::new(&pos);
+        td_no_work.root_moves.begin_depth_iteration(5);
+        let _ = search_root::<CFG_ALL_SELECTIVE>(&mut td_no_work, -INFINITY, INFINITY, 5, 0, illegal_work_item);
+        assert_eq!(tt_no_work.read(pos.hash(), 0, 0).unwrap().depth, 4);
+    }
+
+    #[test]
+    fn pv_node_iir_reduces_depth_independently_of_search_root() {
+        let pos = Board::starting_position();
+        let legal_mv = pos.generate_all_moves()[0];
+
+        // 1. Interior PV node (ply = 1) with missing TT entry at depth 4: PV IIR reduces depth from 4 to 3.
+        let tt_on = TranspositionTable::new(1);
+        let mut hist_on = HistoryTables::default();
+        let mut td_on = ThreadData::new(&pos, Some(&tt_on), Some(&mut hist_on));
+        let _ = search_node::<CFG_ALL_SELECTIVE, true>(&mut td_on, -INFINITY, INFINITY, 4, false, 1, 0);
+        assert_eq!(tt_on.read(pos.hash(), 0, 1).unwrap().depth, 3);
+
+        let tt_off = TranspositionTable::new(1);
+        let mut hist_off = HistoryTables::default();
+        let mut td_off = ThreadData::new(&pos, Some(&tt_off), Some(&mut hist_off));
+        let _ = search_node::<{ CFG_ALL_SELECTIVE & !CFG_ROOT_IIR }, true>(
+            &mut td_off,
+            -INFINITY,
+            INFINITY,
+            4,
+            false,
+            1,
+            0,
+        );
+        assert_eq!(tt_off.read(pos.hash(), 0, 1).unwrap().depth, 4);
+        assert!(td_on.nodes < td_off.nodes);
+
+        // 2. Interior PV node with deep TT entry (depth = 1, 1 + 4 >= 5) and legal tt_move: PV IIR does not reduce.
+        let tt_deep = TranspositionTable::new(1);
+        tt_deep.write(pos.hash(), 1, 0, 0, Bound::Exact, legal_mv, 1, true, true);
+        let mut hist_deep = HistoryTables::default();
+        let mut td_deep = ThreadData::new(&pos, Some(&tt_deep), Some(&mut hist_deep));
+        let _ = search_node::<CFG_ALL_SELECTIVE, true>(&mut td_deep, -INFINITY, INFINITY, 5, false, 1, 0);
+        assert_eq!(tt_deep.read(pos.hash(), 0, 1).unwrap().depth, 5);
+    }
 }

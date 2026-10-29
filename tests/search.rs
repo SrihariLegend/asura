@@ -7,7 +7,8 @@ use asura::{
         search_without_late_quiet_closure, search_without_lmp, search_without_lmr, search_without_nmp,
         search_without_probcut, search_without_qs_early_cutoff, search_without_qs_futility_pruning,
         search_without_qs_history_pruning, search_without_qs_late_capture_pruning, search_without_qs_see_pruning,
-        search_without_razoring, search_without_rfp, search_without_se, search_without_see_pruning,
+        search_without_razoring, search_without_rfp, search_without_root_iir, search_without_se,
+        search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -436,7 +437,7 @@ fn internal_iterative_reduction_reduces_cut_node_work_without_tt_move() {
     assert_eq!(iir_on.best_move, iir_off.best_move);
     assert!(
         iir_on.nodes < iir_off.nodes,
-        "IIR should reduce nodes in the same selective engine ({} vs {})",
+        "Cut-node IIR should reduce nodes in the same selective engine ({} vs {})",
         iir_on.nodes,
         iir_off.nodes
     );
@@ -453,6 +454,46 @@ fn internal_iterative_reduction_reduces_cut_node_work_without_tt_move() {
         tt_illegal.write(child.hash(), 10, 0, 0, Bound::Lower, illegal_mv, 1, false, false);
         tt_null.write(child.hash(), 10, 0, 0, Bound::Lower, Move::NULL, 1, false, false);
     }
+    let res_illegal = search_with_tt(&italian, 4, &tt_illegal);
+    let res_null = search_with_tt(&italian, 4, &tt_null);
+    assert_eq!(res_illegal.nodes, res_null.nodes);
+    assert_eq!(res_illegal.best_move, res_null.best_move);
+}
+
+#[test]
+fn root_and_pv_iir_reduce_nodes_and_sanitize_root_tt_moves() {
+    let italian = Board::from_fen("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
+    let it_on = search_with_zero_draws(&italian, 10);
+    let it_off = search_without_root_iir(&italian, 10);
+    assert_eq!(it_on.best_move, it_off.best_move);
+    assert_eq!(it_on.score, it_off.score);
+    assert!(
+        it_on.nodes < it_off.nodes,
+        "Root and PV IIR should reduce nodes on Italian ({} vs {})",
+        it_on.nodes,
+        it_off.nodes
+    );
+
+    let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
+    let mid_on = search_with_zero_draws(&midgame, 10);
+    let mid_off = search_without_root_iir(&midgame, 10);
+    assert_eq!(mid_on.best_move, mid_off.best_move);
+    assert_eq!(mid_on.score, mid_off.score);
+    assert!(
+        mid_on.nodes < mid_off.nodes,
+        "Root and PV IIR should reduce nodes on Midgame ({} vs {})",
+        mid_on.nodes,
+        mid_off.nodes
+    );
+
+    // A collided TT entry storing an illegal capture at the root hash must be
+    // sanitized to Move::NULL on probe in search_root so it never biases root
+    // LMR or move picking relative to an entry with Move::NULL.
+    let tt_illegal = TranspositionTable::new(1);
+    let tt_null = TranspositionTable::new(1);
+    let illegal_capture = Move::new(Square::A1, Square::H8, MoveKind::Capture);
+    tt_illegal.write(italian.hash(), 10, 0, 0, Bound::Lower, illegal_capture, 0, true, false);
+    tt_null.write(italian.hash(), 10, 0, 0, Bound::Lower, Move::NULL, 0, true, false);
     let res_illegal = search_with_tt(&italian, 4, &tt_illegal);
     let res_null = search_with_tt(&italian, 4, &tt_null);
     assert_eq!(res_illegal.nodes, res_null.nodes);
