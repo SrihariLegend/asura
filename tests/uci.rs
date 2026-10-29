@@ -21,9 +21,12 @@ fn exchange(commands: &str) -> String {
 
 #[test]
 fn handshake_only_advertises_implemented_options() {
-    let output = exchange("uci\nsetoption name Hash value 4\nsetoption name Clear Hash\nisready\nquit\n");
+    let output = exchange(
+        "uci\nsetoption name Hash value 4\nsetoption name Move Overhead value 20\nsetoption name Clear Hash\nisready\nquit\n",
+    );
     assert!(output.starts_with(&format!("id name Asura {}\n", env!("CARGO_PKG_VERSION"))));
     assert!(output.contains("option name Hash type spin default 16 min 1 max 262144\n"));
+    assert!(output.contains("option name Move Overhead type spin default 15 min 0 max 5000\n"));
     assert!(output.contains("option name Clear Hash type button\n"));
     assert!(output.contains("option name UCI_Chess960 type check default false\n"));
     assert!(output.ends_with("uciok\nreadyok\n"));
@@ -188,14 +191,36 @@ fn go_depth_rejects_invalid_or_unsupported_limits_without_fake_moves() {
         "go depth 256",
         "go depth 999999999999999999999",
         "go infinite",
-        "go movetime 10",
+        "go nodes 0",
+        "go movetime 0",
+        "go mate 0",
         "go depth 1 extra",
+        "go searchmoves e2e4",
+        "go depth 1 searchmoves illegal",
     ] {
         let output = exchange(&format!("{command}\nisready\nquit\n"));
         assert!(output.starts_with("info string "), "{command}: {output}");
         assert!(!output.contains("bestmove "), "{command}: {output}");
         assert!(output.ends_with("readyok\n"));
     }
+}
+
+#[test]
+fn go_supports_nodes_movetime_clocks_mate_searchmoves_eval_and_bench() {
+    // 1. go nodes, go movetime, go wtime/btime/winc/binc/movestogo, and go searchmoves.
+    let output = exchange(
+        "position startpos\n         go nodes 150\n         go movetime 15\n         go wtime 1000 btime 1000 winc 50 binc 50 movestogo 20 depth 2\n         go depth 2 searchmoves g1h3\n         eval\n         bench 2\n         quit\n",
+    );
+    let bestmoves: Vec<_> = output.lines().filter_map(|line| line.strip_prefix("bestmove ")).collect();
+    assert_eq!(bestmoves.len(), 4, "{output}");
+    assert_eq!(bestmoves[3], "g1h3", "searchmoves must restrict root moves to g1h3: {output}");
+    assert!(output.contains("info string Static evaluation: 0 cp"), "{output}");
+    assert!(output.contains(" nodes ") && output.contains(" nps"), "{output}");
+
+    // 2. go mate N stops once mate is found.
+    let mate_out = exchange("position fen 7k/5Q2/6K1/8/8/8/8/8 w - - 0 1\ngo mate 1\nquit\n");
+    assert!(mate_out.contains("score mate 1"), "{mate_out}");
+    assert!(mate_out.contains("bestmove "), "{mate_out}");
 }
 
 #[test]
