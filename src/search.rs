@@ -41,6 +41,7 @@ const CFG_QS_LMP: u32 = 1 << 17;
 const CFG_QS_EARLY_CUT: u32 = 1 << 18;
 const CFG_QS_SEE: u32 = 1 << 19;
 const CFG_ROOT_IIR: u32 = 1 << 20;
+const CFG_QS_STANDPAT: u32 = 1 << 21;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -60,7 +61,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_QS_LMP
     | CFG_QS_EARLY_CUT
     | CFG_QS_SEE
-    | CFG_ROOT_IIR;
+    | CFG_ROOT_IIR
+    | CFG_QS_STANDPAT;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -226,6 +228,8 @@ define_diagnostic_searches! {
     search_without_qs_see_pruning: CFG_ALL_SELECTIVE & !CFG_QS_SEE;
     /// The selective search with root and PV Internal Iterative Reduction (IIR) disabled and recognized draws scored zero.
     search_without_root_iir: CFG_ALL_SELECTIVE & !CFG_ROOT_IIR;
+    /// The selective search with quiescence stand-pat fail-high handling disabled and recognized draws scored zero.
+    search_without_qs_standpat_handling: CFG_ALL_SELECTIVE & !CFG_QS_STANDPAT;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -1465,6 +1469,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
     let use_qs_lmp = (CFG & CFG_QS_LMP) != 0;
     let use_qs_early_cut = (CFG & CFG_QS_EARLY_CUT) != 0;
     let use_qs_see = (CFG & CFG_QS_SEE) != 0;
+    let use_qs_standpat = (CFG & CFG_QS_STANDPAT) != 0;
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     debug_assert!(ply <= MAX_PLY && q_depth <= 0);
     td.sel_depth = td.sel_depth.max(ply);
@@ -1557,6 +1562,14 @@ fn quiescence<const CFG: u32, const PV: bool>(
     }
 
     if best_score >= beta {
+        if selective && use_qs_standpat {
+            let ret = if q_depth == 0 && !is_decisive(best_score) && !is_decisive(beta) {
+                (beta + best_score) / 2
+            } else {
+                best_score
+            };
+            return (ret, Move::NULL);
+        }
         if selective
             && entry.is_none()
             && let Some(t) = td.tt
@@ -1782,5 +1795,41 @@ mod tests {
         let mut td_deep = ThreadData::new(&pos, Some(&tt_deep), Some(&mut hist_deep));
         let _ = search_node::<CFG_ALL_SELECTIVE, true>(&mut td_deep, -INFINITY, INFINITY, 5, false, 1, 0);
         assert_eq!(tt_deep.read(pos.hash(), 0, 1).unwrap().depth, 5);
+    }
+
+    #[test]
+    fn qs_standpat_fail_high_damps_at_qdepth_zero_and_preserves_eval_only_tt_entry() {
+        // White has a Queen (+900 cp).
+        let pos = Board::from_fen("7k/7p/8/8/2Q5/8/7P/7K w - - 0 1").unwrap();
+
+        // 1. At q_depth == 0 with beta = 300 and raw_eval = 900:
+        //    Returns damped (300 + 900) / 2 = 600 and leaves the TT entry as EVAL_ONLY (Bound::None).
+        let tt_q0 = TranspositionTable::new(1);
+        let mut hist_q0 = HistoryTables::default();
+        let mut td_q0 = ThreadData::new(&pos, Some(&tt_q0), Some(&mut hist_q0));
+        let (score_q0, mv_q0) = quiescence::<CFG_ALL_SELECTIVE, false>(&mut td_q0, 299, 300, 0, 1, None);
+        assert_eq!(score_q0, 600);
+        assert_eq!(mv_q0, Move::NULL);
+        let entry_q0 = tt_q0.read(pos.hash(), 0, 1).unwrap();
+        assert_eq!(entry_q0.depth, TtDepth::EVAL_ONLY);
+        assert_eq!(entry_q0.bound, Bound::None);
+        assert_eq!(entry_q0.raw_eval, 900);
+
+        // 2. At q_depth == -1 (deeper QS ply) with beta = 300 and raw_eval = 900:
+        //    Returns undamped 900.
+        let tt_q1 = TranspositionTable::new(1);
+        let mut hist_q1 = HistoryTables::default();
+        let mut td_q1 = ThreadData::new(&pos, Some(&tt_q1), Some(&mut hist_q1));
+        let (score_q1, _) = quiescence::<CFG_ALL_SELECTIVE, false>(&mut td_q1, 299, 300, -1, 2, None);
+        assert_eq!(score_q1, 900);
+
+        // 3. When CFG_QS_STANDPAT is disabled, q_depth == 0 returns undamped 900 and writes Bound::Lower.
+        let tt_off = TranspositionTable::new(1);
+        let mut hist_off = HistoryTables::default();
+        let mut td_off = ThreadData::new(&pos, Some(&tt_off), Some(&mut hist_off));
+        let (score_off, _) =
+            quiescence::<{ CFG_ALL_SELECTIVE & !CFG_QS_STANDPAT }, false>(&mut td_off, 299, 300, 0, 1, None);
+        assert_eq!(score_off, 900);
+        assert_eq!(tt_off.read(pos.hash(), 0, 1).unwrap().bound, Bound::Lower);
     }
 }

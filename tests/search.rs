@@ -7,8 +7,8 @@ use asura::{
         search_without_late_quiet_closure, search_without_lmp, search_without_lmr, search_without_nmp,
         search_without_probcut, search_without_qs_early_cutoff, search_without_qs_futility_pruning,
         search_without_qs_history_pruning, search_without_qs_late_capture_pruning, search_without_qs_see_pruning,
-        search_without_razoring, search_without_rfp, search_without_root_iir, search_without_se,
-        search_without_see_pruning,
+        search_without_qs_standpat_handling, search_without_razoring, search_without_rfp, search_without_root_iir,
+        search_without_se, search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -900,4 +900,29 @@ fn quiescence_see_pruning_skips_negative_see_captures_and_checks() {
         p_on.nodes,
         p_off.nodes
     );
+}
+
+#[test]
+fn quiescence_standpat_fail_high_handling_preserves_eval_only_tt_and_tactics() {
+    // At depth 1, Move 1 (1. Rb2xf2, capturing undefended Nf2) sets alpha = -220
+    // at the root, so on 1. a2-a3 (which leaves Nf2 on the board) Black at ply 1
+    // (q_depth = 0) has beta = 220 and raw_eval = 540 > beta. With QS stand-pat
+    // fail-high handling enabled, ply 1 returns damped (220 + 540) / 2 = 380 and
+    // leaves the TT entry at child_after_a2a3 as TtDepth::EVAL_ONLY (Bound::None)
+    // rather than overwriting it with a Bound::Lower entry.
+    let pos = Board::from_fen("3r3k/8/2K5/8/8/8/PR3nn1/8 w - - 0 1").unwrap();
+    let a2a3 = Move::new(Square::A2, Square::A3, MoveKind::Normal);
+    let mut child_after_a2a3 = pos.clone();
+    child_after_a2a3.make_move(a2a3);
+
+    let tt = TranspositionTable::new(1);
+    let res_on = search_with_tt(&pos, 1, &tt);
+    let res_off = search_without_qs_standpat_handling(&pos, 1);
+    assert_eq!(res_on.best_move, res_off.best_move);
+    assert_eq!(res_on.score, res_off.score);
+
+    let entry = tt.read(child_after_a2a3.hash(), 0, 1).unwrap();
+    assert_eq!(entry.depth, asura::transposition::TtDepth::EVAL_ONLY);
+    assert_eq!(entry.bound, Bound::None);
+    assert_eq!(entry.raw_eval, 540);
 }
