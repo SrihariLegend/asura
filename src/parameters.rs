@@ -123,4 +123,10 @@ define! {
     // Hindsight depth adjustment constants (1_000 = 1 ply, 100 = 1 pawn).
     i32, HINDSIGHT_EXT_MIN_REDUCTION: 2_000;
     i32, HINDSIGHT_REDUCTION_MARGIN: 60;
+
+    // Correction history constants on the 100 = 1 pawn scale.
+    i32, CORRHIST_MAX: 1_024;
+    i32, CORRHIST_SCALE_DIV: 32;
+    i32, CORRHIST_BONUS_DIV: 8;
+    i32, CORRHIST_MAX_BONUS: 256;
 }

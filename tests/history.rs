@@ -158,3 +158,26 @@ fn cold_quiet_deferral_defers_threatened_destinations_not_escapes() {
         "escape move ({escape_pos}) must be ordered ahead of deferred move into pawn threat ({into_pawn_pos})"
     );
 }
+
+#[test]
+fn correction_history_updates_structural_and_continuation_tables_and_converges() {
+    let mut board = Board::starting_position();
+    for uci in ["e2e4", "e7e5", "g1f3", "b8c6"] {
+        let mv = board.generate_all_moves().iter().copied().find(|m| m.to_uci(&board) == uci).unwrap();
+        board.make_move(mv);
+    }
+
+    let mut tables = HistoryTables::default();
+    tables.prepare_search(&board);
+    assert_eq!(tables.eval_correction(&board, 0), 0);
+
+    // Repeated positive updates must converge toward 5 * CORRHIST_MAX / CORRHIST_SCALE_DIV = 160.
+    for _ in 0..50 {
+        tables.update_correction_history(&board, 0, 256);
+    }
+    let corr = tables.eval_correction(&board, 0);
+    assert!(corr > 120 && corr <= 160, "expected converged correction in (120, 160], got {corr}");
+
+    tables.clear();
+    assert_eq!(tables.eval_correction(&board, 0), 0);
+}

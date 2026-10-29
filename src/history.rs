@@ -207,11 +207,122 @@ impl Default for ContinuationHistory {
     }
 }
 
+pub struct CorrectionHistory {
+    pawn: Box<[[i16; Self::SIZE]; 2]>,
+    non_pawn: Box<[[[i16; Self::SIZE]; 2]; 2]>,
+    cont_tables: Box<[Option<Box<PieceToHistory<i16>>>; CONT_KEYS]>,
+    active_keys: Vec<u16>,
+    active_flags: Box<[bool; CONT_KEYS]>,
+}
+
+impl CorrectionHistory {
+    pub const MAX_HISTORY: i32 = crate::parameters::CORRHIST_MAX;
+    const SIZE: usize = 16_384;
+    const MASK: usize = Self::SIZE - 1;
+
+    pub fn get(&self, board: &Board, cont_hist: &ContinuationHistory, ply: usize) -> i32 {
+        let stm = board.side_to_move();
+        let mut total = self.pawn[stm][board.pawn_key() as usize & Self::MASK] as i32
+            + self.non_pawn[Color::White][stm][board.non_pawn_key(Color::White) as usize & Self::MASK] as i32
+            + self.non_pawn[Color::Black][stm][board.non_pawn_key(Color::Black) as usize & Self::MASK] as i32;
+
+        let last_mv = board.last_move();
+        let last_pc = board.last_moved_piece();
+        if last_mv.is_present() && last_pc != Piece::None {
+            total += self.get_cont(cont_hist, ply, 2, last_pc, last_mv.to());
+            total += self.get_cont(cont_hist, ply, 4, last_pc, last_mv.to());
+        }
+        total / crate::parameters::CORRHIST_SCALE_DIV
+    }
+
+    fn get_cont(&self, cont_hist: &ContinuationHistory, ply: usize, offset: usize, piece: Piece, to: Square) -> i32 {
+        let slot = (ply + PLY_OFFSET).wrapping_sub(offset);
+        if slot >= MAX_HISTORY_PLY {
+            return 0;
+        }
+        let key = cont_hist.plies[slot] as usize;
+        if key == 0 || key >= CONT_KEYS || !self.active_flags[key] {
+            return 0;
+        }
+        self.cont_tables[key].as_ref().map_or(0, |t| t[piece][to] as i32)
+    }
+
+    pub fn update(&mut self, board: &Board, cont_hist: &ContinuationHistory, ply: usize, bonus: i32) {
+        let stm = board.side_to_move();
+        apply_bonus::<{ Self::MAX_HISTORY }>(&mut self.pawn[stm][board.pawn_key() as usize & Self::MASK], bonus);
+        apply_bonus::<{ Self::MAX_HISTORY }>(
+            &mut self.non_pawn[Color::White][stm][board.non_pawn_key(Color::White) as usize & Self::MASK],
+            bonus,
+        );
+        apply_bonus::<{ Self::MAX_HISTORY }>(
+            &mut self.non_pawn[Color::Black][stm][board.non_pawn_key(Color::Black) as usize & Self::MASK],
+            bonus,
+        );
+
+        let last_mv = board.last_move();
+        let last_pc = board.last_moved_piece();
+        if last_mv.is_present() && last_pc != Piece::None {
+            self.update_cont(cont_hist, ply, 2, last_pc, last_mv.to(), bonus);
+            self.update_cont(cont_hist, ply, 4, last_pc, last_mv.to(), bonus);
+        }
+    }
+
+    fn update_cont(
+        &mut self, cont_hist: &ContinuationHistory, ply: usize, offset: usize, piece: Piece, to: Square, bonus: i32,
+    ) {
+        let slot = (ply + PLY_OFFSET).wrapping_sub(offset);
+        if slot >= MAX_HISTORY_PLY {
+            return;
+        }
+        let key = cont_hist.plies[slot] as usize;
+        if key == 0 || key >= CONT_KEYS {
+            return;
+        }
+        if !self.active_flags[key] {
+            self.active_flags[key] = true;
+            self.active_keys.push(key as u16);
+            if let Some(table) = &mut self.cont_tables[key] {
+                unsafe {
+                    std::ptr::write_bytes(table.as_mut() as *mut _, 0, 1);
+                }
+            } else {
+                self.cont_tables[key] = Some(zeroed_box());
+            }
+        }
+        let table = self.cont_tables[key].as_mut().unwrap();
+        apply_bonus::<{ Self::MAX_HISTORY }>(&mut table[piece][to], bonus);
+    }
+
+    pub fn clear(&mut self) {
+        unsafe {
+            std::ptr::write_bytes(self.pawn.as_mut() as *mut _, 0, 1);
+            std::ptr::write_bytes(self.non_pawn.as_mut() as *mut _, 0, 1);
+        }
+        for &key in &self.active_keys {
+            self.active_flags[key as usize] = false;
+        }
+        self.active_keys.clear();
+    }
+}
+
+impl Default for CorrectionHistory {
+    fn default() -> Self {
+        Self {
+            pawn: zeroed_box(),
+            non_pawn: zeroed_box(),
+            cont_tables: Box::new([const { None }; CONT_KEYS]),
+            active_keys: Vec::with_capacity(256),
+            active_flags: zeroed_box(),
+        }
+    }
+}
+
 pub struct HistoryTables {
     pub quiet_history: QuietHistory,
     pub pawn_history: PawnHistory,
     pub noisy_history: NoisyHistory,
     pub continuation_history: ContinuationHistory,
+    pub correction_history: CorrectionHistory,
     killers: [[Move; 2]; MAX_HISTORY_PLY],
     countermoves: Box<FromToHistory<Move>>,
 }
@@ -259,11 +370,20 @@ impl HistoryTables {
         }
     }
 
+    pub fn eval_correction(&self, board: &Board, ply: usize) -> i32 {
+        self.correction_history.get(board, &self.continuation_history, ply)
+    }
+
+    pub fn update_correction_history(&mut self, board: &Board, ply: usize, bonus: i32) {
+        self.correction_history.update(board, &self.continuation_history, ply, bonus);
+    }
+
     pub fn clear(&mut self) {
         self.quiet_history.clear();
         self.pawn_history.clear();
         self.noisy_history.clear();
         self.continuation_history.clear();
+        self.correction_history.clear();
         self.killers.fill([Move::NULL; 2]);
         unsafe {
             std::ptr::write_bytes(self.countermoves.as_mut() as *mut _, 0, 1);
@@ -278,6 +398,7 @@ impl Default for HistoryTables {
             pawn_history: PawnHistory::default(),
             noisy_history: NoisyHistory::default(),
             continuation_history: ContinuationHistory::default(),
+            correction_history: CorrectionHistory::default(),
             killers: [[Move::NULL; 2]; MAX_HISTORY_PLY],
             countermoves: zeroed_box(),
         }

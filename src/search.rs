@@ -44,6 +44,7 @@ const CFG_ROOT_IIR: u32 = 1 << 20;
 const CFG_QS_STANDPAT: u32 = 1 << 21;
 const CFG_QS_BOUND_AVG: u32 = 1 << 22;
 const CFG_HINDSIGHT: u32 = 1 << 23;
+const CFG_CORRHIST: u32 = 1 << 24;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -66,7 +67,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_ROOT_IIR
     | CFG_QS_STANDPAT
     | CFG_QS_BOUND_AVG
-    | CFG_HINDSIGHT;
+    | CFG_HINDSIGHT
+    | CFG_CORRHIST;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -238,6 +240,8 @@ define_diagnostic_searches! {
     search_without_qs_bound_averaging: CFG_ALL_SELECTIVE & !CFG_QS_BOUND_AVG;
     /// The selective search with hindsight depth adjustment disabled and recognized draws scored zero.
     search_without_hindsight: CFG_ALL_SELECTIVE & !CFG_HINDSIGHT;
+    /// The selective search with correction history disabled and recognized draws scored zero.
+    search_without_correction_history: CFG_ALL_SELECTIVE & !CFG_CORRHIST;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -376,6 +380,7 @@ fn search_root<const CFG: u32>(
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     let selective = (CFG & CFG_SELECTIVE) != 0;
     let use_root_iir = (CFG & CFG_ROOT_IIR) != 0;
+    let use_corrhist = (CFG & CFG_CORRHIST) != 0;
     let hash = td.board.hash();
     let entry = td.tt.and_then(|t| t.read(hash, td.board.fiftymove_clock(), 0));
     let tt_move = entry.map(|e| e.mv).filter(|&mv| mv.is_present() && td.board.is_legal(mv)).unwrap_or(Move::NULL);
@@ -399,7 +404,9 @@ fn search_root<const CFG: u32>(
         ev
     };
 
-    td.stack[0].static_eval = raw_eval;
+    let static_eval =
+        if in_check { TtDepth::NONE_SCORE } else { correct_eval(td, selective && use_corrhist, raw_eval, 0) };
+    td.stack[0].static_eval = static_eval;
     td.stack[0].reduction = 0;
     td.stack[0].laterality = 0;
     td.stack[2].cutoff_count = 0;
@@ -578,6 +585,19 @@ fn search_root<const CFG: u32>(
         t.write(hash, store_depth, raw_eval, best_score, bound, store_mv, 0, true, true);
     }
 
+    if selective && use_corrhist {
+        maybe_update_correction_history(
+            td,
+            0,
+            root_effective_depth as i32,
+            in_check,
+            best_move.is_present().then_some(best_move),
+            bound,
+            best_score,
+            static_eval,
+        );
+    }
+
     best_score
 }
 
@@ -601,6 +621,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_checked_tt_cut = (CFG & CFG_CHECKED_TT_CUT) != 0;
     let use_lqc = (CFG & CFG_LQC) != 0;
     let use_hindsight = (CFG & CFG_HINDSIGHT) != 0;
+    let use_corrhist = (CFG & CFG_CORRHIST) != 0;
 
     let ply_idx = ply as usize;
     let prior_move = if ply_idx > 0 { td.stack[ply_idx - 1].mv } else { Move::NULL };
@@ -736,7 +757,9 @@ fn search_node<const CFG: u32, const PV: bool>(
         ev
     };
 
-    td.stack[ply_idx].static_eval = raw_eval;
+    let static_eval =
+        if in_check { TtDepth::NONE_SCORE } else { correct_eval(td, selective && use_corrhist, raw_eval, ply_idx) };
+    td.stack[ply_idx].static_eval = static_eval;
     td.stack[ply_idx].reduction = 0;
     if ply_idx + 2 < td.stack.len() {
         td.stack[ply_idx + 2].cutoff_count = 0;
@@ -752,7 +775,7 @@ fn search_node<const CFG: u32, const PV: bool>(
         && (depth < 6 || entry.is_none())
         && let Some(h) = td.history.as_deref_mut()
     {
-        let eval_delta = -(raw_eval + parent_eval);
+        let eval_delta = -(static_eval + parent_eval);
         if eval_delta != 0 {
             let bonus = (eval_delta * 6).clamp(-150, 300);
             h.quiet_history.update(td.board.prior_threats(), false, !td.board.side_to_move(), prior_move, bonus);
@@ -762,8 +785,6 @@ fn search_node<const CFG: u32, const PV: bool>(
     if let Some(h) = td.history.as_deref_mut() {
         h.clear_child_killers(ply_idx);
     }
-
-    let static_eval = raw_eval;
     let improving = td.stack.is_improving(ply_idx, in_check, static_eval);
     let parent_stat_score = if ply_idx > 0 { td.stack[ply_idx - 1].stat_score } else { 0 };
     let parent_reduction = if ply_idx > 0 { td.stack[ply_idx - 1].reduction } else { 0 };
@@ -1405,6 +1426,10 @@ fn search_node<const CFG: u32, const PV: bool>(
         t.write(hash, store_depth, raw_eval, best_score, bound, store_mv, ply as isize, tt_pv, PV);
     }
 
+    if selective && use_corrhist && !in_singular {
+        maybe_update_correction_history(td, ply_idx, depth as i32, in_check, best_move, bound, best_score, static_eval);
+    }
+
     (best_score, best_move)
 }
 
@@ -1502,6 +1527,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
     let use_qs_see = (CFG & CFG_QS_SEE) != 0;
     let use_qs_standpat = (CFG & CFG_QS_STANDPAT) != 0;
     let use_qs_bound_avg = (CFG & CFG_QS_BOUND_AVG) != 0;
+    let use_corrhist = (CFG & CFG_CORRHIST) != 0;
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     debug_assert!(ply <= MAX_PLY && q_depth <= 0);
     td.sel_depth = td.sel_depth.max(ply);
@@ -1576,7 +1602,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
                 ev
             }
         };
-        best_score = raw_eval;
+        best_score = correct_eval(td, selective && use_corrhist, raw_eval, ply as usize);
 
         if let Some(entry) = &entry
             && entry.depth >= tt_depth
@@ -1739,6 +1765,43 @@ fn quiescence<const CFG: u32, const PV: bool>(
     }
 
     (best_score, best_move)
+}
+
+#[inline]
+fn correct_eval(td: &ThreadData<'_>, use_corrhist: bool, raw_eval: i32, ply: usize) -> i32 {
+    if !use_corrhist {
+        return raw_eval;
+    }
+    let Some(h) = td.history.as_deref() else {
+        return raw_eval;
+    };
+    let corr = h.eval_correction(&td.board, ply);
+    if corr == 0 { raw_eval } else { (raw_eval + corr).clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1) }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_update_correction_history(
+    td: &mut ThreadData<'_>, ply: usize, depth: i32, in_check: bool, best_move: Option<Move>, bound: Bound,
+    best_score: i32, static_eval: i32,
+) {
+    if in_check
+        || best_move.is_some_and(|mv| mv.is_noisy())
+        || is_decisive(best_score)
+        || !match bound {
+            Bound::Exact => true,
+            Bound::Lower => best_score > static_eval,
+            Bound::Upper => best_score < static_eval,
+            Bound::None => false,
+        }
+    {
+        return;
+    }
+    let Some(h) = td.history.as_deref_mut() else {
+        return;
+    };
+    let bonus =
+        ((best_score - static_eval) * depth / CORRHIST_BONUS_DIV).clamp(-CORRHIST_MAX_BONUS, CORRHIST_MAX_BONUS);
+    h.update_correction_history(&td.board, ply, bonus);
 }
 
 const fn draw_score(draw_jitter: bool, nodes: u64) -> i32 {
@@ -1948,5 +2011,25 @@ mod tests {
         td_red.make_move(quiet_mv);
         let _ = search_node::<CFG_ALL_SELECTIVE, false>(&mut td_red, 500, 501, 5, false, 1, 0);
         assert_eq!(tt_red.read(child_hash, 0, 1).unwrap().depth, 4);
+    }
+
+    #[test]
+    fn correction_history_adjusts_static_eval_while_keeping_tt_raw_eval_uncorrected() {
+        let pos = Board::starting_position();
+        let tt = TranspositionTable::new(1);
+        let mut hist = HistoryTables::default();
+        hist.prepare_search(&pos);
+        for _ in 0..20 {
+            hist.update_correction_history(&pos, 0, 256);
+        }
+        let expected_corr = hist.eval_correction(&pos, 0);
+        assert!(expected_corr > 0);
+
+        let mut td = ThreadData::new(&pos, Some(&tt), Some(&mut hist));
+        let _ = search_node::<CFG_ALL_SELECTIVE, true>(&mut td, -INFINITY, INFINITY, 1, false, 1, 0);
+
+        // Stack static_eval receives the corrected evaluation, while TT raw_eval remains uncorrected (0).
+        assert_eq!(td.stack[1].static_eval, expected_corr);
+        assert_eq!(tt.read(pos.hash(), 0, 1).unwrap().raw_eval, 0);
     }
 }
