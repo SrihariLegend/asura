@@ -47,6 +47,7 @@ const CFG_HINDSIGHT: u32 = 1 << 23;
 const CFG_CORRHIST: u32 = 1 << 24;
 const CFG_SE_HINDSIGHT: u32 = 1 << 25;
 const CFG_ALPHA_REDUCE: u32 = 1 << 26;
+const CFG_CLEAR_CUTOFF_BONUS: u32 = 1 << 27;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -72,7 +73,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_HINDSIGHT
     | CFG_CORRHIST
     | CFG_SE_HINDSIGHT
-    | CFG_ALPHA_REDUCE;
+    | CFG_ALPHA_REDUCE
+    | CFG_CLEAR_CUTOFF_BONUS;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -250,6 +252,8 @@ define_diagnostic_searches! {
     search_without_se_hindsight: CFG_ALL_SELECTIVE & !CFG_SE_HINDSIGHT;
     /// The selective search with post-alpha-raise effective depth reduction disabled and recognized draws scored zero.
     search_without_alpha_reduce: CFG_ALL_SELECTIVE & !CFG_ALPHA_REDUCE;
+    /// The selective search with clear-cutoff history depth bonus disabled and recognized draws scored zero.
+    search_without_clear_cutoff_bonus: CFG_ALL_SELECTIVE & !CFG_CLEAR_CUTOFF_BONUS;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -390,6 +394,7 @@ fn search_root<const CFG: u32>(
     let use_root_iir = (CFG & CFG_ROOT_IIR) != 0;
     let use_corrhist = (CFG & CFG_CORRHIST) != 0;
     let use_alpha_reduce = (CFG & CFG_ALPHA_REDUCE) != 0;
+    let use_clear_cutoff_bonus = (CFG & CFG_CLEAR_CUTOFF_BONUS) != 0;
     let hash = td.board.hash();
     let entry = td.tt.and_then(|t| t.read(hash, td.board.fiftymove_clock(), 0));
     let tt_move = entry.map(|e| e.mv).filter(|&mv| mv.is_present() && td.board.is_legal(mv)).unwrap_or(Move::NULL);
@@ -583,10 +588,12 @@ fn search_root<const CFG: u32>(
     }
 
     if best_score >= beta && best_move.is_present() {
+        let hist_depth =
+            root_effective_depth as i32 + i32::from(use_clear_cutoff_bonus && best_score >= beta + CLEAR_CUTOFF_MARGIN);
         update_histories_on_best_move(
             td,
             0,
-            root_effective_depth as i32,
+            hist_depth,
             false,
             best_move,
             best_score,
@@ -643,6 +650,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_corrhist = (CFG & CFG_CORRHIST) != 0;
     let use_se_hindsight = (CFG & CFG_SE_HINDSIGHT) != 0;
     let use_alpha_reduce = (CFG & CFG_ALPHA_REDUCE) != 0;
+    let use_clear_cutoff_bonus = (CFG & CFG_CLEAR_CUTOFF_BONUS) != 0;
 
     let ply_idx = ply as usize;
     let prior_move = if ply_idx > 0 { td.stack[ply_idx - 1].mv } else { Move::NULL };
@@ -1407,10 +1415,12 @@ fn search_node<const CFG: u32, const PV: bool>(
         if best_score >= beta
             && let Some(best_mv) = best_move
         {
+            let hist_depth =
+                depth as i32 + i32::from(use_clear_cutoff_bonus && best_score >= beta + CLEAR_CUTOFF_MARGIN);
             update_histories_on_best_move(
                 td,
                 ply_idx,
-                depth as i32,
+                hist_depth,
                 cut_node,
                 best_mv,
                 best_score,
@@ -2174,5 +2184,27 @@ mod tests {
         let mut td_pv = ThreadData::new(&pos, Some(&tt_pv), Some(&mut hist_pv));
         let _ = search_node::<CFG_ALL_SELECTIVE, true>(&mut td_pv, -INFINITY, INFINITY, 4, false, 1, 0);
         assert_eq!(tt_pv.read(pos.hash(), 0, 1).unwrap().depth, 3);
+    }
+
+    #[test]
+    fn clear_cutoff_bonus_strengthens_quiet_and_noisy_history_updates() {
+        // White has a winning capture 1. Ra1xa8 (+500 cp).
+        // With beta = 100, best_score >= beta + CLEAR_CUTOFF_MARGIN (50) is true,
+        // so CFG_CLEAR_CUTOFF_BONUS increments hist_depth from 2 to 3.
+        let pos = Board::from_fen("r7/8/6p1/7k/8/6P1/8/R6K w - - 0 1").unwrap();
+
+        let tt_on = TranspositionTable::new(1);
+        let mut hist_on = HistoryTables::default();
+        let mut td_on = ThreadData::new(&pos, Some(&tt_on), Some(&mut hist_on));
+        let _ = search_node::<CFG_ALL_SELECTIVE, false>(&mut td_on, 99, 100, 2, false, 1, 0);
+        let score_on = hist_on.noisy_history.get(pos.all_threats(), Piece::WhiteRook, Square::A8, PieceType::Rook);
+
+        let tt_off = TranspositionTable::new(1);
+        let mut hist_off = HistoryTables::default();
+        let mut td_off = ThreadData::new(&pos, Some(&tt_off), Some(&mut hist_off));
+        let _ =
+            search_node::<{ CFG_ALL_SELECTIVE & !CFG_CLEAR_CUTOFF_BONUS }, false>(&mut td_off, 99, 100, 2, false, 1, 0);
+        let score_off = hist_off.noisy_history.get(pos.all_threats(), Piece::WhiteRook, Square::A8, PieceType::Rook);
+        assert!(score_on > score_off, "expected clear-cutoff noisy bonus {} > {}", score_on, score_off);
     }
 }

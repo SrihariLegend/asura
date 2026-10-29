@@ -133,4 +133,7 @@ define! {
 
     // Post-alpha-raise effective depth reduction minimum depth (keeps child_depth >= 1).
     u8,  ALPHA_REDUCE_MIN_DEPTH: 3;
+
+    // Clear-cutoff history depth bonus margin on the 100 = 1 pawn scale.
+    i32, CLEAR_CUTOFF_MARGIN: 50;
 }

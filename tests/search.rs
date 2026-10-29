@@ -3,10 +3,10 @@ use asura::{
     movepick::{MainMovePicker, MainStage},
     search::{
         lmr_table_term, search, search_reference, search_with_context, search_with_tt, search_with_zero_draws,
-        search_without_alpha_reduce, search_without_checked_tt_cutoff, search_without_correction_history,
-        search_without_fp, search_without_hindsight, search_without_hp, search_without_iir,
-        search_without_late_quiet_closure, search_without_lmp, search_without_lmr, search_without_nmp,
-        search_without_probcut, search_without_qs_bound_averaging, search_without_qs_early_cutoff,
+        search_without_alpha_reduce, search_without_checked_tt_cutoff, search_without_clear_cutoff_bonus,
+        search_without_correction_history, search_without_fp, search_without_hindsight, search_without_hp,
+        search_without_iir, search_without_late_quiet_closure, search_without_lmp, search_without_lmr,
+        search_without_nmp, search_without_probcut, search_without_qs_bound_averaging, search_without_qs_early_cutoff,
         search_without_qs_futility_pruning, search_without_qs_history_pruning, search_without_qs_late_capture_pruning,
         search_without_qs_see_pruning, search_without_qs_standpat_handling, search_without_razoring,
         search_without_rfp, search_without_root_iir, search_without_se, search_without_se_hindsight,
@@ -1001,4 +1001,13 @@ fn post_alpha_raise_depth_reduction_reduces_nodes_and_preserves_tactics() {
     let res_on = search_with_tt(&pos, 4, &tt);
     let res_off = search_without_alpha_reduce(&pos, 4);
     assert_eq!(res_on.best_move, res_off.best_move);
+}
+
+#[test]
+fn clear_cutoff_history_bonus_preserves_tactics() {
+    let italian = Board::from_fen("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
+    let it_on = search_with_zero_draws(&italian, 7);
+    let it_off = search_without_clear_cutoff_bonus(&italian, 7);
+    assert_eq!(it_on.best_move, it_off.best_move);
+    assert_eq!(it_on.score, it_off.score);
 }
