@@ -6,11 +6,11 @@ use asura::{
         search_without_alpha_reduce, search_without_checked_tt_cutoff, search_without_clear_cutoff_bonus,
         search_without_correction_history, search_without_fp, search_without_hindsight, search_without_hp,
         search_without_iir, search_without_late_quiet_closure, search_without_lmp, search_without_lmr,
-        search_without_nmp, search_without_probcut, search_without_qs_bound_averaging, search_without_qs_early_cutoff,
-        search_without_qs_futility_pruning, search_without_qs_history_pruning, search_without_qs_late_capture_pruning,
-        search_without_qs_see_pruning, search_without_qs_standpat_handling, search_without_razoring,
-        search_without_rfp, search_without_root_iir, search_without_se, search_without_se_hindsight,
-        search_without_see_pruning, search_without_tt_store_discount,
+        search_without_multi_threat_closure, search_without_nmp, search_without_probcut,
+        search_without_qs_bound_averaging, search_without_qs_early_cutoff, search_without_qs_futility_pruning,
+        search_without_qs_history_pruning, search_without_qs_late_capture_pruning, search_without_qs_see_pruning,
+        search_without_qs_standpat_handling, search_without_razoring, search_without_rfp, search_without_root_iir,
+        search_without_se, search_without_se_hindsight, search_without_see_pruning, search_without_tt_store_discount,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -1019,4 +1019,13 @@ fn tt_store_depth_discount_preserves_tactics() {
     let mid_off = search_without_tt_store_discount(&midgame, 7);
     assert_eq!(mid_on.best_move, mid_off.best_move);
     assert_eq!(mid_on.score, mid_off.score);
+}
+
+#[test]
+fn depth_one_multi_threat_closure_preserves_tactics() {
+    let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+    let kw_on = search_with_zero_draws(&kiwipete, 6);
+    let kw_off = search_without_multi_threat_closure(&kiwipete, 6);
+    assert_eq!(kw_on.best_move, kw_off.best_move);
+    assert_eq!(kw_on.score, kw_off.score);
 }

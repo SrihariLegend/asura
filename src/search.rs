@@ -49,6 +49,7 @@ const CFG_SE_HINDSIGHT: u32 = 1 << 25;
 const CFG_ALPHA_REDUCE: u32 = 1 << 26;
 const CFG_CLEAR_CUTOFF_BONUS: u32 = 1 << 27;
 const CFG_TT_STORE_DISCOUNT: u32 = 1 << 28;
+const CFG_MULTI_THREAT_CLOSURE: u32 = 1 << 29;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -76,7 +77,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_SE_HINDSIGHT
     | CFG_ALPHA_REDUCE
     | CFG_CLEAR_CUTOFF_BONUS
-    | CFG_TT_STORE_DISCOUNT;
+    | CFG_TT_STORE_DISCOUNT
+    | CFG_MULTI_THREAT_CLOSURE;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -258,6 +260,8 @@ define_diagnostic_searches! {
     search_without_clear_cutoff_bonus: CFG_ALL_SELECTIVE & !CFG_CLEAR_CUTOFF_BONUS;
     /// The selective search with cut-node TT store-depth discount disabled and recognized draws scored zero.
     search_without_tt_store_discount: CFG_ALL_SELECTIVE & !CFG_TT_STORE_DISCOUNT;
+    /// The selective search with depth-1 multi-threat quiet closure disabled and recognized draws scored zero.
+    search_without_multi_threat_closure: CFG_ALL_SELECTIVE & !CFG_MULTI_THREAT_CLOSURE;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -656,6 +660,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_alpha_reduce = (CFG & CFG_ALPHA_REDUCE) != 0;
     let use_clear_cutoff_bonus = (CFG & CFG_CLEAR_CUTOFF_BONUS) != 0;
     let use_tt_store_discount = (CFG & CFG_TT_STORE_DISCOUNT) != 0;
+    let use_multi_threat_closure = (CFG & CFG_MULTI_THREAT_CLOSURE) != 0;
 
     let ply_idx = ply as usize;
     let prior_move = if ply_idx > 0 { td.stack[ply_idx - 1].mv } else { Move::NULL };
@@ -1121,6 +1126,26 @@ fn search_node<const CFG: u32, const PV: bool>(
         } else {
             0
         };
+
+        // Depth-1 Multi-Threat Quiet Closure
+        if selective
+            && use_multi_threat_closure
+            && !PV
+            && ply > 0
+            && !in_check
+            && is_quiet
+            && depth == 1
+            && best_score > -MATE_THRESHOLD
+            && !is_decisive(alpha)
+            && static_eval < alpha
+            && !entry.is_some_and(|e| matches!(e.bound, Bound::Lower | Bound::Exact))
+            && has_multiple_lesser_threats(&td.board)
+        {
+            skip_quiets = true;
+            if !td.board.is_direct_check(mv) {
+                continue;
+            }
+        }
 
         // Late Move Pruning (LMP)
         if selective
@@ -1866,6 +1891,19 @@ fn maybe_update_correction_history(
     h.update_correction_history(&td.board, ply, bonus);
 }
 
+#[inline]
+fn has_multiple_lesser_threats(board: &Board) -> bool {
+    let own = board.colors(board.side_to_move());
+    let pawn_threats = board.piece_threats(PieceType::Pawn);
+    let minor_threats = pawn_threats | board.piece_threats(PieceType::Knight) | board.piece_threats(PieceType::Bishop);
+    let rook_threats = minor_threats | board.piece_threats(PieceType::Rook);
+    let minors = board.pieces(PieceType::Knight) | board.pieces(PieceType::Bishop);
+    let rooks = board.pieces(PieceType::Rook);
+    let queens = board.pieces(PieceType::Queen);
+    let threatened = own & ((minors & pawn_threats) | (rooks & minor_threats) | (queens & rook_threats));
+    threatened.count() > 1
+}
+
 const fn draw_score(draw_jitter: bool, nodes: u64) -> i32 {
     if draw_jitter { (nodes % 5) as i32 - 2 } else { 0 }
 }
@@ -2238,5 +2276,34 @@ mod tests {
         let e_cut_fh = tt_cut_fh.read(pos.hash(), 0, 1).unwrap();
         assert_eq!(e_cut_fh.bound, Bound::Lower);
         assert_eq!(e_cut_fh.depth, 4);
+    }
+
+    #[test]
+    fn depth_one_multi_threat_closure_prunes_quiets_when_two_pieces_threatened_by_lesser() {
+        // White has two Knights (c3, f3) both attacked by Black Pawns (b4, e4) and no captures.
+        // At depth = 1 (!PV, ply = 1) with static_eval = 540 and alpha = 600:
+        // Move 1 sets best_score > -MATE_THRESHOLD, and on Move 2 (move_count == 2 < LMP limit 4,
+        // 540 + 240 > 600 so FP does not fire), multi-threat closure closes the remaining quiets.
+        let pos = Board::from_fen("7k/8/8/8/1p4p1/2N2N2/P7/6K1 w - - 0 1").unwrap();
+        assert!(has_multiple_lesser_threats(&pos));
+
+        let tt_on = TranspositionTable::new(1);
+        let mut hist_on = HistoryTables::default();
+        let mut td_on = ThreadData::new(&pos, Some(&tt_on), Some(&mut hist_on));
+        let _ = search_node::<{ CFG_ALL_SELECTIVE & !CFG_RAZOR }, false>(&mut td_on, 600, 601, 1, false, 1, 0);
+
+        let tt_off = TranspositionTable::new(1);
+        let mut hist_off = HistoryTables::default();
+        let mut td_off = ThreadData::new(&pos, Some(&tt_off), Some(&mut hist_off));
+        let _ = search_node::<{ CFG_ALL_SELECTIVE & !CFG_RAZOR & !CFG_MULTI_THREAT_CLOSURE }, false>(
+            &mut td_off,
+            600,
+            601,
+            1,
+            false,
+            1,
+            0,
+        );
+        assert!(td_on.nodes < td_off.nodes, "expected multi-threat closure {} < {}", td_on.nodes, td_off.nodes);
     }
 }
