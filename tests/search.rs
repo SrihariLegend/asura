@@ -3,9 +3,9 @@ use asura::{
     movepick::{MainMovePicker, MainStage},
     search::{
         lmr_table_term, search, search_reference, search_with_context, search_with_tt, search_with_zero_draws,
-        search_without_checked_tt_cutoff, search_without_fp, search_without_hp, search_without_iir,
-        search_without_late_quiet_closure, search_without_lmp, search_without_lmr, search_without_nmp,
-        search_without_probcut, search_without_qs_bound_averaging, search_without_qs_early_cutoff,
+        search_without_checked_tt_cutoff, search_without_fp, search_without_hindsight, search_without_hp,
+        search_without_iir, search_without_late_quiet_closure, search_without_lmp, search_without_lmr,
+        search_without_nmp, search_without_probcut, search_without_qs_bound_averaging, search_without_qs_early_cutoff,
         search_without_qs_futility_pruning, search_without_qs_history_pruning, search_without_qs_late_capture_pruning,
         search_without_qs_see_pruning, search_without_qs_standpat_handling, search_without_razoring,
         search_without_rfp, search_without_root_iir, search_without_se, search_without_see_pruning,
@@ -949,4 +949,13 @@ fn quiescence_post_loop_bound_averaging_damps_tt_bounds_and_preserves_tactics() 
     let entry_on = tt_on.read(child_after_a2a8.hash(), 0, 1).unwrap();
     assert_eq!(entry_on.bound, Bound::Lower);
     assert!(entry_on.score < 720, "Post-loop fail-high score should be damped toward beta (got {})", entry_on.score);
+}
+
+#[test]
+fn hindsight_depth_adjustment_preserves_tactics_and_reduces_bad_lmr_subtrees() {
+    let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
+    let mid_on = search_with_zero_draws(&midgame, 7);
+    let mid_off = search_without_hindsight(&midgame, 7);
+    assert_eq!(mid_on.best_move, mid_off.best_move);
+    assert_eq!(mid_on.score, mid_off.score);
 }

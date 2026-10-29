@@ -43,6 +43,7 @@ const CFG_QS_SEE: u32 = 1 << 19;
 const CFG_ROOT_IIR: u32 = 1 << 20;
 const CFG_QS_STANDPAT: u32 = 1 << 21;
 const CFG_QS_BOUND_AVG: u32 = 1 << 22;
+const CFG_HINDSIGHT: u32 = 1 << 23;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -64,7 +65,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_QS_SEE
     | CFG_ROOT_IIR
     | CFG_QS_STANDPAT
-    | CFG_QS_BOUND_AVG;
+    | CFG_QS_BOUND_AVG
+    | CFG_HINDSIGHT;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -234,6 +236,8 @@ define_diagnostic_searches! {
     search_without_qs_standpat_handling: CFG_ALL_SELECTIVE & !CFG_QS_STANDPAT;
     /// The selective search with quiescence post-loop bound-score averaging disabled and recognized draws scored zero.
     search_without_qs_bound_averaging: CFG_ALL_SELECTIVE & !CFG_QS_BOUND_AVG;
+    /// The selective search with hindsight depth adjustment disabled and recognized draws scored zero.
+    search_without_hindsight: CFG_ALL_SELECTIVE & !CFG_HINDSIGHT;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -596,6 +600,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_razoring = (CFG & CFG_RAZOR) != 0;
     let use_checked_tt_cut = (CFG & CFG_CHECKED_TT_CUT) != 0;
     let use_lqc = (CFG & CFG_LQC) != 0;
+    let use_hindsight = (CFG & CFG_HINDSIGHT) != 0;
 
     let ply_idx = ply as usize;
     let prior_move = if ply_idx > 0 { td.stack[ply_idx - 1].mv } else { Move::NULL };
@@ -763,6 +768,28 @@ fn search_node<const CFG: u32, const PV: bool>(
     let parent_stat_score = if ply_idx > 0 { td.stack[ply_idx - 1].stat_score } else { 0 };
     let parent_reduction = if ply_idx > 0 { td.stack[ply_idx - 1].reduction } else { 0 };
     let parent_laterality = if ply_idx > 0 { td.stack[ply_idx - 1].laterality } else { 0 };
+
+    // Hindsight depth adjustment from parent LMR reduction
+    if selective
+        && use_hindsight
+        && !in_singular
+        && ply > 0
+        && !in_check
+        && parent_eval != TtDepth::NONE_SCORE
+        && parent_reduction > 0
+    {
+        let eval_delta = static_eval + parent_eval;
+        if parent_reduction >= HINDSIGHT_EXT_MIN_REDUCTION
+            && prior_move.is_quiet()
+            && eval_delta < 0
+            && static_eval < alpha
+            && (depth as usize) < MAX_PLY_USIZE - 1
+        {
+            depth += 1;
+        } else if !tt_pv && depth >= 2 && eval_delta > HINDSIGHT_REDUCTION_MARGIN {
+            depth -= 1;
+        }
+    }
 
     // Razoring
     if selective
@@ -1886,5 +1913,40 @@ mod tests {
         let entry_fl = tt_fl.read(fl_pos.hash(), 0, 1).unwrap();
         assert_eq!(entry_fl.bound, Bound::Upper);
         assert_eq!(entry_fl.score, 100);
+    }
+
+    #[test]
+    fn hindsight_depth_adjustment_extends_and_reduces_based_on_parent_eval_delta() {
+        let pos = Board::starting_position();
+        let quiet_mv = pos.generate_all_moves()[0];
+
+        // 1. Hindsight extension (depth += 1):
+        //    parent_reduction = 2_000 (>= HINDSIGHT_EXT_MIN_REDUCTION), prior_move is quiet,
+        //    static_eval (0) + parent_eval (-100) = -100 < 0, and static_eval (0) < alpha (500).
+        //    depth = 3 is extended to 4 (> RAZOR_MAX_DEPTH), storing depth 4 on fail-low.
+        let tt_ext = TranspositionTable::new(1);
+        let mut hist_ext = HistoryTables::default();
+        let mut td_ext = ThreadData::new(&pos, Some(&tt_ext), Some(&mut hist_ext));
+        td_ext.stack[0].mv = quiet_mv;
+        td_ext.stack[0].static_eval = -100;
+        td_ext.stack[0].reduction = 2_000;
+        td_ext.make_move(quiet_mv);
+        let child_hash = td_ext.board.hash();
+        let _ = search_node::<CFG_ALL_SELECTIVE, false>(&mut td_ext, 500, 501, 3, false, 1, 0);
+        assert_eq!(tt_ext.read(child_hash, 0, 1).unwrap().depth, 4);
+
+        // 2. Hindsight reduction (depth -= 1):
+        //    parent_reduction = 1_000 (> 0), !tt_pv, depth = 5 >= 2, and
+        //    static_eval (0) + parent_eval (100) = 100 > HINDSIGHT_REDUCTION_MARGIN (60).
+        //    depth = 5 is reduced to 4 (> RAZOR_MAX_DEPTH), storing depth 4 on fail-low.
+        let tt_red = TranspositionTable::new(1);
+        let mut hist_red = HistoryTables::default();
+        let mut td_red = ThreadData::new(&pos, Some(&tt_red), Some(&mut hist_red));
+        td_red.stack[0].mv = quiet_mv;
+        td_red.stack[0].static_eval = 100;
+        td_red.stack[0].reduction = 1_000;
+        td_red.make_move(quiet_mv);
+        let _ = search_node::<CFG_ALL_SELECTIVE, false>(&mut td_red, 500, 501, 5, false, 1, 0);
+        assert_eq!(tt_red.read(child_hash, 0, 1).unwrap().depth, 4);
     }
 }

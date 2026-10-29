@@ -119,4 +119,8 @@ define! {
     i32, QS_SEE_BASE: 75;
     i32, QS_SEE_EVAL_DIV: 8;
     i32, QS_SEE_HIST_DIV: 50;
+
+    // Hindsight depth adjustment constants (1_000 = 1 ply, 100 = 1 pawn).
+    i32, HINDSIGHT_EXT_MIN_REDUCTION: 2_000;
+    i32, HINDSIGHT_REDUCTION_MARGIN: 60;
 }
