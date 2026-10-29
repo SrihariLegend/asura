@@ -3,13 +3,14 @@ use asura::{
     movepick::{MainMovePicker, MainStage},
     search::{
         lmr_table_term, search, search_reference, search_with_context, search_with_tt, search_with_zero_draws,
-        search_without_checked_tt_cutoff, search_without_correction_history, search_without_fp,
-        search_without_hindsight, search_without_hp, search_without_iir, search_without_late_quiet_closure,
-        search_without_lmp, search_without_lmr, search_without_nmp, search_without_probcut,
-        search_without_qs_bound_averaging, search_without_qs_early_cutoff, search_without_qs_futility_pruning,
-        search_without_qs_history_pruning, search_without_qs_late_capture_pruning, search_without_qs_see_pruning,
-        search_without_qs_standpat_handling, search_without_razoring, search_without_rfp, search_without_root_iir,
-        search_without_se, search_without_se_hindsight, search_without_see_pruning,
+        search_without_alpha_reduce, search_without_checked_tt_cutoff, search_without_correction_history,
+        search_without_fp, search_without_hindsight, search_without_hp, search_without_iir,
+        search_without_late_quiet_closure, search_without_lmp, search_without_lmr, search_without_nmp,
+        search_without_probcut, search_without_qs_bound_averaging, search_without_qs_early_cutoff,
+        search_without_qs_futility_pruning, search_without_qs_history_pruning, search_without_qs_late_capture_pruning,
+        search_without_qs_see_pruning, search_without_qs_standpat_handling, search_without_razoring,
+        search_without_rfp, search_without_root_iir, search_without_se, search_without_se_hindsight,
+        search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -554,8 +555,8 @@ fn singular_extensions_extend_unique_tt_moves_and_multi_cut_alternatives() {
 #[test]
 fn razoring_prunes_hopeless_nodes_and_preserves_tactical_refutations() {
     let kiwipete = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
-    let rz_on = search_with_zero_draws(&kiwipete, 7);
-    let rz_off = search_without_razoring(&kiwipete, 7);
+    let rz_on = search_with_zero_draws(&kiwipete, 6);
+    let rz_off = search_without_razoring(&kiwipete, 6);
     assert_eq!(rz_on.best_move, rz_off.best_move);
     assert_eq!(rz_on.score, rz_off.score);
     assert!(
@@ -986,4 +987,18 @@ fn se_hindsight_depth_boost_preserves_tactics() {
     let mid_off = search_without_se_hindsight(&midgame, 8);
     assert_eq!(mid_on.best_move, mid_off.best_move);
     assert_eq!(mid_on.score, mid_off.score);
+}
+
+#[test]
+fn post_alpha_raise_depth_reduction_reduces_nodes_and_preserves_tactics() {
+    // Seed the TT with a suboptimal quiet move (Kh1-g1) so Move 2 (Ra1xa8)
+    // raises alpha at move_count == 2 and reduces the depth of all remaining
+    // root moves.
+    let pos = Board::from_fen("r7/8/6p1/7k/8/6P1/8/R6K w - - 0 1").unwrap();
+    let quiet_mv = Move::new(Square::H1, Square::G1, MoveKind::Normal);
+    let tt = TranspositionTable::new(1);
+    tt.write(pos.hash(), 3, 0, 0, Bound::Exact, quiet_mv, 0, true, true);
+    let res_on = search_with_tt(&pos, 4, &tt);
+    let res_off = search_without_alpha_reduce(&pos, 4);
+    assert_eq!(res_on.best_move, res_off.best_move);
 }

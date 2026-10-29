@@ -130,4 +130,7 @@ define! {
     i32, CORRHIST_SCALE_DIV: 32;
     i32, CORRHIST_BONUS_DIV: 8;
     i32, CORRHIST_MAX_BONUS: 256;
+
+    // Post-alpha-raise effective depth reduction minimum depth (keeps child_depth >= 1).
+    u8,  ALPHA_REDUCE_MIN_DEPTH: 3;
 }

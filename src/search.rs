@@ -46,6 +46,7 @@ const CFG_QS_BOUND_AVG: u32 = 1 << 22;
 const CFG_HINDSIGHT: u32 = 1 << 23;
 const CFG_CORRHIST: u32 = 1 << 24;
 const CFG_SE_HINDSIGHT: u32 = 1 << 25;
+const CFG_ALPHA_REDUCE: u32 = 1 << 26;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -70,7 +71,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_QS_BOUND_AVG
     | CFG_HINDSIGHT
     | CFG_CORRHIST
-    | CFG_SE_HINDSIGHT;
+    | CFG_SE_HINDSIGHT
+    | CFG_ALPHA_REDUCE;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -246,6 +248,8 @@ define_diagnostic_searches! {
     search_without_correction_history: CFG_ALL_SELECTIVE & !CFG_CORRHIST;
     /// The selective search with singular-extension hindsight depth boost disabled and recognized draws scored zero.
     search_without_se_hindsight: CFG_ALL_SELECTIVE & !CFG_SE_HINDSIGHT;
+    /// The selective search with post-alpha-raise effective depth reduction disabled and recognized draws scored zero.
+    search_without_alpha_reduce: CFG_ALL_SELECTIVE & !CFG_ALPHA_REDUCE;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -385,6 +389,7 @@ fn search_root<const CFG: u32>(
     let selective = (CFG & CFG_SELECTIVE) != 0;
     let use_root_iir = (CFG & CFG_ROOT_IIR) != 0;
     let use_corrhist = (CFG & CFG_CORRHIST) != 0;
+    let use_alpha_reduce = (CFG & CFG_ALPHA_REDUCE) != 0;
     let hash = td.board.hash();
     let entry = td.tt.and_then(|t| t.read(hash, td.board.fiftymove_clock(), 0));
     let tt_move = entry.map(|e| e.mv).filter(|&mv| mv.is_present() && td.board.is_legal(mv)).unwrap_or(Move::NULL);
@@ -540,6 +545,16 @@ fn search_root<const CFG: u32>(
         );
 
         if score > best_score {
+            if selective
+                && use_alpha_reduce
+                && move_count > 1
+                && root_effective_depth >= ALPHA_REDUCE_MIN_DEPTH
+                && score > alpha
+                && score < beta
+                && score > -MATE_THRESHOLD
+            {
+                root_effective_depth -= 1;
+            }
             best_score = score;
             if score > alpha {
                 best_move = mv;
@@ -627,6 +642,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_hindsight = (CFG & CFG_HINDSIGHT) != 0;
     let use_corrhist = (CFG & CFG_CORRHIST) != 0;
     let use_se_hindsight = (CFG & CFG_SE_HINDSIGHT) != 0;
+    let use_alpha_reduce = (CFG & CFG_ALPHA_REDUCE) != 0;
 
     let ply_idx = ply as usize;
     let prior_move = if ply_idx > 0 { td.stack[ply_idx - 1].mv } else { Move::NULL };
@@ -1333,6 +1349,18 @@ fn search_node<const CFG: u32, const PV: bool>(
         }
 
         if score > best_score {
+            if selective
+                && PV
+                && ply > 0
+                && move_count > 1
+                && use_alpha_reduce
+                && depth >= ALPHA_REDUCE_MIN_DEPTH
+                && score > alpha
+                && score < beta
+                && score > -MATE_THRESHOLD
+            {
+                depth -= 1;
+            }
             best_score = score;
             best_move = Some(mv);
             if score > alpha {
@@ -1842,7 +1870,14 @@ mod tests {
         let mut td_on = ThreadData::new(&pos, Some(&tt_on), Some(&mut hist_on));
         td_on.root_moves = RootMoves::new(&pos);
         td_on.root_moves.begin_depth_iteration(4);
-        let _ = search_root::<CFG_ALL_SELECTIVE>(&mut td_on, -INFINITY, INFINITY, 4, 0, legal_work_item);
+        let _ = search_root::<{ CFG_ALL_SELECTIVE & !CFG_ALPHA_REDUCE }>(
+            &mut td_on,
+            -INFINITY,
+            INFINITY,
+            4,
+            0,
+            legal_work_item,
+        );
         assert_eq!(tt_on.read(pos.hash(), 0, 0).unwrap().depth, 3);
 
         let tt_off = TranspositionTable::new(1);
@@ -1850,7 +1885,7 @@ mod tests {
         let mut td_off = ThreadData::new(&pos, Some(&tt_off), Some(&mut hist_off));
         td_off.root_moves = RootMoves::new(&pos);
         td_off.root_moves.begin_depth_iteration(4);
-        let _ = search_root::<{ CFG_ALL_SELECTIVE & !CFG_ROOT_IIR }>(
+        let _ = search_root::<{ CFG_ALL_SELECTIVE & !CFG_ROOT_IIR & !CFG_ALPHA_REDUCE }>(
             &mut td_off,
             -INFINITY,
             INFINITY,
@@ -1868,7 +1903,14 @@ mod tests {
         let mut td_deep = ThreadData::new(&pos, Some(&tt_deep), Some(&mut hist_deep));
         td_deep.root_moves = RootMoves::new(&pos);
         td_deep.root_moves.begin_depth_iteration(5);
-        let _ = search_root::<CFG_ALL_SELECTIVE>(&mut td_deep, -INFINITY, INFINITY, 5, 0, legal_work_item);
+        let _ = search_root::<{ CFG_ALL_SELECTIVE & !CFG_ALPHA_REDUCE }>(
+            &mut td_deep,
+            -INFINITY,
+            INFINITY,
+            5,
+            0,
+            legal_work_item,
+        );
         assert_eq!(tt_deep.read(pos.hash(), 0, 0).unwrap().depth, 5);
 
         // 3. Even with a deep TT entry (depth = 4), an absent or illegal work_item triggers Root IIR (5 -> 4).
@@ -1878,7 +1920,14 @@ mod tests {
         let mut td_no_work = ThreadData::new(&pos, Some(&tt_no_work), Some(&mut hist_no_work));
         td_no_work.root_moves = RootMoves::new(&pos);
         td_no_work.root_moves.begin_depth_iteration(5);
-        let _ = search_root::<CFG_ALL_SELECTIVE>(&mut td_no_work, -INFINITY, INFINITY, 5, 0, illegal_work_item);
+        let _ = search_root::<{ CFG_ALL_SELECTIVE & !CFG_ALPHA_REDUCE }>(
+            &mut td_no_work,
+            -INFINITY,
+            INFINITY,
+            5,
+            0,
+            illegal_work_item,
+        );
         assert_eq!(tt_no_work.read(pos.hash(), 0, 0).unwrap().depth, 4);
     }
 
@@ -1891,13 +1940,15 @@ mod tests {
         let tt_on = TranspositionTable::new(1);
         let mut hist_on = HistoryTables::default();
         let mut td_on = ThreadData::new(&pos, Some(&tt_on), Some(&mut hist_on));
-        let _ = search_node::<CFG_ALL_SELECTIVE, true>(&mut td_on, -INFINITY, INFINITY, 4, false, 1, 0);
+        let _ = search_node::<{ CFG_ALL_SELECTIVE & !CFG_ALPHA_REDUCE }, true>(
+            &mut td_on, -INFINITY, INFINITY, 4, false, 1, 0,
+        );
         assert_eq!(tt_on.read(pos.hash(), 0, 1).unwrap().depth, 3);
 
         let tt_off = TranspositionTable::new(1);
         let mut hist_off = HistoryTables::default();
         let mut td_off = ThreadData::new(&pos, Some(&tt_off), Some(&mut hist_off));
-        let _ = search_node::<{ CFG_ALL_SELECTIVE & !CFG_ROOT_IIR }, true>(
+        let _ = search_node::<{ CFG_ALL_SELECTIVE & !CFG_ROOT_IIR & !CFG_ALPHA_REDUCE }, true>(
             &mut td_off,
             -INFINITY,
             INFINITY,
@@ -1914,7 +1965,15 @@ mod tests {
         tt_deep.write(pos.hash(), 1, 0, 0, Bound::Exact, legal_mv, 1, true, true);
         let mut hist_deep = HistoryTables::default();
         let mut td_deep = ThreadData::new(&pos, Some(&tt_deep), Some(&mut hist_deep));
-        let _ = search_node::<CFG_ALL_SELECTIVE, true>(&mut td_deep, -INFINITY, INFINITY, 5, false, 1, 0);
+        let _ = search_node::<{ CFG_ALL_SELECTIVE & !CFG_ALPHA_REDUCE }, true>(
+            &mut td_deep,
+            -INFINITY,
+            INFINITY,
+            5,
+            false,
+            1,
+            0,
+        );
         assert_eq!(tt_deep.read(pos.hash(), 0, 1).unwrap().depth, 5);
     }
 
@@ -2086,5 +2145,34 @@ mod tests {
         tt_cut.write(child_hash, 5, 0, 400, Bound::Lower, a1a8, 1, false, false);
         let _ = search_node::<{ CFG_ALL_SELECTIVE & !CFG_HINDSIGHT }, false>(&mut td_cut, 2_000, 2_001, 6, false, 1, 0);
         assert_eq!(tt_cut.read(child_hash, 0, 1).unwrap().depth, 6);
+    }
+
+    #[test]
+    fn post_alpha_raise_depth_reduction_decrements_root_and_pv_effective_depth() {
+        // White has a quiet move 1. Kh1-g1 (Move 1 via TT/work_item, scoring <= 0)
+        // and a winning capture 1. Ra1xa8 (Move 2, scoring +500), which overturns
+        // Move 1 at move_count == 2 and raises alpha inside (-INFINITY, INFINITY).
+        let pos = Board::from_fen("r7/8/6p1/7k/8/6P1/8/R6K w - - 0 1").unwrap();
+        let quiet_mv = Move::new(Square::H1, Square::G1, MoveKind::Normal);
+
+        // 1. At search_root (with warm TT so Root IIR does not fire): Move 2 (Ra1xa8)
+        //    overturns Move 1 (Kh1-g1) and raises alpha, reducing root_effective_depth from 4 to 3.
+        let tt_root = TranspositionTable::new(1);
+        tt_root.write(pos.hash(), 3, 0, 0, Bound::Exact, quiet_mv, 0, true, true);
+        let mut hist_root = HistoryTables::default();
+        let mut td_root = ThreadData::new(&pos, Some(&tt_root), Some(&mut hist_root));
+        td_root.root_moves = RootMoves::new(&pos);
+        td_root.root_moves.begin_depth_iteration(4);
+        let _ = search_root::<CFG_ALL_SELECTIVE>(&mut td_root, -INFINITY, INFINITY, 4, 0, quiet_mv);
+        assert_eq!(tt_root.read(pos.hash(), 0, 0).unwrap().depth, 3);
+
+        // 2. At interior PV node (with warm TT so PV IIR does not fire): Move 2 (Ra1xa8)
+        //    overturns Move 1 (Kh1-g1) and raises alpha, reducing depth from 4 to 3.
+        let tt_pv = TranspositionTable::new(1);
+        tt_pv.write(pos.hash(), 3, 0, 0, Bound::Exact, quiet_mv, 1, true, true);
+        let mut hist_pv = HistoryTables::default();
+        let mut td_pv = ThreadData::new(&pos, Some(&tt_pv), Some(&mut hist_pv));
+        let _ = search_node::<CFG_ALL_SELECTIVE, true>(&mut td_pv, -INFINITY, INFINITY, 4, false, 1, 0);
+        assert_eq!(tt_pv.read(pos.hash(), 0, 1).unwrap().depth, 3);
     }
 }
