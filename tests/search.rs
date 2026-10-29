@@ -9,7 +9,7 @@ use asura::{
         search_without_qs_bound_averaging, search_without_qs_early_cutoff, search_without_qs_futility_pruning,
         search_without_qs_history_pruning, search_without_qs_late_capture_pruning, search_without_qs_see_pruning,
         search_without_qs_standpat_handling, search_without_razoring, search_without_rfp, search_without_root_iir,
-        search_without_se, search_without_see_pruning,
+        search_without_se, search_without_se_hindsight, search_without_see_pruning,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -977,4 +977,13 @@ fn correction_history_learns_from_quiet_discrepancies_and_preserves_tactics() {
     let mut hist = asura::history::HistoryTables::default();
     let _ = search_with_context(&pos, 2, &tt, &mut hist);
     assert!(hist.eval_correction(&pos, 0) > 0);
+}
+
+#[test]
+fn se_hindsight_depth_boost_preserves_tactics() {
+    let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
+    let mid_on = search_with_zero_draws(&midgame, 8);
+    let mid_off = search_without_se_hindsight(&midgame, 8);
+    assert_eq!(mid_on.best_move, mid_off.best_move);
+    assert_eq!(mid_on.score, mid_off.score);
 }

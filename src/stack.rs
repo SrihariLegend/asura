@@ -12,6 +12,7 @@ pub struct StackEntry {
     pub laterality: i32,
     pub cutoff_count: i32,
     pub move_count: u16,
+    pub cut_node: bool,
 }
 
 impl Default for StackEntry {
@@ -25,6 +26,7 @@ impl Default for StackEntry {
             laterality: 0,
             cutoff_count: 0,
             move_count: 0,
+            cut_node: false,
         }
     }
 }

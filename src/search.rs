@@ -45,6 +45,7 @@ const CFG_QS_STANDPAT: u32 = 1 << 21;
 const CFG_QS_BOUND_AVG: u32 = 1 << 22;
 const CFG_HINDSIGHT: u32 = 1 << 23;
 const CFG_CORRHIST: u32 = 1 << 24;
+const CFG_SE_HINDSIGHT: u32 = 1 << 25;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -68,7 +69,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_QS_STANDPAT
     | CFG_QS_BOUND_AVG
     | CFG_HINDSIGHT
-    | CFG_CORRHIST;
+    | CFG_CORRHIST
+    | CFG_SE_HINDSIGHT;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -242,6 +244,8 @@ define_diagnostic_searches! {
     search_without_hindsight: CFG_ALL_SELECTIVE & !CFG_HINDSIGHT;
     /// The selective search with correction history disabled and recognized draws scored zero.
     search_without_correction_history: CFG_ALL_SELECTIVE & !CFG_CORRHIST;
+    /// The selective search with singular-extension hindsight depth boost disabled and recognized draws scored zero.
+    search_without_se_hindsight: CFG_ALL_SELECTIVE & !CFG_SE_HINDSIGHT;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -622,6 +626,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_lqc = (CFG & CFG_LQC) != 0;
     let use_hindsight = (CFG & CFG_HINDSIGHT) != 0;
     let use_corrhist = (CFG & CFG_CORRHIST) != 0;
+    let use_se_hindsight = (CFG & CFG_SE_HINDSIGHT) != 0;
 
     let ply_idx = ply as usize;
     let prior_move = if ply_idx > 0 { td.stack[ply_idx - 1].mv } else { Move::NULL };
@@ -788,6 +793,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let improving = td.stack.is_improving(ply_idx, in_check, static_eval);
     let parent_stat_score = if ply_idx > 0 { td.stack[ply_idx - 1].stat_score } else { 0 };
     let parent_reduction = if ply_idx > 0 { td.stack[ply_idx - 1].reduction } else { 0 };
+    let parent_cut_node = if ply_idx > 0 { td.stack[ply_idx - 1].cut_node } else { false };
     let parent_laterality = if ply_idx > 0 { td.stack[ply_idx - 1].laterality } else { 0 };
 
     // Hindsight depth adjustment from parent LMR reduction
@@ -1176,6 +1182,13 @@ fn search_node<const CFG: u32, const PV: bool>(
                 } else {
                     1 + i32::from(verify < s_beta - SE_DOUBLE_GAP) + i32::from(verify < s_beta - SE_TRIPLE_GAP)
                 };
+                if use_se_hindsight
+                    && parent_reduction >= SE_HINDSIGHT_MIN_REDUCTION
+                    && !parent_cut_node
+                    && (depth as usize) < MAX_PLY_USIZE - 1
+                {
+                    depth += 1;
+                }
             } else if verify >= beta && !is_decisive(verify) {
                 return (verify, None);
             } else if PV {
@@ -1195,6 +1208,7 @@ fn search_node<const CFG: u32, const PV: bool>(
         td.stack[ply_idx].stat_score = hist;
         td.stack[ply_idx].laterality =
             parent_laterality + if move_count > 1 { (move_count.ilog2() as i32 - 1).max(0) } else { 0 };
+        td.stack[ply_idx].cut_node = false;
 
         td.make_move(mv);
         let gives_check = td.board.in_check();
@@ -1251,9 +1265,12 @@ fn search_node<const CFG: u32, const PV: bool>(
                 reduced_depth = (child_depth as i32 - reduction_plies).clamp(1, child_depth as i32 + 1) as u8;
             }
 
-            td.stack[ply_idx].reduction = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
+            let red = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
+            td.stack[ply_idx].reduction = red;
+            td.stack[ply_idx].cut_node = red != 0 && !PV && cut_node;
             let mut scout = -search_node::<CFG, false>(td, -alpha - 1, -alpha, reduced_depth, true, ply + 1, ply + 1).0;
             td.stack[ply_idx].reduction = 0;
+            td.stack[ply_idx].cut_node = false;
 
             if is_quiet
                 && (quotient > 0 || !lmr_eligible)
@@ -2031,5 +2048,43 @@ mod tests {
         // Stack static_eval receives the corrected evaluation, while TT raw_eval remains uncorrected (0).
         assert_eq!(td.stack[1].static_eval, expected_corr);
         assert_eq!(tt.read(pos.hash(), 0, 1).unwrap().raw_eval, 0);
+    }
+
+    #[test]
+    fn se_hindsight_depth_boost_increments_depth_when_parent_heavily_reduced_non_cut() {
+        // After Black plays 1... Kh5-g5, White at ply 1 has a unique winning capture
+        // 2. Ra1xa8 (+500 cp); if excluded, Black's Ra8 escapes or trades so verify <= 0.
+        let root_pos = Board::from_fen("r7/8/6p1/7k/8/6P1/8/R6K b - - 0 1").unwrap();
+        let h5g5 = Move::new(Square::H5, Square::G5, MoveKind::Normal);
+        let a1a8 = Move::new(Square::A1, Square::A8, MoveKind::Capture);
+
+        // 1. With parent_reduction = 3_000 (>= SE_HINDSIGHT_MIN_REDUCTION) and parent_cut_node = false:
+        //    When a1a8 is verified singular at depth 6 (with alpha = 2_000, beta = 2_001 so the node
+        //    completes with Bound::Upper), SE hindsight boosts depth from 6 to 7.
+        let tt_on = TranspositionTable::new(1);
+        let mut hist_on = HistoryTables::default();
+        let mut td_on = ThreadData::new(&root_pos, Some(&tt_on), Some(&mut hist_on));
+        td_on.stack[0].mv = h5g5;
+        td_on.stack[0].static_eval = 0;
+        td_on.stack[0].reduction = 3_000;
+        td_on.stack[0].cut_node = false;
+        td_on.make_move(h5g5);
+        let child_hash = td_on.board.hash();
+        tt_on.write(child_hash, 5, 0, 400, Bound::Lower, a1a8, 1, false, false);
+        let _ = search_node::<{ CFG_ALL_SELECTIVE & !CFG_HINDSIGHT }, false>(&mut td_on, 2_000, 2_001, 6, false, 1, 0);
+        assert_eq!(tt_on.read(child_hash, 0, 1).unwrap().depth, 7);
+
+        // 2. When parent_cut_node = true, SE hindsight does not boost depth (stays 6).
+        let tt_cut = TranspositionTable::new(1);
+        let mut hist_cut = HistoryTables::default();
+        let mut td_cut = ThreadData::new(&root_pos, Some(&tt_cut), Some(&mut hist_cut));
+        td_cut.stack[0].mv = h5g5;
+        td_cut.stack[0].static_eval = 0;
+        td_cut.stack[0].reduction = 3_000;
+        td_cut.stack[0].cut_node = true;
+        td_cut.make_move(h5g5);
+        tt_cut.write(child_hash, 5, 0, 400, Bound::Lower, a1a8, 1, false, false);
+        let _ = search_node::<{ CFG_ALL_SELECTIVE & !CFG_HINDSIGHT }, false>(&mut td_cut, 2_000, 2_001, 6, false, 1, 0);
+        assert_eq!(tt_cut.read(child_hash, 0, 1).unwrap().depth, 6);
     }
 }
