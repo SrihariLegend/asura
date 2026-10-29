@@ -10,7 +10,7 @@ use asura::{
         search_without_qs_futility_pruning, search_without_qs_history_pruning, search_without_qs_late_capture_pruning,
         search_without_qs_see_pruning, search_without_qs_standpat_handling, search_without_razoring,
         search_without_rfp, search_without_root_iir, search_without_se, search_without_se_hindsight,
-        search_without_see_pruning,
+        search_without_see_pruning, search_without_tt_store_discount,
     },
     transposition::{Bound, TranspositionTable},
     types::{Move, MoveKind, Square},
@@ -522,12 +522,12 @@ fn singular_extensions_extend_unique_tt_moves_and_multi_cut_alternatives() {
 
     // 2. Direct Multi-Cut verification (verify >= beta):
     // After the noisy root move c2xd3 (not reduced by root LMR), at ply 1
-    // (depth = 6 at step 7, !PV) Black has two independent queen-winning knight
-    // captures (d6xe4 and f6xg4). At step 6 (depth = 5 at ply 1), d6xe4 fails
-    // high and stores depth = 4 (5 - 1) in the TT. At step 7 (depth = 6 at
-    // ply 1), the excluded-move verification search (excluding d6xe4) finds
-    // f6xg4 >= beta and returns a Multi-Cut early without overwriting the TT
-    // entry at depth = 5 (6 - 1).
+    // (depth = 6 at step 7, !PV, cut_node = true) Black has two independent
+    // queen-winning knight captures (d6xe4 and f6xg4). At step 6 (depth = 5 at
+    // ply 1, cut_node = true), d6xe4 fails high and stores depth = 5 in the TT.
+    // At step 7 (depth = 6 at ply 1), the excluded-move verification search
+    // (excluding d6xe4) finds f6xg4 >= beta and returns a Multi-Cut early
+    // without overwriting the TT entry at depth = 6.
     let mc_pos = Board::from_fen("r1r5/1rp5/1k1n1n2/8/4Q1Q1/1p1p4/P1P5/K7 w - - 0 1").unwrap();
     let d6e4 = Move::new(Square::D6, Square::E4, MoveKind::Capture);
     let c2d3 = Move::new(Square::C2, Square::D3, MoveKind::Capture);
@@ -539,7 +539,7 @@ fn singular_extensions_extend_unique_tt_moves_and_multi_cut_alternatives() {
     tt_mc.write(child_after_c2d3.hash(), 5, -200, 500, Bound::Lower, d6e4, 1, false, false);
     let _ = search_with_tt(&mc_pos, 7, &tt_mc);
     let after = tt_mc.read(child_after_c2d3.hash(), 0, 1).unwrap();
-    assert_eq!(after.depth, 4, "Multi-Cut at depth 6 must return before overwriting TT at depth 5");
+    assert_eq!(after.depth, 5, "Multi-Cut at depth 6 must return before overwriting TT at depth 6");
 
     // 3. On Midgame at depth 8, extending singular tactical moves and
     // multi-cutting alternatives reduces nodes while preserving the exact
@@ -598,10 +598,10 @@ fn checked_tt_capture_cutoff_prunes_verified_check_evasion_captures() {
     // At step 6 (reduced to depth = 4 at ply 1 by root LMR), 1... Ra8xe8 fails
     // high and stores depth = 3 (4 - 1), Bound::Lower, mv = a8e8 (capture!) in
     // the TT. At step 7 (reduced to depth = 5 at ply 1 by root LMR, !PV,
-    // in_check == true), entry.depth (3) < 5 (so early TT cutoff does not
-    // fire), but 3 >= 5 - 4 and score >= beta + 200 with tt_move.is_capture(),
-    // so checked TT-capture cutoff returns early without overwriting the TT
-    // entry at depth = 4 (5 - 1).
+    // cut_node == true, in_check == true), entry.depth (4) < 5 (so early TT
+    // cutoff does not fire), but 4 >= 5 - 4 and score >= beta + 200 with
+    // tt_move.is_capture(), so checked TT-capture cutoff returns early without
+    // overwriting the TT entry at depth = 5.
     let pos = Board::from_fen("r5k1/5ppp/8/8/8/1n6/P4PPP/4R1K1 w - - 0 1").unwrap();
     let e1e8 = Move::new(Square::E1, Square::E8, MoveKind::Normal);
     let a8e8 = Move::new(Square::A8, Square::E8, MoveKind::Capture);
@@ -615,8 +615,8 @@ fn checked_tt_capture_cutoff_prunes_verified_check_evasion_captures() {
     let after = tt.read(child_after_e1e8.hash(), 0, 1).unwrap();
     assert_eq!(after.mv, a8e8);
     assert_eq!(
-        after.depth, 3,
-        "Checked TT-capture cutoff at depth 5 (step 7 after root LMR) must return before overwriting the depth-3 TT entry"
+        after.depth, 4,
+        "Checked TT-capture cutoff at depth 5 (step 7 after root LMR) must return before overwriting the depth-4 TT entry"
     );
 
     let on = search_with_zero_draws(&pos, 7);
@@ -1010,4 +1010,13 @@ fn clear_cutoff_history_bonus_preserves_tactics() {
     let it_off = search_without_clear_cutoff_bonus(&italian, 7);
     assert_eq!(it_on.best_move, it_off.best_move);
     assert_eq!(it_on.score, it_off.score);
+}
+
+#[test]
+fn tt_store_depth_discount_preserves_tactics() {
+    let midgame = Board::from_fen("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10").unwrap();
+    let mid_on = search_with_zero_draws(&midgame, 7);
+    let mid_off = search_without_tt_store_discount(&midgame, 7);
+    assert_eq!(mid_on.best_move, mid_off.best_move);
+    assert_eq!(mid_on.score, mid_off.score);
 }

@@ -48,6 +48,7 @@ const CFG_CORRHIST: u32 = 1 << 24;
 const CFG_SE_HINDSIGHT: u32 = 1 << 25;
 const CFG_ALPHA_REDUCE: u32 = 1 << 26;
 const CFG_CLEAR_CUTOFF_BONUS: u32 = 1 << 27;
+const CFG_TT_STORE_DISCOUNT: u32 = 1 << 28;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -74,7 +75,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_CORRHIST
     | CFG_SE_HINDSIGHT
     | CFG_ALPHA_REDUCE
-    | CFG_CLEAR_CUTOFF_BONUS;
+    | CFG_CLEAR_CUTOFF_BONUS
+    | CFG_TT_STORE_DISCOUNT;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -254,6 +256,8 @@ define_diagnostic_searches! {
     search_without_alpha_reduce: CFG_ALL_SELECTIVE & !CFG_ALPHA_REDUCE;
     /// The selective search with clear-cutoff history depth bonus disabled and recognized draws scored zero.
     search_without_clear_cutoff_bonus: CFG_ALL_SELECTIVE & !CFG_CLEAR_CUTOFF_BONUS;
+    /// The selective search with cut-node TT store-depth discount disabled and recognized draws scored zero.
+    search_without_tt_store_discount: CFG_ALL_SELECTIVE & !CFG_TT_STORE_DISCOUNT;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -651,6 +655,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_se_hindsight = (CFG & CFG_SE_HINDSIGHT) != 0;
     let use_alpha_reduce = (CFG & CFG_ALPHA_REDUCE) != 0;
     let use_clear_cutoff_bonus = (CFG & CFG_CLEAR_CUTOFF_BONUS) != 0;
+    let use_tt_store_discount = (CFG & CFG_TT_STORE_DISCOUNT) != 0;
 
     let ply_idx = ply as usize;
     let prior_move = if ply_idx > 0 { td.stack[ply_idx - 1].mv } else { Move::NULL };
@@ -1477,7 +1482,9 @@ fn search_node<const CFG: u32, const PV: bool>(
         && let Some(t) = td.tt
     {
         let store_mv = if bound == Bound::Upper { Move::NULL } else { best_move.unwrap_or(Move::NULL) };
-        let store_depth = (depth as i32 - i32::from(bound == Bound::Lower)).max(1);
+        let discount_depth =
+            if PV || !use_tt_store_discount { bound == Bound::Lower } else { (bound == Bound::Lower) != cut_node };
+        let store_depth = (depth as i32 - i32::from(discount_depth)).max(1);
         t.write(hash, store_depth, raw_eval, best_score, bound, store_mv, ply as isize, tt_pv, PV);
     }
 
@@ -2206,5 +2213,30 @@ mod tests {
             search_node::<{ CFG_ALL_SELECTIVE & !CFG_CLEAR_CUTOFF_BONUS }, false>(&mut td_off, 99, 100, 2, false, 1, 0);
         let score_off = hist_off.noisy_history.get(pos.all_threats(), Piece::WhiteRook, Square::A8, PieceType::Rook);
         assert!(score_on > score_off, "expected clear-cutoff noisy bonus {} > {}", score_on, score_off);
+    }
+
+    #[test]
+    fn tt_store_depth_discounts_unexpected_bounds_on_cut_and_all_nodes() {
+        let pos = Board::from_fen("r7/8/6p1/7k/8/6P1/8/R6K w - - 0 1").unwrap();
+
+        // 1. Cut-node (cut_node = true) failing low (Bound::Upper, alpha = 2_000, beta = 2_001):
+        //    Unexpected bound at cut-node is discounted by 1 (depth 4 -> store_depth 3).
+        let tt_cut_fl = TranspositionTable::new(1);
+        let mut hist_cut_fl = HistoryTables::default();
+        let mut td_cut_fl = ThreadData::new(&pos, Some(&tt_cut_fl), Some(&mut hist_cut_fl));
+        let _ = search_node::<{ CFG_ALL_SELECTIVE & !CFG_IIR }, false>(&mut td_cut_fl, 2_000, 2_001, 4, true, 1, 0);
+        let e_cut_fl = tt_cut_fl.read(pos.hash(), 0, 1).unwrap();
+        assert_eq!(e_cut_fl.bound, Bound::Upper);
+        assert_eq!(e_cut_fl.depth, 3);
+
+        // 2. Cut-node (cut_node = true) failing high (Bound::Lower, alpha = 99, beta = 100):
+        //    Expected bound at cut-node keeps full depth (depth 4 -> store_depth 4).
+        let tt_cut_fh = TranspositionTable::new(1);
+        let mut hist_cut_fh = HistoryTables::default();
+        let mut td_cut_fh = ThreadData::new(&pos, Some(&tt_cut_fh), Some(&mut hist_cut_fh));
+        let _ = search_node::<{ CFG_ALL_SELECTIVE & !CFG_IIR }, false>(&mut td_cut_fh, 99, 100, 4, true, 1, 0);
+        let e_cut_fh = tt_cut_fh.read(pos.hash(), 0, 1).unwrap();
+        assert_eq!(e_cut_fh.bound, Bound::Lower);
+        assert_eq!(e_cut_fh.depth, 4);
     }
 }
