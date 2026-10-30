@@ -628,7 +628,7 @@ fn search_root<const CFG: u32>(
 
         let moved_piece = td.board.moved_piece(mv);
         let is_quiet = mv.is_quiet();
-        let creates_threat = is_quiet && creates_threat_on_board(&td.board, mv);
+        let creates_threat = is_quiet && picker.creates_threat(&td.board, mv);
         let hist = td.history.as_deref().map_or(0, |h| {
             if is_quiet {
                 h.quiet_history.get(td.board.all_threats(), creates_threat, td.board.side_to_move(), mv)
@@ -677,7 +677,7 @@ fn search_root<const CFG: u32>(
             td.stack[0].reduction = 0;
 
             let mut retry_depth = child_depth;
-            if quotient > 0 && scout > alpha && reduced_depth < child_depth {
+            if !td.stopped && quotient > 0 && scout > alpha && reduced_depth < child_depth {
                 let margin_deeper = 60 + 10 * (child_depth.saturating_sub(reduced_depth) as i32);
                 if scout > best_score.saturating_add(margin_deeper) {
                     retry_depth = child_depth.saturating_add(1);
@@ -689,7 +689,7 @@ fn search_root<const CFG: u32>(
                 }
             }
 
-            if scout > alpha && beta > alpha + 1 {
+            if !td.stopped && scout > alpha && beta > alpha + 1 {
                 td.stack[0].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
                 let res = -search_node::<CFG, true>(td, -beta, -alpha, retry_depth, false, 1, 0).0;
                 td.stack[0].reduction = 0;
@@ -701,7 +701,7 @@ fn search_root<const CFG: u32>(
 
         td.undo_move(mv);
         if td.stopped {
-            break;
+            return best_score;
         }
 
         let move_nodes = td.nodes - nodes_before;
@@ -1034,6 +1034,9 @@ fn search_node<const CFG: u32, const PV: bool>(
         && !entry.is_some_and(|e| e.bound == Bound::Lower && e.score > alpha)
     {
         let (q_score, q_move) = quiescence::<CFG, false>(td, alpha, beta, 0, ply, previous);
+        if td.stopped {
+            return (0, None);
+        }
         if q_score <= alpha {
             return (q_score, None);
         }
@@ -1114,6 +1117,9 @@ fn search_node<const CFG: u32, const PV: bool>(
             let null_score =
                 -search_node::<CFG, false>(td, -beta, -beta + 1, null_depth, !cut_node, ply + 1, ply + 1).0;
             td.undo_null_move();
+            if td.stopped {
+                return (0, None);
+            }
 
             if null_score >= beta {
                 let pruned_score = if null_score >= MATE_THRESHOLD { beta } else { null_score };
@@ -1125,6 +1131,9 @@ fn search_node<const CFG: u32, const PV: bool>(
                 let verified_score =
                     search_node::<CFG, false>(td, beta - 1, beta, null_depth, false, ply, last_critical_ply).0;
                 td.stack.nmp_min_ply = 0;
+                if td.stopped {
+                    return (0, None);
+                }
 
                 if verified_score >= beta {
                     return (pruned_score, None);
@@ -1173,7 +1182,7 @@ fn search_node<const CFG: u32, const PV: bool>(
                 td.make_move(mv);
 
                 let mut score = -quiescence::<CFG, false>(td, -prob_beta, -prob_beta + 1, 0, ply + 1, Some(mv.to())).0;
-                if score >= prob_beta {
+                if !td.stopped && score >= prob_beta {
                     score = -search_node::<CFG, false>(
                         td,
                         -prob_beta,
@@ -1187,6 +1196,9 @@ fn search_node<const CFG: u32, const PV: bool>(
                 }
 
                 td.undo_move(mv);
+                if td.stopped {
+                    return (0, None);
+                }
 
                 if score >= prob_beta && !is_decisive(score) {
                     if let Some(t) = td.tt {
@@ -1284,7 +1296,7 @@ fn search_node<const CFG: u32, const PV: bool>(
 
         let moved_piece = td.board.moved_piece(mv);
         let is_quiet = mv.is_quiet();
-        let creates_threat = selective && is_quiet && creates_threat_on_board(&td.board, mv);
+        let creates_threat = selective && is_quiet && picker.creates_threat(&td.board, mv);
         let hist = if let Some(h) = td.history.as_deref() {
             if is_quiet {
                 h.quiet_history.get(td.board.all_threats(), creates_threat, td.board.side_to_move(), mv)
@@ -1397,6 +1409,9 @@ fn search_node<const CFG: u32, const PV: bool>(
             td.stack[ply_idx].excluded_move = mv;
             let verify = search_node::<CFG, false>(td, s_beta - 1, s_beta, s_depth, true, ply, last_critical_ply).0;
             td.stack[ply_idx].excluded_move = Move::NULL;
+            if td.stopped {
+                return (0, None);
+            }
             if let Some(h) = td.history.as_deref_mut() {
                 h.clear_child_killers(ply_idx);
             }
@@ -1508,7 +1523,8 @@ fn search_node<const CFG: u32, const PV: bool>(
             td.stack[ply_idx].reduction = 0;
             td.stack[ply_idx].cut_node = false;
 
-            if is_quiet
+            if !td.stopped
+                && is_quiet
                 && (quotient > 0 || !lmr_eligible)
                 && let Some(h) = td.history.as_deref_mut()
             {
@@ -1517,7 +1533,7 @@ fn search_node<const CFG: u32, const PV: bool>(
             }
 
             let mut retry_depth = child_depth;
-            if quotient > 0 && scout > alpha && reduced_depth < child_depth {
+            if !td.stopped && quotient > 0 && scout > alpha && reduced_depth < child_depth {
                 retry_depth = plan_scout_retry(best_score, scout, child_depth, reduced_depth);
                 if retry_depth > reduced_depth {
                     td.stack[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
@@ -1538,7 +1554,7 @@ fn search_node<const CFG: u32, const PV: bool>(
             gate_child_depth = retry_depth;
             lmr_quotient = quotient;
 
-            if PV && scout > alpha && beta > alpha + 1 {
+            if !td.stopped && PV && scout > alpha && beta > alpha + 1 {
                 td.stack[ply_idx].reduction = (child_depth as i32 - retry_depth as i32) * LMR_SCALE;
                 let res =
                     -search_node::<CFG, true>(td, -beta, -alpha, retry_depth, false, ply + 1, last_critical_ply).0;
@@ -1750,8 +1766,9 @@ fn update_histories_on_best_move(
         if best_score >= beta {
             history.update_killer_and_countermove(ply, prior_move, best_move);
         }
+        let ctx = crate::movepick::QuietScoringContext::new(board);
         let best_piece = board.moved_piece(best_move);
-        let best_creates_threat = creates_threat_on_board(board, best_move);
+        let best_creates_threat = ctx.creates_threat(best_piece.piece_type(), best_move);
         history.quiet_history.update(threats, best_creates_threat, stm, best_move, quiet_bonus);
         history.pawn_history.update(pawn_key, best_piece, best_move.to(), quiet_bonus);
         history.update_continuation_histories(ply, best_piece, best_move.to(), cont_bonus);
@@ -1760,7 +1777,7 @@ fn update_histories_on_best_move(
             let denom = 1_000 + 45 * i as i32;
             let scale = 1_000_i32 * 1_000 / (denom * denom / 1_000);
             let piece = board.moved_piece(mv);
-            let creates_threat = creates_threat_on_board(board, mv);
+            let creates_threat = ctx.creates_threat(piece.piece_type(), mv);
             history.quiet_history.update(threats, creates_threat, stm, mv, -quiet_malus * scale / 1_000);
             history.pawn_history.update(pawn_key, piece, mv.to(), -quiet_malus * scale / 1_000);
             history.update_continuation_histories(ply, piece, mv.to(), -cont_malus * scale / 1_000);

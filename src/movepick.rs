@@ -40,6 +40,7 @@ pub struct MainMovePicker {
     emitted_stage: MainStage,
     noisy_count: usize,
     is_root: bool,
+    quiet_ctx: Option<QuietScoringContext>,
 }
 
 impl MainMovePicker {
@@ -60,6 +61,7 @@ impl MainMovePicker {
             emitted_stage: MainStage::HashMove,
             noisy_count: 0,
             is_root,
+            quiet_ctx: None,
         }
     }
 
@@ -83,7 +85,14 @@ impl MainMovePicker {
             emitted_stage: MainStage::HashMove,
             noisy_count: 0,
             is_root: false,
+            quiet_ctx: None,
         }
+    }
+
+    #[inline]
+    pub(crate) fn creates_threat(&mut self, board: &Board, mv: Move) -> bool {
+        let ctx = self.quiet_ctx.get_or_insert_with(|| QuietScoringContext::new(board));
+        ctx.creates_threat(board.type_on(mv.from()), mv)
     }
 
     pub const fn stage(&self) -> MainStage {
@@ -268,7 +277,7 @@ impl MainMovePicker {
 
     fn score_priority_quiets(&mut self, board: &Board, history: Option<&HistoryTables>, ply: usize) {
         let Some(h) = history else { return };
-        let ctx = QuietScoringContext::new(board);
+        let ctx = *self.quiet_ctx.get_or_insert_with(|| QuietScoringContext::new(board));
         for i in 0..3 {
             let mv = self.priority_quiets[i];
             if mv.is_null()
@@ -308,7 +317,7 @@ impl MainMovePicker {
             }
             return;
         };
-        let ctx = QuietScoringContext::new(board);
+        let ctx = *self.quiet_ctx.get_or_insert_with(|| QuietScoringContext::new(board));
         for (index, &mv) in self.moves.iter().enumerate() {
             if self.scores[index] == i32::MIN {
                 continue;
@@ -332,6 +341,7 @@ impl MainMovePicker {
     }
 }
 
+#[derive(Copy, Clone)]
 pub(crate) struct QuietScoringContext {
     threats: Bitboard,
     threatened: [Bitboard; 6],

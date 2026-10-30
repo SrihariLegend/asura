@@ -288,21 +288,21 @@ mod tests {
 
     #[test]
     fn expected_horizon_tapers_from_opening_to_endgame_floor() {
-        assert_eq!(TimeManager::expected_horizon(1), 40);
-        assert_eq!(TimeManager::expected_horizon(18), 34);
-        assert_eq!(TimeManager::expected_horizon(54), 22);
-        assert_eq!(TimeManager::expected_horizon(100), 22);
+        assert_eq!(TimeManager::expected_horizon(1), 33);
+        assert_eq!(TimeManager::expected_horizon(18), 27);
+        assert_eq!(TimeManager::expected_horizon(54), 20);
+        assert_eq!(TimeManager::expected_horizon(100), 20);
     }
 
     #[test]
     fn clock_bounds_respect_overhead_soft_cap_and_hard_cap() {
         let tm = TimeManager::new(Limits::Fischer { main_ms: 60_000, inc_ms: 1_000 }, 1, 15);
-        assert_eq!(tm.soft_bound_ms(), 2_166);
-        assert_eq!(tm.hard_bound_ms(), 11_186);
+        assert_eq!(tm.soft_bound_ms(), 2_617);
+        assert_eq!(tm.hard_bound_ms(), 13_515);
 
         let cyclic = TimeManager::new(Limits::Cyclic { main_ms: 10_000, inc_ms: 5_000, moves_to_go: 1 }, 20, 0);
-        assert_eq!(cyclic.soft_bound_ms(), 1_450);
-        assert_eq!(cyclic.hard_bound_ms(), 7_486);
+        assert_eq!(cyclic.soft_bound_ms(), 1_650);
+        assert_eq!(cyclic.hard_bound_ms(), 7_500);
     }
 
     #[test]
