@@ -10,7 +10,6 @@ use std::{
 use crate::{
     board::Board,
     evaluation::evaluate,
-    history::HistoryTables,
     parameters::DEFAULT_MOVE_OVERHEAD_MS,
     search::{MATE_SCORE, MATE_THRESHOLD, search_with_context},
     thread::{SharedContext, Status},
@@ -20,14 +19,6 @@ use crate::{
     transposition::{DEFAULT_TT_SIZE, TranspositionTable},
     types::{Color, MAX_MOVES, Move},
 };
-
-const BENCH_FENS: [&str; 5] = [
-    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-    "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
-    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-    "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
-    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
-];
 
 struct ScopedInputPtr(*mut (dyn BufRead + 'static));
 // Safety: Only accessed by the single scoped reader thread inside message_loop before the scope exits.
@@ -188,9 +179,13 @@ pub fn message_loop(commands: VecDeque<String>, mut input: impl BufRead, mut out
                     writeln!(output, "info string Static evaluation: {cp} cp (side to move)")?;
                 }
                 ["bench", args @ ..] => match args {
-                    [] => run_bench(5, &mut output)?,
+                    [] => {
+                        tools::bench(5, &mut output)?;
+                    }
                     [depth] => match depth.parse::<u8>().ok().filter(|&d| d > 0) {
-                        Some(d) => run_bench(d, &mut output)?,
+                        Some(d) => {
+                            tools::bench(d, &mut output)?;
+                        }
                         None => writeln!(output, "info string bench depth must be an integer from 1 to 255")?,
                     },
                     _ => writeln!(output, "info string Usage: bench [depth]")?,
@@ -516,25 +511,6 @@ fn go_managed(
 
     let best_move = worker.best_move.map(|mv| mv.to_uci(board)).unwrap_or_else(|| "0000".to_string());
     writeln!(output, "bestmove {best_move}")
-}
-
-fn run_bench(depth: u8, output: &mut impl Write) -> io::Result<()> {
-    let start = std::time::Instant::now();
-    let mut tt = TranspositionTable::default();
-    let mut history = HistoryTables::default();
-    let mut total_nodes = 0u64;
-
-    for fen in BENCH_FENS {
-        let board = Board::from_fen(fen).unwrap();
-        tt.clear(1);
-        history.clear();
-        let res = search_with_context(&board, depth, &tt, &mut history);
-        total_nodes += res.nodes;
-    }
-
-    let elapsed_secs = start.elapsed().as_secs_f64().max(1e-6);
-    let nps = (total_nodes as f64 / elapsed_secs) as u64;
-    writeln!(output, "{total_nodes} nodes {nps} nps")
 }
 
 /// Construct a new position before replacing the live board, so a malformed FEN

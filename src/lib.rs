@@ -1,3 +1,8 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::large_types_passed_by_value)]
+#![warn(clippy::trivially_copy_pass_by_ref)]
+#![warn(clippy::redundant_clone)]
+
 use std::{collections::VecDeque, io};
 
 pub mod board;

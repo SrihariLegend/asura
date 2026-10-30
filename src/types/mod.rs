@@ -1,3 +1,4 @@
+pub mod arrayvec;
 pub mod bitboard;
 pub mod castling;
 pub mod color;
@@ -9,6 +10,7 @@ pub mod score;
 pub mod square;
 pub mod zobrist;
 
+pub use arrayvec::*;
 pub use bitboard::*;
 pub use castling::*;
 pub use color::*;
