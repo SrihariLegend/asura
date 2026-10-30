@@ -104,8 +104,9 @@ define! {
     // Quiescence quiet-history pruning threshold on the 10_000 = MAX_HISTORY scale.
     i32, QS_QUIET_HIST_THRESHOLD: -350;
 
-    // Quiescence capture-futility margin on the 100 = 1 pawn scale.
+    // Quiescence capture-futility margins on the 100 = 1 pawn scale.
     i32, QS_FUTILITY_MARGIN: 200;
+    i32, QS_SEE_FUTILITY_MARGIN: 300;
 
     // Quiescence late-capture limit (maximum legal move index for unrelated
     // non-promotion, non-checking captures when not in check).
@@ -123,7 +124,7 @@ define! {
 
     // Hindsight depth adjustment constants (1_000 = 1 ply, 100 = 1 pawn).
     i32, HINDSIGHT_EXT_MIN_REDUCTION: 2_000;
-    i32, HINDSIGHT_REDUCTION_MARGIN: 60;
+    i32, HINDSIGHT_REDUCTION_MARGIN: 100;
 
     // Correction history constants on the 100 = 1 pawn scale.
     i32, CORRHIST_MAX: 1_024;
@@ -132,7 +133,7 @@ define! {
     i32, CORRHIST_MAX_BONUS: 256;
 
     // Post-alpha-raise effective depth reduction minimum depth (keeps child_depth >= 1).
-    u8,  ALPHA_REDUCE_MIN_DEPTH: 3;
+    u8,  ALPHA_REDUCE_MIN_DEPTH: 8;
 
     // Clear-cutoff history depth bonus margin on the 100 = 1 pawn scale.
     i32, CLEAR_CUTOFF_MARGIN: 50;

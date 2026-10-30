@@ -1357,7 +1357,8 @@ fn search_node<const CFG: u32, const PV: bool>(
             && best_score > -MATE_THRESHOLD
             && !td.board.is_direct_check(mv)
         {
-            let threshold = HP_DEPTH_SCALE * depth as i32 + HP_IMPROVING_OFFSET * i32::from(improving);
+            let d = depth as i32;
+            let threshold = HP_DEPTH_SCALE * d * (d - 1).max(1) + HP_IMPROVING_OFFSET * i32::from(improving);
             if hist < threshold {
                 continue;
             }
@@ -1935,8 +1936,9 @@ fn quiescence<const CFG: u32, const PV: bool>(
                     }
                     if use_qs_fp {
                         let margin = stand_pat + QS_FUTILITY_MARGIN;
+                        let see_margin = stand_pat + QS_SEE_FUTILITY_MARGIN;
                         let capture_margin = margin + victim_val;
-                        if alpha >= capture_margin || (alpha >= margin && !td.board.see_ge(mv, 1)) {
+                        if alpha >= capture_margin || (alpha >= see_margin && !td.board.see_ge(mv, 1)) {
                             continue;
                         }
                     }
@@ -2015,7 +2017,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
         if best_score > beta && !is_decisive(best_score) && !is_decisive(beta) {
             let cutoff = (beta + best_score) / 2;
             best_score = (best_score + cutoff) / 2;
-        } else if best_score < alpha && !is_decisive(best_score) && !is_decisive(alpha) {
+        } else if in_check && best_score < alpha && !is_decisive(best_score) && !is_decisive(alpha) {
             best_score = (alpha + best_score) / 2;
         }
     }
@@ -2267,10 +2269,11 @@ mod tests {
             quiescence::<{ CFG_ALL_SELECTIVE & !CFG_QS_BOUND_AVG }, false>(&mut td_fh_off, 99, 100, 0, 1, None);
         assert_eq!(score_fh_off, 500);
 
-        // 2. Post-loop fail-low (best_score < alpha):
-        //    White starts at raw_eval = 0 with no captures and alpha = 200, beta = 201.
-        //    stand_pat = 0 < alpha; damped = (200 + 0) / 2 = 100 (Bound::Upper).
-        let fl_pos = Board::from_fen("7k/7p/8/8/8/8/7P/7K w - - 0 1").unwrap();
+        // 2. Post-loop in-check fail-low (in_check && best_score < alpha):
+        //    White is in check from Black's Rook on h2 (raw_eval = -500) and evades
+        //    check (best_score = 0 after 1. Kh1xh2) below alpha = 200, beta = 201;
+        //    damped = (200 + 0) / 2 = 100 (Bound::Upper).
+        let fl_pos = Board::from_fen("7k/8/8/8/8/8/7r/7K w - - 0 1").unwrap();
         let tt_fl = TranspositionTable::new(1);
         let mut hist_fl = HistoryTables::default();
         let mut td_fl = ThreadData::new(&fl_pos, Some(&tt_fl), Some(&mut hist_fl));
@@ -2304,13 +2307,13 @@ mod tests {
 
         // 2. Hindsight reduction (depth -= 1):
         //    parent_reduction = 1_000 (> 0), !tt_pv, depth = 5 >= 2, and
-        //    static_eval (0) + parent_eval (100) = 100 > HINDSIGHT_REDUCTION_MARGIN (60).
+        //    static_eval (0) + parent_eval (150) = 150 > HINDSIGHT_REDUCTION_MARGIN (100).
         //    depth = 5 is reduced to 4 (> RAZOR_MAX_DEPTH), storing depth 4 on fail-low.
         let tt_red = TranspositionTable::new(1);
         let mut hist_red = HistoryTables::default();
         let mut td_red = ThreadData::new(&pos, Some(&tt_red), Some(&mut hist_red));
         td_red.stack[0].mv = quiet_mv;
-        td_red.stack[0].static_eval = 100;
+        td_red.stack[0].static_eval = 150;
         td_red.stack[0].reduction = 1_000;
         td_red.make_move(quiet_mv);
         let _ = search_node::<CFG_ALL_SELECTIVE, false>(&mut td_red, 500, 501, 5, false, 1, 0);
@@ -2384,24 +2387,24 @@ mod tests {
         let quiet_mv = Move::new(Square::H1, Square::G1, MoveKind::Normal);
 
         // 1. At search_root (with warm TT so Root IIR does not fire): Move 2 (Ra1xa8)
-        //    overturns Move 1 (Kh1-g1) and raises alpha, reducing root_effective_depth from 4 to 3.
+        //    overturns Move 1 (Kh1-g1) and raises alpha, reducing root_effective_depth from 8 to 7.
         let tt_root = TranspositionTable::new(1);
-        tt_root.write(pos.hash(), 3, 0, 0, Bound::Exact, quiet_mv, 0, true, true);
+        tt_root.write(pos.hash(), 7, 0, 0, Bound::Exact, quiet_mv, 0, true, true);
         let mut hist_root = HistoryTables::default();
         let mut td_root = ThreadData::new(&pos, Some(&tt_root), Some(&mut hist_root));
         td_root.root_moves = RootMoves::new(&pos);
-        td_root.root_moves.begin_depth_iteration(4);
-        let _ = search_root::<CFG_ALL_SELECTIVE>(&mut td_root, -INFINITY, INFINITY, 4, 0, quiet_mv);
-        assert_eq!(tt_root.read(pos.hash(), 0, 0).unwrap().depth, 3);
+        td_root.root_moves.begin_depth_iteration(8);
+        let _ = search_root::<CFG_ALL_SELECTIVE>(&mut td_root, -INFINITY, INFINITY, 8, 0, quiet_mv);
+        assert_eq!(tt_root.read(pos.hash(), 0, 0).unwrap().depth, 7);
 
         // 2. At interior PV node (with warm TT so PV IIR does not fire): Move 2 (Ra1xa8)
-        //    overturns Move 1 (Kh1-g1) and raises alpha, reducing depth from 4 to 3.
+        //    overturns Move 1 (Kh1-g1) and raises alpha, reducing depth from 8 to 7.
         let tt_pv = TranspositionTable::new(1);
-        tt_pv.write(pos.hash(), 3, 0, 0, Bound::Exact, quiet_mv, 1, true, true);
+        tt_pv.write(pos.hash(), 7, 0, 0, Bound::Exact, quiet_mv, 1, true, true);
         let mut hist_pv = HistoryTables::default();
         let mut td_pv = ThreadData::new(&pos, Some(&tt_pv), Some(&mut hist_pv));
-        let _ = search_node::<CFG_ALL_SELECTIVE, true>(&mut td_pv, -INFINITY, INFINITY, 4, false, 1, 0);
-        assert_eq!(tt_pv.read(pos.hash(), 0, 1).unwrap().depth, 3);
+        let _ = search_node::<CFG_ALL_SELECTIVE, true>(&mut td_pv, -INFINITY, INFINITY, 8, false, 1, 0);
+        assert_eq!(tt_pv.read(pos.hash(), 0, 1).unwrap().depth, 7);
     }
 
     #[test]
