@@ -1,6 +1,10 @@
 use std::{
     collections::VecDeque,
     io::{self, BufRead, Write},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::{
@@ -8,11 +12,13 @@ use crate::{
     evaluation::evaluate,
     history::HistoryTables,
     parameters::DEFAULT_MOVE_OVERHEAD_MS,
-    search::{MATE_SCORE, MATE_THRESHOLD, search_with_context, search_with_time_manager},
+    search::{MATE_SCORE, MATE_THRESHOLD, search_with_context},
+    thread::{SharedContext, Status},
+    threadpool::ThreadPool,
     time::{Limits, TimeManager},
     tools,
     transposition::{DEFAULT_TT_SIZE, TranspositionTable},
-    types::{Color, Move},
+    types::{Color, MAX_MOVES, Move},
 };
 
 const BENCH_FENS: [&str; 5] = [
@@ -23,109 +29,208 @@ const BENCH_FENS: [&str; 5] = [
     "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
 ];
 
-pub fn message_loop(mut commands: VecDeque<String>, mut input: impl BufRead, mut output: impl Write) -> io::Result<()> {
+struct ScopedInputPtr(*mut (dyn BufRead + 'static));
+// Safety: Only accessed by the single scoped reader thread inside message_loop before the scope exits.
+unsafe impl Send for ScopedInputPtr {}
+
+pub fn message_loop(commands: VecDeque<String>, mut input: impl BufRead, mut output: impl Write) -> io::Result<()> {
     let mut board = Board::starting_position();
     let mut tt = TranspositionTable::default();
-    let mut history = HistoryTables::default();
+    let shared = Arc::new(SharedContext::default());
+    let mut threads = ThreadPool::new();
     let mut frc = false;
     let mut move_overhead_ms = DEFAULT_MOVE_OVERHEAD_MS;
-    let mut use_stdin = commands.is_empty();
+    let mut multi_pv: usize = 1;
+    let use_stdin = Arc::new(AtomicBool::new(commands.is_empty()));
 
-    loop {
-        let message = if let Some(command) = commands.pop_front() {
-            command
-        } else if use_stdin {
-            let mut message = String::new();
-            if input.read_line(&mut message)? == 0 {
+    let dyn_input: &mut (dyn BufRead + '_) = &mut input;
+    let raw_input: *mut (dyn BufRead + 'static) =
+        unsafe { std::mem::transmute::<*mut (dyn BufRead + '_), *mut (dyn BufRead + 'static)>(dyn_input) };
+    let input_ptr = ScopedInputPtr(raw_input);
+    let shared_reader = Arc::clone(&shared);
+    let use_stdin_reader = Arc::clone(&use_stdin);
+
+    std::thread::scope(|scope| -> io::Result<()> {
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<io::Result<Option<String>>>(0);
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(0);
+
+        scope.spawn(move || {
+            let ptr = input_ptr;
+            let reader: &mut dyn BufRead = unsafe { &mut *ptr.0 };
+            let mut queued = commands;
+
+            loop {
+                let message = if let Some(cmd) = queued.pop_front() {
+                    cmd
+                } else if use_stdin_reader.load(Ordering::Acquire) {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => {
+                            if shared_reader.infinite_search.load(Ordering::Acquire) {
+                                shared_reader.status.set(Status::STOPPED);
+                            }
+                            let _ = cmd_tx.send(Ok(None));
+                            break;
+                        }
+                        Ok(_) => line,
+                        Err(e) => {
+                            shared_reader.status.set(Status::STOPPED);
+                            let _ = cmd_tx.send(Err(e));
+                            break;
+                        }
+                    }
+                } else {
+                    let _ = cmd_tx.send(Ok(None));
+                    break;
+                };
+
+                let trimmed = message.trim();
+                if shared_reader.status.get() == Status::RUNNING && trimmed == "stop" {
+                    shared_reader.status.set(Status::STOPPED);
+                    continue;
+                }
+                if shared_reader.infinite_search.load(Ordering::Acquire) && trimmed == "quit" {
+                    shared_reader.status.set(Status::STOPPED);
+                }
+
+                let is_quit = trimmed == "quit";
+                if cmd_tx.send(Ok(Some(message))).is_err() || is_quit {
+                    break;
+                }
+                if ack_rx.recv().is_err() {
+                    break;
+                }
+            }
+        });
+
+        while let Ok(next_msg) = cmd_rx.recv() {
+            let Some(message) = next_msg? else {
+                break;
+            };
+
+            let mut acked = false;
+            let tokens: Vec<_> = message.split_whitespace().collect();
+            match tokens.as_slice() {
+                ["uci"] => {
+                    writeln!(output, "id name Asura {}", env!("CARGO_PKG_VERSION"))?;
+                    writeln!(output, "id author Asura contributors")?;
+                    writeln!(output, "option name Hash type spin default {DEFAULT_TT_SIZE} min 1 max 262144")?;
+                    writeln!(
+                        output,
+                        "option name Threads type spin default 1 min 1 max {}",
+                        ThreadPool::available_threads()
+                    )?;
+                    writeln!(
+                        output,
+                        "option name Move Overhead type spin default {DEFAULT_MOVE_OVERHEAD_MS} min 0 max 5000"
+                    )?;
+                    writeln!(output, "option name MultiPV type spin default 1 min 1 max {MAX_MOVES}")?;
+                    writeln!(output, "option name Clear Hash type button")?;
+                    writeln!(output, "option name UCI_Chess960 type check default false")?;
+                    writeln!(output, "uciok")?;
+                    use_stdin.store(true, Ordering::Release);
+                }
+                ["isready"] => writeln!(output, "readyok")?,
+                ["ucinewgame"] => {
+                    board = Board::starting_position();
+                    board.set_frc(frc);
+                    threads.clear();
+                    tt.clear(threads.len());
+                }
+                ["position", tokens @ ..] => match position(tokens, frc) {
+                    Ok(position) => board = position,
+                    Err(error) => writeln!(output, "info string {error}")?,
+                },
+                ["setoption", "name", "Hash", "value", value] => {
+                    match value.parse::<usize>().ok().filter(|&mb| (1..=262_144).contains(&mb)) {
+                        Some(mb) => tt.resize(threads.len(), mb),
+                        None => writeln!(output, "info string Hash must be an integer from 1 to 262144")?,
+                    }
+                }
+                ["setoption", "name", "Threads", "value", value] => {
+                    let max_threads = ThreadPool::available_threads();
+                    match value.parse::<usize>().ok().filter(|&n| (1..=max_threads).contains(&n)) {
+                        Some(n) => threads.set_count(n),
+                        None => writeln!(output, "info string Threads must be an integer from 1 to {max_threads}")?,
+                    }
+                }
+                ["setoption", "name", "Move", "Overhead", "value", value]
+                | ["setoption", "name", "MoveOverhead", "value", value] => {
+                    match value.parse::<u64>().ok().filter(|&ms| ms <= 5_000) {
+                        Some(ms) => move_overhead_ms = ms,
+                        None => writeln!(output, "info string Move Overhead must be an integer from 0 to 5000")?,
+                    }
+                }
+                ["setoption", "name", "MultiPV", "value", value] => {
+                    match value.parse::<usize>().ok().filter(|&n| (1..=MAX_MOVES).contains(&n)) {
+                        Some(n) => multi_pv = n,
+                        None => writeln!(output, "info string MultiPV must be an integer from 1 to {MAX_MOVES}")?,
+                    }
+                }
+                ["setoption", "name", "Clear", "Hash"] => tt.clear(threads.len()),
+                ["setoption", "name", "UCI_Chess960", "value", value] => match value.parse::<bool>() {
+                    Ok(value) => {
+                        frc = value;
+                        board.set_frc(frc);
+                    }
+                    Err(_) => writeln!(output, "info string UCI_Chess960 requires true or false")?,
+                },
+                ["perft", depth] => match depth.parse::<usize>() {
+                    Ok(depth) => {
+                        tools::divide(&mut board, depth, &mut output)?;
+                    }
+                    Err(_) => writeln!(output, "info string perft depth must be a non-negative integer")?,
+                },
+                ["perft", ..] => writeln!(output, "info string Usage: perft <depth>")?,
+                ["d"] => writeln!(output, "{board}")?,
+                ["eval"] => {
+                    let cp = evaluate(&board);
+                    writeln!(output, "info string Static evaluation: {cp} cp (side to move)")?;
+                }
+                ["bench", args @ ..] => match args {
+                    [] => run_bench(5, &mut output)?,
+                    [depth] => match depth.parse::<u8>().ok().filter(|&d| d > 0) {
+                        Some(d) => run_bench(d, &mut output)?,
+                        None => writeln!(output, "info string bench depth must be an integer from 1 to 255")?,
+                    },
+                    _ => writeln!(output, "info string Usage: bench [depth]")?,
+                },
+                ["go", tokens @ ..] => match parse_go(&board, tokens, move_overhead_ms) {
+                    Ok(ParsedGo::FixedDepth(depth)) if threads.len() == 1 && multi_pv == 1 => {
+                        shared.infinite_search.store(false, Ordering::Release);
+                        shared.status.set(Status::RUNNING);
+                        let _ = ack_tx.send(());
+                        acked = true;
+                        go_fixed_depth(&board, &tt, &shared, &mut threads, depth, &mut output)?;
+                    }
+                    Ok(ParsedGo::FixedDepth(depth)) => {
+                        let tm = TimeManager::new(Limits::Depth(depth), board.fullmove_number(), move_overhead_ms);
+                        shared.infinite_search.store(false, Ordering::Release);
+                        shared.status.set(Status::RUNNING);
+                        let _ = ack_tx.send(());
+                        acked = true;
+                        go_managed(&board, &tt, &shared, &mut threads, tm, multi_pv, depth, &mut output)?;
+                    }
+                    Ok(ParsedGo::Managed(tm, report_depth)) => {
+                        shared.infinite_search.store(matches!(tm.limits(), Limits::Infinite), Ordering::Release);
+                        shared.status.set(Status::RUNNING);
+                        let _ = ack_tx.send(());
+                        acked = true;
+                        go_managed(&board, &tt, &shared, &mut threads, tm, multi_pv, report_depth, &mut output)?;
+                    }
+                    Err(error) => writeln!(output, "info string {error}")?,
+                },
+                ["quit"] => break,
+                ["stop"] | [] => (),
+                _ => (),
+            }
+            output.flush()?;
+            if !acked && ack_tx.send(()).is_err() {
                 break;
             }
-            message
-        } else {
-            break;
-        };
-
-        let tokens: Vec<_> = message.split_whitespace().collect();
-        match tokens.as_slice() {
-            ["uci"] => {
-                writeln!(output, "id name Asura {}", env!("CARGO_PKG_VERSION"))?;
-                writeln!(output, "id author Asura contributors")?;
-                writeln!(output, "option name Hash type spin default {DEFAULT_TT_SIZE} min 1 max 262144")?;
-                writeln!(
-                    output,
-                    "option name Move Overhead type spin default {DEFAULT_MOVE_OVERHEAD_MS} min 0 max 5000"
-                )?;
-                writeln!(output, "option name Clear Hash type button")?;
-                writeln!(output, "option name UCI_Chess960 type check default false")?;
-                writeln!(output, "uciok")?;
-                use_stdin = true;
-            }
-            ["isready"] => writeln!(output, "readyok")?,
-            ["ucinewgame"] => {
-                board = Board::starting_position();
-                board.set_frc(frc);
-                tt.clear(1);
-                history.clear();
-            }
-            ["position", tokens @ ..] => match position(tokens, frc) {
-                Ok(position) => board = position,
-                Err(error) => writeln!(output, "info string {error}")?,
-            },
-            ["setoption", "name", "Hash", "value", value] => {
-                match value.parse::<usize>().ok().filter(|&mb| (1..=262_144).contains(&mb)) {
-                    Some(mb) => tt.resize(1, mb),
-                    None => writeln!(output, "info string Hash must be an integer from 1 to 262144")?,
-                }
-            }
-            ["setoption", "name", "Move", "Overhead", "value", value]
-            | ["setoption", "name", "MoveOverhead", "value", value] => {
-                match value.parse::<u64>().ok().filter(|&ms| ms <= 5_000) {
-                    Some(ms) => move_overhead_ms = ms,
-                    None => writeln!(output, "info string Move Overhead must be an integer from 0 to 5000")?,
-                }
-            }
-            ["setoption", "name", "Clear", "Hash"] => tt.clear(1),
-            ["setoption", "name", "UCI_Chess960", "value", value] => match value.parse::<bool>() {
-                Ok(value) => {
-                    frc = value;
-                    board.set_frc(frc);
-                }
-                Err(_) => writeln!(output, "info string UCI_Chess960 requires true or false")?,
-            },
-            ["perft", depth] => match depth.parse::<usize>() {
-                Ok(depth) => {
-                    tools::divide(&mut board, depth, &mut output)?;
-                }
-                Err(_) => writeln!(output, "info string perft depth must be a non-negative integer")?,
-            },
-            ["perft", ..] => writeln!(output, "info string Usage: perft <depth>")?,
-            ["d"] => writeln!(output, "{board}")?,
-            ["eval"] => {
-                let cp = evaluate(&board);
-                writeln!(output, "info string Static evaluation: {cp} cp (side to move)")?;
-            }
-            ["bench", args @ ..] => match args {
-                [] => run_bench(5, &mut output)?,
-                [depth] => match depth.parse::<u8>().ok().filter(|&d| d > 0) {
-                    Some(d) => run_bench(d, &mut output)?,
-                    None => writeln!(output, "info string bench depth must be an integer from 1 to 255")?,
-                },
-                _ => writeln!(output, "info string Usage: bench [depth]")?,
-            },
-            ["go", tokens @ ..] => match parse_go(&board, tokens, move_overhead_ms) {
-                Ok(ParsedGo::FixedDepth(depth)) => go_fixed_depth(&board, &tt, &mut history, depth, &mut output)?,
-                Ok(ParsedGo::Managed(tm, report_depth)) => {
-                    go_managed(&board, &tt, &mut history, tm, report_depth, &mut output)?
-                }
-                Err(error) => writeln!(output, "info string {error}")?,
-            },
-            ["quit"] => break,
-            // Commands run synchronously; there is no background search to stop.
-            ["stop"] | [] => (),
-            _ => (),
         }
-        output.flush()?;
-    }
-    output.flush()
+        output.flush()
+    })
 }
 
 enum ParsedGo {
@@ -153,7 +258,7 @@ fn is_go_keyword(token: &str) -> bool {
 
 fn parse_go(board: &Board, tokens: &[&str], move_overhead_ms: u64) -> Result<ParsedGo, String> {
     if tokens.is_empty() {
-        return Err("Usage: go depth|nodes|movetime|mate|wtime|btime <value> [searchmoves <moves...>]".to_string());
+        return Err("Usage: go depth|nodes|movetime|mate|wtime|btime|infinite [searchmoves <moves...>]".to_string());
     }
 
     // Fast path for plain `go depth <N>`.
@@ -176,11 +281,19 @@ fn parse_go(board: &Board, tokens: &[&str], move_overhead_ms: u64) -> Result<Par
     let mut binc: Option<u64> = None;
     let mut movestogo: Option<u64> = None;
     let mut search_moves: Option<Vec<Move>> = None;
+    let mut infinite = false;
 
     let legal_moves = board.generate_all_moves();
     let mut i = 0;
     while i < tokens.len() {
         match tokens[i] {
+            "infinite" | "ponder" => {
+                if infinite {
+                    return Err("Duplicate 'infinite' limit".to_string());
+                }
+                infinite = true;
+                i += 1;
+            }
             "depth" => {
                 if depth.is_some() {
                     return Err("Duplicate 'depth' limit".to_string());
@@ -317,9 +430,9 @@ fn parse_go(board: &Board, tokens: &[&str], move_overhead_ms: u64) -> Result<Par
     let inc = if stm == Color::White { winc } else { binc }.unwrap_or(0);
 
     let has_clock = wtime.is_some() || btime.is_some();
-    let has_finite_limit = depth.is_some() || nodes.is_some() || movetime.is_some() || mate.is_some() || has_clock;
-    if !has_finite_limit {
-        return Err("go requires at least one finite depth, nodes, movetime, mate, or clock limit".to_string());
+    let has_limit = depth.is_some() || nodes.is_some() || movetime.is_some() || mate.is_some() || has_clock || infinite;
+    if !has_limit {
+        return Err("go requires at least one depth, nodes, movetime, mate, clock, or infinite limit".to_string());
     }
 
     let primary_limits = if let Some(ms) = movetime {
@@ -338,7 +451,7 @@ fn parse_go(board: &Board, tokens: &[&str], move_overhead_ms: u64) -> Result<Par
     } else if let Some(d) = depth {
         Limits::Depth(d)
     } else {
-        unreachable!()
+        Limits::Infinite
     };
 
     let tm = TimeManager::new(primary_limits, board.fullmove_number(), move_overhead_ms).with_overrides(
@@ -363,10 +476,12 @@ fn format_uci_score(score: i32) -> String {
 }
 
 fn go_fixed_depth(
-    board: &Board, tt: &TranspositionTable, history: &mut HistoryTables, depth: u8, output: &mut impl Write,
+    board: &Board, tt: &TranspositionTable, shared: &Arc<SharedContext>, threads: &mut ThreadPool, depth: u8,
+    output: &mut impl Write,
 ) -> io::Result<()> {
     tt.increment_age();
-    let result = search_with_context(board, depth, tt, history);
+    let result = search_with_context(board, depth, tt, &mut threads.main_thread().history);
+    shared.status.set(Status::STOPPED);
     let score = format_uci_score(result.score);
     writeln!(output, "info depth {depth} score {score} nodes {}", result.nodes)?;
 
@@ -374,17 +489,32 @@ fn go_fixed_depth(
     writeln!(output, "bestmove {best_move}")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn go_managed(
-    board: &Board, tt: &TranspositionTable, history: &mut HistoryTables, tm: TimeManager, report_depth: u8,
-    output: &mut impl Write,
+    board: &Board, tt: &TranspositionTable, shared: &Arc<SharedContext>, threads: &mut ThreadPool, tm: TimeManager,
+    multi_pv: usize, report_depth: u8, output: &mut impl Write,
 ) -> io::Result<()> {
-    tt.increment_age();
-    let result = search_with_time_manager(board, tm, tt, history);
-    let score = format_uci_score(result.score);
-    let depth = result.pv().len().max(report_depth as usize) as u8;
-    writeln!(output, "info depth {depth} score {score} nodes {}", result.nodes)?;
+    let limits = tm.limits();
+    threads.execute_searches(board, tt, tm, multi_pv, shared);
+    let best_idx = threads.select_best_thread(limits);
+    let total_nodes = if threads.len() > 1 { shared.nodes.aggregate() } else { threads[best_idx].nodes };
+    let worker = &threads[best_idx];
+    let depth = worker.completed_depth.max(report_depth);
 
-    let best_move = result.best_move.map(|mv| mv.to_uci(board)).unwrap_or_else(|| "0000".to_string());
+    if multi_pv > 1 && !worker.root_moves.is_empty() {
+        let count = multi_pv.min(worker.root_moves.records.len());
+        for i in 0..count {
+            let rm = worker.root_moves.at(i);
+            let res = rm.active_result();
+            let score = format_uci_score(res.score);
+            writeln!(output, "info depth {depth} multipv {} score {score} nodes {total_nodes}", i + 1)?;
+        }
+    } else {
+        let score = format_uci_score(worker.score);
+        writeln!(output, "info depth {depth} score {score} nodes {total_nodes}")?;
+    }
+
+    let best_move = worker.best_move.map(|mv| mv.to_uci(board)).unwrap_or_else(|| "0000".to_string());
     writeln!(output, "bestmove {best_move}")
 }
 

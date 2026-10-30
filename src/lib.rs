@@ -5,6 +5,7 @@ pub mod history;
 pub mod movepick;
 pub mod search;
 pub mod thread;
+pub mod threadpool;
 pub mod time;
 pub mod tools;
 pub mod transposition;

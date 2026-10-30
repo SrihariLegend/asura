@@ -1,4 +1,7 @@
-use std::{cell::RefCell, sync::OnceLock};
+use std::{
+    cell::RefCell,
+    sync::{OnceLock, atomic::Ordering},
+};
 
 pub use crate::thread::PvLine;
 use crate::{
@@ -8,7 +11,7 @@ use crate::{
     movepick::{MainMovePicker, MainStage, QuiescenceMovePicker, creates_threat_on_board},
     parameters::*,
     stack::Stack,
-    thread::{AspirationKind, AspirationWindow, RootMove, RootMoves, ThreadData},
+    thread::{AspirationKind, AspirationWindow, RootMove, RootMoves, Status, ThreadData},
     time::{DynamicTimeState, Limits, TimeManager},
     transposition::{Bound, Entry as TtEntry, TranspositionTable, TtDepth},
     types::{MAX_PLY as MAX_PLY_USIZE, Move, Piece, PieceType, Score, Square, is_decisive, is_win},
@@ -207,6 +210,12 @@ pub fn search_with_time_manager(
     SearchResult { best_move, score, nodes: td.nodes, pv }
 }
 
+/// Entry point used by Lazy SMP worker threads in ThreadPool.
+pub fn start_worker_search(td: &mut ThreadData<'_>, pv: &mut PvLine) -> (i32, Option<Move>) {
+    let max_depth = td.time_manager.max_depth();
+    run_iterative_search::<CFG_STANDARD>(td, max_depth, pv)
+}
+
 macro_rules! define_diagnostic_searches {
     ($($(#[$attr:meta])* $name:ident: $cfg:expr;)*) => {
         $(
@@ -324,51 +333,104 @@ fn run_iterative_search<const CFG: u32>(
     td.root_moves = RootMoves::with_filter(&td.board, td.time_manager.search_moves());
     if td.root_moves.is_empty() {
         let score = if td.board.in_check() { -MATE_SCORE } else { draw_score(draw_jitter, td.nodes) };
+        if td.id == 0
+            && !matches!(td.time_manager.limits(), Limits::Infinite)
+            && let Some(shared) = td.shared
+        {
+            shared.status.set(Status::STOPPED);
+        }
+        if matches!(td.time_manager.limits(), Limits::Infinite)
+            && let Some(shared) = td.shared
+        {
+            while shared.status.get() != Status::STOPPED {
+                std::hint::spin_loop();
+            }
+        }
         return (score, None);
     }
     if td.board.is_draw(0) {
         let mv = td.root_moves.at(0).mv;
         pv.update(mv, &[]);
+        if td.id == 0
+            && !matches!(td.time_manager.limits(), Limits::Infinite)
+            && let Some(shared) = td.shared
+        {
+            shared.status.set(Status::STOPPED);
+        }
+        if matches!(td.time_manager.limits(), Limits::Infinite)
+            && let Some(shared) = td.shared
+        {
+            while shared.status.get() != Status::STOPPED {
+                std::hint::spin_loop();
+            }
+        }
         return (draw_score(draw_jitter, td.nodes), Some(mv));
     }
 
+    let multi_pv = td.multi_pv.min(td.root_moves.records.len()).max(1);
     let mut eval_stability: i32 = 0;
     let mut pv_stability: i32 = 0;
     let mut last_best_rootmove: Option<RootMove> = None;
+    let mut soft_stop_voted = false;
 
     for step in 1..=max_depth {
         td.root_moves.begin_depth_iteration(step);
+        let prev_best_score = td.root_moves.aspiration_previous_score(0);
 
-        let pv_idx = 0;
-        let prev_score = td.root_moves.aspiration_previous_score(pv_idx);
-        let mut window = AspirationWindow::new(step, prev_score, eval_stability, pv_stability);
-        let mut aspiration_depth = step;
-        let mut root_pv_move = td.root_moves.at(pv_idx).mv;
+        for pv_idx in 0..multi_pv {
+            let prev_score = td.root_moves.aspiration_previous_score(pv_idx);
+            let mut window = AspirationWindow::new(step, prev_score, eval_stability, pv_stability);
+            let mut aspiration_depth = step;
+            let mut root_pv_move = td.root_moves.at(pv_idx).mv;
 
-        loop {
-            td.stack = Stack::default();
-            let root_effective_depth = aspiration_depth.max(1);
-            let score = search_root::<CFG>(td, window.alpha, window.beta, root_effective_depth, pv_idx, root_pv_move);
-            td.root_moves.sort_from(pv_idx);
+            loop {
+                td.stack = Stack::default();
+                let root_effective_depth = aspiration_depth.max(1);
+                let score =
+                    search_root::<CFG>(td, window.alpha, window.beta, root_effective_depth, pv_idx, root_pv_move);
+                td.root_moves.sort_from(pv_idx);
+                if td.stopped {
+                    break;
+                }
+
+                match window.on_result(score) {
+                    AspirationKind::FailHigh => {
+                        if !is_decisive(score) && aspiration_depth > 3 {
+                            aspiration_depth -= 1;
+                        }
+                        let winning_move = td.root_moves.at(pv_idx).mv;
+                        if winning_move.is_present() {
+                            root_pv_move = winning_move;
+                        }
+                    }
+                    AspirationKind::FailLow => {
+                        aspiration_depth = step;
+                    }
+                    AspirationKind::Exact => {
+                        if let Some(shared) = td.shared {
+                            let avg = td.root_moves.at(pv_idx).average;
+                            shared.best_stats[pv_idx].fetch_max(
+                                (u32::from(step) << 16) | ((avg + 32_768).clamp(0, 65_535) as u32),
+                                Ordering::AcqRel,
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if multi_pv > 1 {
+                td.root_moves.sort_multi_pv_prefix(pv_idx);
+            }
             if td.stopped {
                 break;
             }
+        }
 
-            match window.on_result(score) {
-                AspirationKind::FailHigh => {
-                    if !is_decisive(score) && aspiration_depth > 3 {
-                        aspiration_depth -= 1;
-                    }
-                    let winning_move = td.root_moves.at(pv_idx).mv;
-                    if winning_move.is_present() {
-                        root_pv_move = winning_move;
-                    }
-                }
-                AspirationKind::FailLow => {
-                    aspiration_depth = step;
-                }
-                AspirationKind::Exact => break,
-            }
+        if let Some(shared) = td.shared
+            && shared.status.get() == Status::STOPPED
+        {
+            td.stopped = true;
         }
 
         let top = *td.root_moves.at(0);
@@ -414,16 +476,20 @@ fn run_iterative_search<const CFG: u32>(
         td.completed_depth = step;
 
         let winner = *td.root_moves.at(0);
-        if let Some(mate_moves) = td.time_manager.mate_moves()
+        if td.id == 0
+            && let Some(mate_moves) = td.time_manager.mate_moves()
             && is_decisive(winner.current.score)
             && MATE_SCORE - winner.current.score.abs() <= i32::from(mate_moves) * 2
         {
+            if let Some(shared) = td.shared {
+                shared.status.set(Status::STOPPED);
+            }
             break;
         }
 
         let tm_state = DynamicTimeState {
             cur_score: winner.current.score,
-            prev_score: prev_score.last,
+            prev_score: prev_best_score.last,
             best_move_nodes: winner.nodes,
             total_nodes: td.nodes,
             pv_stability,
@@ -431,8 +497,47 @@ fn run_iterative_search<const CFG: u32>(
             best_move_changes: td.root_moves.best_move_changes,
             legal_root_moves: td.root_moves.records.len(),
         };
-        if td.time_manager.should_stop_soft_now(&tm_state) {
+
+        if let Some(shared) = td.shared
+            && td.thread_count > 1
+        {
+            if td.time_manager.should_stop_soft_now(&tm_state) {
+                if !soft_stop_voted {
+                    soft_stop_voted = true;
+                    let votes = shared.soft_stop_votes.fetch_add(1, Ordering::AcqRel) + 1;
+                    let majority = (td.thread_count * 65).div_ceil(100);
+                    if votes >= majority {
+                        shared.status.set(Status::STOPPED);
+                        break;
+                    }
+                }
+            } else if soft_stop_voted {
+                soft_stop_voted = false;
+                shared.soft_stop_votes.fetch_sub(1, Ordering::AcqRel);
+            }
+            if shared.status.get() == Status::STOPPED {
+                break;
+            }
+        } else if td.time_manager.should_stop_soft_now(&tm_state) {
+            if let Some(shared) = td.shared {
+                shared.status.set(Status::STOPPED);
+            }
             break;
+        }
+    }
+
+    if td.id == 0
+        && !matches!(td.time_manager.limits(), Limits::Infinite)
+        && let Some(shared) = td.shared
+    {
+        shared.status.set(Status::STOPPED);
+    }
+
+    if matches!(td.time_manager.limits(), Limits::Infinite)
+        && let Some(shared) = td.shared
+    {
+        while shared.status.get() != Status::STOPPED {
+            std::hint::spin_loop();
         }
     }
 

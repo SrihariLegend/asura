@@ -22,15 +22,16 @@ fn exchange(commands: &str) -> String {
 #[test]
 fn handshake_only_advertises_implemented_options() {
     let output = exchange(
-        "uci\nsetoption name Hash value 4\nsetoption name Move Overhead value 20\nsetoption name Clear Hash\nisready\nquit\n",
+        "uci\nsetoption name Hash value 4\nsetoption name Threads value 2\nsetoption name Move Overhead value 20\nsetoption name MultiPV value 2\nsetoption name Clear Hash\nisready\nquit\n",
     );
     assert!(output.starts_with(&format!("id name Asura {}\n", env!("CARGO_PKG_VERSION"))));
     assert!(output.contains("option name Hash type spin default 16 min 1 max 262144\n"));
+    assert!(output.contains("option name Threads type spin default 1 min 1 max "));
     assert!(output.contains("option name Move Overhead type spin default 15 min 0 max 5000\n"));
+    assert!(output.contains("option name MultiPV type spin default 1 min 1 max 256\n"));
     assert!(output.contains("option name Clear Hash type button\n"));
     assert!(output.contains("option name UCI_Chess960 type check default false\n"));
     assert!(output.ends_with("uciok\nreadyok\n"));
-    assert!(!output.contains("name Threads"));
 }
 
 #[test]
@@ -190,7 +191,6 @@ fn go_depth_rejects_invalid_or_unsupported_limits_without_fake_moves() {
         "go depth nope",
         "go depth 256",
         "go depth 999999999999999999999",
-        "go infinite",
         "go nodes 0",
         "go movetime 0",
         "go mate 0",
@@ -221,6 +221,23 @@ fn go_supports_nodes_movetime_clocks_mate_searchmoves_eval_and_bench() {
     let mate_out = exchange("position fen 7k/5Q2/6K1/8/8/8/8/8 w - - 0 1\ngo mate 1\nquit\n");
     assert!(mate_out.contains("score mate 1"), "{mate_out}");
     assert!(mate_out.contains("bestmove "), "{mate_out}");
+}
+
+#[test]
+fn lazy_smp_multipv_and_async_infinite_stop_work() {
+    // 1. Lazy SMP with 2 threads + MultiPV 2.
+    let smp_out = exchange(
+        "setoption name Threads value 2\n         setoption name MultiPV value 2\n         position startpos\n         go depth 3\n         setoption name MultiPV value 1\n         go nodes 400\n         quit\n",
+    );
+    assert!(smp_out.contains("info depth 3 multipv 1 score "), "{smp_out}");
+    assert!(smp_out.contains("info depth 3 multipv 2 score "), "{smp_out}");
+    assert_eq!(smp_out.matches("bestmove ").count(), 2, "{smp_out}");
+
+    // 2. go infinite stopped by async stop command.
+    let inf_out = exchange("position startpos\ngo infinite\nstop\nisready\nquit\n");
+    assert!(inf_out.contains("bestmove "), "go infinite + stop must emit bestmove: {inf_out}");
+    assert!(!inf_out.contains("bestmove 0000"), "go infinite + stop must return a legal move: {inf_out}");
+    assert!(inf_out.ends_with("readyok\n"), "{inf_out}");
 }
 
 #[test]

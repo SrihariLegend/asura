@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
 use crate::{
     board::Board,
     history::HistoryTables,
@@ -5,8 +7,101 @@ use crate::{
     stack::Stack,
     time::{Limits, TimeManager},
     transposition::TranspositionTable,
-    types::{MAX_PLY, Move, Score},
+    types::{MAX_MOVES, MAX_PLY, Move, Score},
 };
+
+pub const MAX_THREADS: usize = 512;
+
+#[repr(align(64))]
+struct AlignedAtomicU64 {
+    inner: AtomicU64,
+}
+
+/// Sharded cache-line-aligned atomic counter for lock-free Lazy SMP node counting.
+pub struct Counter {
+    shards: Box<[AlignedAtomicU64]>,
+}
+
+unsafe impl Sync for Counter {}
+
+impl Counter {
+    pub fn aggregate(&self) -> u64 {
+        self.shards.iter().map(|shard| shard.inner.load(Ordering::Relaxed)).sum()
+    }
+
+    pub fn get(&self, id: usize) -> u64 {
+        self.shards[id].inner.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn increment(&self, id: usize) {
+        let cur = self.shards[id].inner.load(Ordering::Relaxed);
+        self.shards[id].inner.store(cur + 1, Ordering::Relaxed);
+    }
+
+    pub fn reset(&self) {
+        for shard in &self.shards {
+            shard.inner.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Default for Counter {
+    fn default() -> Self {
+        Self {
+            shards: std::iter::from_fn(|| Some(AlignedAtomicU64 { inner: AtomicU64::new(0) }))
+                .take(MAX_THREADS)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+}
+
+pub struct Status {
+    inner: AtomicUsize,
+}
+
+impl Status {
+    pub const STOPPED: usize = 0;
+    pub const RUNNING: usize = 1;
+
+    #[inline]
+    pub fn get(&self) -> usize {
+        self.inner.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set(&self, status: usize) {
+        self.inner.store(status, Ordering::Release);
+    }
+}
+
+impl Default for Status {
+    fn default() -> Self {
+        Self { inner: AtomicUsize::new(Self::STOPPED) }
+    }
+}
+
+/// Shared state across Lazy SMP worker threads.
+pub struct SharedContext {
+    pub status: Status,
+    pub infinite_search: AtomicBool,
+    pub nodes: Counter,
+    pub soft_stop_votes: AtomicUsize,
+    pub best_stats: [AtomicU32; MAX_MOVES],
+}
+
+impl Default for SharedContext {
+    fn default() -> Self {
+        Self {
+            status: Status::default(),
+            infinite_search: AtomicBool::new(false),
+            nodes: Counter::default(),
+            soft_stop_votes: AtomicUsize::new(0),
+            best_stats: [const { AtomicU32::new(0) }; MAX_MOVES],
+        }
+    }
+}
 
 const MATE_SCORE: i32 = Score::MATE;
 const INFINITY: i32 = Score::INFINITE;
@@ -208,7 +303,7 @@ impl RootMove {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RootMoves {
     pub records: Vec<RootMove>,
     pub best_move_changes: usize,
@@ -270,6 +365,9 @@ impl RootMoves {
             rec.current.score = -INFINITY;
             return;
         }
+        if pv_idx > 0 {
+            rec.average = if rec.average == -INFINITY { score } else { (rec.average + score) / 2 };
+        }
         rec.searched_this_iteration = true;
         rec.sel_depth = sel_depth;
         rec.current.alpha = alpha_before;
@@ -290,10 +388,18 @@ impl RootMoves {
             sb.cmp(&sa).then_with(|| b.previous.score.cmp(&a.previous.score))
         });
     }
+
+    pub fn sort_multi_pv_prefix(&mut self, end_inclusive: usize) {
+        let end = (end_inclusive + 1).min(self.records.len());
+        self.records[..end].sort_by_key(|a| std::cmp::Reverse(a.active_result().score));
+    }
 }
 
 /// Per-thread search state bundling board, stack, PV table, root moves, TT, and histories.
 pub struct ThreadData<'a> {
+    pub id: usize,
+    pub multi_pv: usize,
+    pub thread_count: usize,
     pub board: Board,
     pub stack: Stack,
     pub pv_table: PrincipalVariationTable,
@@ -305,6 +411,7 @@ pub struct ThreadData<'a> {
     pub stopped: bool,
     pub tt: Option<&'a TranspositionTable>,
     pub history: Option<&'a mut HistoryTables>,
+    pub shared: Option<&'a SharedContext>,
 }
 
 impl<'a> ThreadData<'a> {
@@ -329,6 +436,9 @@ impl<'a> ThreadData<'a> {
             h.prepare_search(&board);
         }
         Self {
+            id: 0,
+            multi_pv: 1,
+            thread_count: 1,
             board,
             stack: Stack::default(),
             pv_table: PrincipalVariationTable::default(),
@@ -340,6 +450,18 @@ impl<'a> ThreadData<'a> {
             stopped: false,
             tt,
             history,
+            shared: None,
+        }
+    }
+
+    #[inline]
+    pub fn total_nodes(&self) -> u64 {
+        if self.thread_count > 1
+            && let Some(shared) = self.shared
+        {
+            shared.nodes.aggregate()
+        } else {
+            self.nodes
         }
     }
 
@@ -348,9 +470,27 @@ impl<'a> ThreadData<'a> {
         if self.stopped {
             return true;
         }
-        if self.time_manager.check_hard_limit(self.completed_depth, self.nodes) {
+        if self.completed_depth > 0
+            && (self.nodes & TIME_CHECK_NODE_MASK) == 0
+            && let Some(shared) = self.shared
+            && shared.status.get() == Status::STOPPED
+        {
             self.stopped = true;
             return true;
+        }
+        if self.id == 0 {
+            let check_nodes = if self.thread_count > 1 && (self.nodes & TIME_CHECK_NODE_MASK) == 0 {
+                self.total_nodes()
+            } else {
+                self.nodes
+            };
+            if self.time_manager.check_hard_limit(self.completed_depth, check_nodes) {
+                self.stopped = true;
+                if let Some(shared) = self.shared {
+                    shared.status.set(Status::STOPPED);
+                }
+                return true;
+            }
         }
         false
     }
@@ -360,6 +500,9 @@ impl<'a> ThreadData<'a> {
             t.prefetch(self.board.key_after(mv));
         }
         self.nodes += 1;
+        if let Some(shared) = self.shared {
+            shared.nodes.increment(self.id);
+        }
         self.board.make_move(mv);
         if let Some(t) = self.tt {
             t.prefetch(self.board.hash());
