@@ -54,6 +54,7 @@ const CFG_ALPHA_REDUCE: u32 = 1 << 26;
 const CFG_CLEAR_CUTOFF_BONUS: u32 = 1 << 27;
 const CFG_TT_STORE_DISCOUNT: u32 = 1 << 28;
 const CFG_MULTI_THREAT_CLOSURE: u32 = 1 << 29;
+const CFG_LDSE: u32 = 1 << 30;
 const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_LMR
     | CFG_NMP
@@ -82,7 +83,8 @@ const CFG_ALL_SELECTIVE: u32 = CFG_SELECTIVE
     | CFG_ALPHA_REDUCE
     | CFG_CLEAR_CUTOFF_BONUS
     | CFG_TT_STORE_DISCOUNT
-    | CFG_MULTI_THREAT_CLOSURE;
+    | CFG_MULTI_THREAT_CLOSURE
+    | CFG_LDSE;
 const CFG_STANDARD: u32 = CFG_DRAW_JITTER | CFG_ALL_SELECTIVE;
 
 thread_local! {
@@ -97,7 +99,7 @@ pub fn lmr_table_term(depth: u8, move_count: usize) -> i32 {
         let mut t = [[0; 128]; 128];
         for (d, row) in t.iter_mut().enumerate().skip(1) {
             for (m, cell) in row.iter_mut().enumerate().skip(1) {
-                *cell = (400.0 * (d as f64).ln() * (m as f64).ln()).round() as i32;
+                *cell = ((LMR_TABLE_SCALE as f64) * (d as f64).ln() * (m as f64).ln()).round() as i32;
             }
         }
         t
@@ -110,15 +112,15 @@ fn compute_node_bias(
     pv_node: bool, in_check: bool, cut_node: bool, tt_pv: bool, improving: bool, tt_capture: bool,
     parent_reduction: i32, ply: u16, last_critical_ply: u16, laterality: i32,
 ) -> i32 {
-    let mut bias = if pv_node { -500 } else { 2_000 * cut_node as i32 - 1_000 * tt_pv as i32 };
-    bias -= 1_000 * in_check as i32;
-    bias += 1_000 * (!improving) as i32;
-    bias += 500 * tt_capture as i32;
-    bias += 200 * parent_reduction / LMR_SCALE;
+    let mut bias = if pv_node { LMR_PV_BIAS } else { LMR_CUT_BIAS * cut_node as i32 - LMR_TT_PV_BONUS * tt_pv as i32 };
+    bias -= LMR_IN_CHECK_BONUS * in_check as i32;
+    bias += LMR_NON_IMPROVING_PENALTY * (!improving) as i32;
+    bias += LMR_TT_CAPTURE_PENALTY * tt_capture as i32;
+    bias += LMR_PARENT_RED_WEIGHT * parent_reduction / LMR_SCALE;
     if !pv_node {
         let chain = ply.saturating_sub(last_critical_ply).min(8) as i32;
-        bias -= 125 * chain;
-        bias += 30 * laterality;
+        bias -= LMR_CRIT_CHAIN_BONUS * chain;
+        bias += LMR_LATERALITY_PENALTY * laterality;
     }
     bias
 }
@@ -130,7 +132,8 @@ const fn lmp_limit(depth: u8, improving: bool) -> usize {
 
 const fn plan_scout_retry(best_score: i32, score: i32, child_depth: u8, reduced_depth: u8) -> u8 {
     let mut retry_depth = child_depth;
-    let margin_deeper = 60 + 10 * (child_depth.saturating_sub(reduced_depth) as i32);
+    let margin_deeper =
+        SCOUT_RETRY_BASE_MARGIN + SCOUT_RETRY_DEPTH_SCALE * (child_depth.saturating_sub(reduced_depth) as i32);
     if score > best_score.saturating_add(margin_deeper) {
         retry_depth = retry_depth.saturating_add(1);
     } else if score <= best_score.saturating_add(child_depth as i32) && retry_depth > 1 {
@@ -292,6 +295,8 @@ define_diagnostic_searches! {
     search_without_tt_store_discount: CFG_ALL_SELECTIVE & !CFG_TT_STORE_DISCOUNT;
     /// The selective search with depth-1 multi-threat quiet closure disabled and recognized draws scored zero.
     search_without_multi_threat_closure: CFG_ALL_SELECTIVE & !CFG_MULTI_THREAT_CLOSURE;
+    /// The selective search with low-depth singular extensions (LDSE) disabled and recognized draws scored zero.
+    search_without_ldse: CFG_ALL_SELECTIVE & !CFG_LDSE;
 }
 
 /// Diagnostic search with zero draw scores and no selective QS pruning or TT/history/LMR/NMP/RFP/ProbCut/SEE/LMP/FP/HP/IIR/SE/Razoring/CheckedTtCut.
@@ -654,7 +659,7 @@ fn search_root<const CFG: u32>(
             let mut quotient = 0;
             if use_lmr && is_quiet && root_effective_depth >= 2 && child_depth >= 1 {
                 let mut raw_reduction = lmr_table_term(root_effective_depth, move_count) + node_bias
-                    - hist / 10
+                    - hist / LMR_HIST_DIV
                     - LMR_CHECK_BONUS * gives_check as i32
                     - LMR_THREAT_BONUS * creates_threat as i32
                     + LMR_EXACT_BOUND_PENALTY * (bound == Bound::Exact) as i32
@@ -822,6 +827,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let use_clear_cutoff_bonus = (CFG & CFG_CLEAR_CUTOFF_BONUS) != 0;
     let use_tt_store_discount = (CFG & CFG_TT_STORE_DISCOUNT) != 0;
     let use_multi_threat_closure = (CFG & CFG_MULTI_THREAT_CLOSURE) != 0;
+    let use_ldse = (CFG & CFG_LDSE) != 0;
 
     let ply_idx = ply as usize;
     let prior_move = if ply_idx > 0 { td.stack[ply_idx - 1].mv } else { Move::NULL };
@@ -1417,6 +1423,17 @@ fn search_node<const CFG: u32, const PV: bool>(
             } else {
                 extension = if cut_node { -2 } else { -1 };
             }
+        } else if selective
+            && use_ldse
+            && !PV
+            && !in_singular
+            && !in_check
+            && cut_node
+            && move_count == 1
+            && (LDSE_MIN_DEPTH..=LDSE_MAX_DEPTH).contains(&depth)
+            && static_eval <= alpha - LDSE_MARGIN
+        {
+            extension = 1;
         }
 
         if let Some(h) = td.history.as_deref_mut() {
@@ -1467,7 +1484,7 @@ fn search_node<const CFG: u32, const PV: bool>(
                 };
 
                 let raw_reduction = base_term + node_bias
-                    - hist / 10
+                    - hist / LMR_HIST_DIV
                     - LMR_PRIORITY_QUIET_BONUS * (emitted_stage == MainStage::PriorityQuiet) as i32
                     - LMR_CHECK_BONUS * gives_check as i32
                     - LMR_THREAT_BONUS * creates_threat as i32
@@ -1701,14 +1718,25 @@ fn update_histories_on_best_move(
     let threats = board.all_threats();
     let pawn_key = board.pawn_key();
 
-    let noisy_bonus = (100 * depth).min(900) - 40 - 80 * cut_node as i32;
-    let noisy_malus = (170 * depth).min(1_200) - 50 - 15 * noisy_moves.len() as i32;
+    let noisy_bonus = (NOISY_BONUS_SCALE * depth).min(NOISY_BONUS_CAP)
+        - NOISY_BONUS_OFFSET
+        - NOISY_BONUS_CUT_PENALTY * cut_node as i32;
+    let noisy_malus = (NOISY_MALUS_SCALE * depth).min(NOISY_MALUS_CAP)
+        - NOISY_MALUS_OFFSET
+        - NOISY_MALUS_COUNT_STEP * noisy_moves.len() as i32;
 
-    let quiet_bonus = (180 * depth).min(1_700) - 70 - 40 * cut_node as i32;
-    let quiet_malus = (170 * depth).min(1_100) - 45 - 30 * quiet_moves.len() as i32;
+    let quiet_bonus = (QUIET_BONUS_SCALE * depth).min(QUIET_BONUS_CAP)
+        - QUIET_BONUS_OFFSET
+        - QUIET_BONUS_CUT_PENALTY * cut_node as i32;
+    let quiet_malus = (QUIET_MALUS_SCALE * depth).min(QUIET_MALUS_CAP)
+        - QUIET_MALUS_OFFSET
+        - QUIET_MALUS_COUNT_STEP * quiet_moves.len() as i32;
 
-    let cont_bonus = (100 * depth).min(1_100) - 70 - 45 * cut_node as i32;
-    let cont_malus = (400 * depth).min(950) - 50 - 15 * quiet_moves.len() as i32;
+    let cont_bonus =
+        (CONT_BONUS_SCALE * depth).min(CONT_BONUS_CAP) - CONT_BONUS_OFFSET - CONT_BONUS_CUT_PENALTY * cut_node as i32;
+    let cont_malus = (CONT_MALUS_SCALE * depth).min(CONT_MALUS_CAP)
+        - CONT_MALUS_OFFSET
+        - CONT_MALUS_COUNT_STEP * quiet_moves.len() as i32;
 
     if best_move.is_noisy() {
         history.noisy_history.update(
@@ -2481,5 +2509,39 @@ mod tests {
             0,
         );
         assert!(td_on.nodes < td_off.nodes, "expected multi-threat closure {} < {}", td_on.nodes, td_off.nodes);
+    }
+
+    #[test]
+    fn low_depth_singular_extension_extends_first_move_on_cut_nodes_below_alpha() {
+        // White has a single legal move (1. Ka1-b1), so Move 1 is deterministic.
+        let pos = Board::from_fen("7k/8/8/8/8/2p5/p1p5/K7 w - - 0 1").unwrap();
+        let first_mv = pos.generate_all_moves()[0];
+        let mut child = pos.clone();
+        child.make_move(first_mv);
+
+        // At depth = 5 (!PV, cut_node = true, static_eval = -300 <= alpha - 25 with alpha = 100),
+        // LDSE extends Move 1 from base_child_depth = 4 to child_depth = 5.
+        let tt_on = TranspositionTable::new(1);
+        let mut hist_on = HistoryTables::default();
+        let mut td_on = ThreadData::new(&pos, Some(&tt_on), Some(&mut hist_on));
+        let _ =
+            search_node::<{ CFG_ALL_SELECTIVE & !(CFG_IIR | CFG_RAZOR) }, false>(&mut td_on, 100, 101, 5, true, 1, 0);
+        let e_on = tt_on.read(child.hash(), 0, 2).unwrap();
+
+        let tt_off = TranspositionTable::new(1);
+        let mut hist_off = HistoryTables::default();
+        let mut td_off = ThreadData::new(&pos, Some(&tt_off), Some(&mut hist_off));
+        let _ = search_node::<{ CFG_ALL_SELECTIVE & !(CFG_IIR | CFG_RAZOR | CFG_LDSE) }, false>(
+            &mut td_off,
+            100,
+            101,
+            5,
+            true,
+            1,
+            0,
+        );
+        let e_off = tt_off.read(child.hash(), 0, 2).unwrap();
+
+        assert_eq!(e_on.depth, e_off.depth + 1);
     }
 }

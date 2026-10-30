@@ -6,8 +6,8 @@ use asura::{
         search_with_zero_draws, search_without_alpha_reduce, search_without_checked_tt_cutoff,
         search_without_clear_cutoff_bonus, search_without_correction_history, search_without_fp,
         search_without_hindsight, search_without_hp, search_without_iir, search_without_late_quiet_closure,
-        search_without_lmp, search_without_lmr, search_without_multi_threat_closure, search_without_nmp,
-        search_without_probcut, search_without_qs_bound_averaging, search_without_qs_early_cutoff,
+        search_without_ldse, search_without_lmp, search_without_lmr, search_without_multi_threat_closure,
+        search_without_nmp, search_without_probcut, search_without_qs_bound_averaging, search_without_qs_early_cutoff,
         search_without_qs_futility_pruning, search_without_qs_history_pruning, search_without_qs_late_capture_pruning,
         search_without_qs_see_pruning, search_without_qs_standpat_handling, search_without_razoring,
         search_without_rfp, search_without_root_iir, search_without_se, search_without_se_hindsight,
@@ -1047,4 +1047,13 @@ fn time_manager_stops_on_node_mate_and_clock_limits_while_preserving_board_and_b
     let mut hist_mate = asura::history::HistoryTables::default();
     let res_mate = search_with_limits(&mate_pos, Limits::Mate(1), &tt_mate, &mut hist_mate);
     assert_eq!(res_mate.score, 31_999);
+}
+
+#[test]
+fn low_depth_singular_extension_preserves_tactics() {
+    let italian = Board::from_fen("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
+    let it_on = search_with_zero_draws(&italian, 7);
+    let it_off = search_without_ldse(&italian, 7);
+    assert_eq!(it_on.best_move, it_off.best_move);
+    assert_eq!(it_on.score, it_off.score);
 }

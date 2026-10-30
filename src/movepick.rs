@@ -3,11 +3,10 @@ use crate::{
     evaluation::material_value,
     history::HistoryTables,
     lookup::king_attacks,
+    parameters::*,
     setwise::{bishop_attacks_setwise, knight_attacks_setwise, pawn_attacks_setwise, rook_attacks_setwise},
     types::{Bitboard, MAX_MOVES, Move, MoveList, PieceType},
 };
-
-const DEFER_QUIET_THRESHOLD: i32 = -1_000;
 
 #[derive(Copy, Clone, Eq, PartialEq, PartialOrd)]
 pub enum MainStage {
@@ -130,7 +129,7 @@ impl MainMovePicker {
                                     board.type_on(mv.capture_sq()),
                                 )
                             });
-                            -hist / 100
+                            -hist / GOOD_NOISY_SEE_HIST_DIV
                         };
                         if !board.see_ge(mv, threshold) {
                             if self.see_threshold.is_none() {
@@ -400,17 +399,17 @@ impl QuietScoringContext {
         let piece = board.moved_piece(mv);
         let creates_threat = self.creates_threat(pt, mv);
 
-        1_500 * history.quiet_history.get(self.threats, creates_threat, side, mv) / 1_000
-            + 1_000 * history.pawn_history.get(pawn_key, piece, mv.to()) / 1_000
-            + 1_500 * history.conthist(ply, 1, piece, mv.to()) / 1_000
-            + 1_000 * history.conthist(ply, 2, piece, mv.to()) / 1_000
-            + 1_000 * history.conthist(ply, 4, piece, mv.to()) / 1_000
-            + 1_000 * history.conthist(ply, 6, piece, mv.to()) / 1_000
+        QUIET_HIST_WEIGHT * history.quiet_history.get(self.threats, creates_threat, side, mv) / 1_000
+            + PAWN_HIST_WEIGHT * history.pawn_history.get(pawn_key, piece, mv.to()) / 1_000
+            + CONT_HIST_1_WEIGHT * history.conthist(ply, 1, piece, mv.to()) / 1_000
+            + CONT_HIST_2_WEIGHT * history.conthist(ply, 2, piece, mv.to()) / 1_000
+            + CONT_HIST_4_WEIGHT * history.conthist(ply, 4, piece, mv.to()) / 1_000
+            + CONT_HIST_6_WEIGHT * history.conthist(ply, 6, piece, mv.to()) / 1_000
             + ESCAPE[pt] * self.threatened[pt].contains(mv.from()) as i32
-            + 10_000 * board.checking_squares(pt).contains(mv.to()) as i32
-            - 8_000 * self.threatened[pt].contains(mv.to()) as i32
-            + 3_500 * creates_threat as i32
-            - 4_000 * self.wall_pawns.contains(mv.from()) as i32
+            + QUIET_CHECK_SCORE_BONUS * board.checking_squares(pt).contains(mv.to()) as i32
+            - QUIET_THREATENED_DEST_PENALTY * self.threatened[pt].contains(mv.to()) as i32
+            + QUIET_CREATE_THREAT_BONUS * creates_threat as i32
+            - QUIET_WALL_PAWN_PENALTY * self.wall_pawns.contains(mv.from()) as i32
     }
 }
 

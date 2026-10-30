@@ -18,8 +18,10 @@ define! {
     i32, EVAL_STABILITY_THRESHOLD: 10;
     i32, SCOUT_HISTORY_BONUS: 50;
 
-    // LMR constants in 1_000 = 1 ply fixed-point units.
+    // LMR and node-bias constants in 1_000 = 1 ply fixed-point units.
     i32, LMR_SCALE: 1_000;
+    i32, LMR_TABLE_SCALE: 400;
+    i32, LMR_HIST_DIV: 10;
     i32, LMR_GOOD_NOISY_BASE: 200;
     i32, LMR_BAD_NOISY_BASE: 2_500;
     i32, LMR_PRIORITY_QUIET_BONUS: 1_000;
@@ -27,6 +29,18 @@ define! {
     i32, LMR_THREAT_BONUS: 750;
     i32, LMR_EXACT_BOUND_PENALTY: 1_000;
     i32, LMR_CHILD_CUTOFF_PENALTY: 1_000;
+
+    i32, LMR_PV_BIAS: -500;
+    i32, LMR_CUT_BIAS: 2_000;
+    i32, LMR_TT_PV_BONUS: 1_000;
+    i32, LMR_IN_CHECK_BONUS: 1_000;
+    i32, LMR_NON_IMPROVING_PENALTY: 1_000;
+    i32, LMR_TT_CAPTURE_PENALTY: 500;
+    i32, LMR_PARENT_RED_WEIGHT: 200;
+    i32, LMR_CRIT_CHAIN_BONUS: 125;
+    i32, LMR_LATERALITY_PENALTY: 30;
+    i32, SCOUT_RETRY_BASE_MARGIN: 60;
+    i32, SCOUT_RETRY_DEPTH_SCALE: 10;
 
     // Null Move Pruning constants on the 100 = 1 pawn scale.
     u8,  NMP_MIN_DEPTH: 3;
@@ -77,13 +91,16 @@ define! {
     u8,  IIR_MIN_DEPTH: 3;
     i32, IIR_TT_DEPTH_GAP: 4;
 
-    // Singular Extension constants on the 100 = 1 pawn scale.
+    // Singular Extension and Low-Depth Singular Extension (LDSE) constants on the 100 = 1 pawn scale.
     u8,  SE_MIN_DEPTH: 6;
     i32, SE_BETA_MARGIN: 30;
     i32, SE_DEPTH_MARGIN: 3;
     i32, SE_DOUBLE_GAP: 25;
     i32, SE_TRIPLE_GAP: 100;
     i32, SE_HINDSIGHT_MIN_REDUCTION: 3_000;
+    u8,  LDSE_MIN_DEPTH: 5;
+    u8,  LDSE_MAX_DEPTH: 7;
+    i32, LDSE_MARGIN: 25;
 
     // Razoring constants on the 100 = 1 pawn scale.
     u8,  RAZOR_MAX_DEPTH: 3;
@@ -137,6 +154,47 @@ define! {
 
     // Clear-cutoff history depth bonus margin on the 100 = 1 pawn scale.
     i32, CLEAR_CUTOFF_MARGIN: 50;
+
+    // Move-picker and history update constants on the 10_000 = MAX_HISTORY scale.
+    i32, DEFER_QUIET_THRESHOLD: -1_000;
+    i32, GOOD_NOISY_SEE_HIST_DIV: 100;
+    i32, QUIET_HIST_WEIGHT: 1_500;
+    i32, PAWN_HIST_WEIGHT: 1_000;
+    i32, CONT_HIST_1_WEIGHT: 1_500;
+    i32, CONT_HIST_2_WEIGHT: 1_000;
+    i32, CONT_HIST_4_WEIGHT: 1_000;
+    i32, CONT_HIST_6_WEIGHT: 1_000;
+    i32, QUIET_CHECK_SCORE_BONUS: 10_000;
+    i32, QUIET_THREATENED_DEST_PENALTY: 8_000;
+    i32, QUIET_CREATE_THREAT_BONUS: 3_500;
+    i32, QUIET_WALL_PAWN_PENALTY: 4_000;
+
+    i32, NOISY_BONUS_SCALE: 100;
+    i32, NOISY_BONUS_CAP: 900;
+    i32, NOISY_BONUS_OFFSET: 40;
+    i32, NOISY_BONUS_CUT_PENALTY: 80;
+    i32, NOISY_MALUS_SCALE: 170;
+    i32, NOISY_MALUS_CAP: 1_200;
+    i32, NOISY_MALUS_OFFSET: 50;
+    i32, NOISY_MALUS_COUNT_STEP: 15;
+
+    i32, QUIET_BONUS_SCALE: 180;
+    i32, QUIET_BONUS_CAP: 1_700;
+    i32, QUIET_BONUS_OFFSET: 70;
+    i32, QUIET_BONUS_CUT_PENALTY: 40;
+    i32, QUIET_MALUS_SCALE: 170;
+    i32, QUIET_MALUS_CAP: 1_100;
+    i32, QUIET_MALUS_OFFSET: 45;
+    i32, QUIET_MALUS_COUNT_STEP: 30;
+
+    i32, CONT_BONUS_SCALE: 100;
+    i32, CONT_BONUS_CAP: 1_100;
+    i32, CONT_BONUS_OFFSET: 70;
+    i32, CONT_BONUS_CUT_PENALTY: 45;
+    i32, CONT_MALUS_SCALE: 400;
+    i32, CONT_MALUS_CAP: 950;
+    i32, CONT_MALUS_OFFSET: 50;
+    i32, CONT_MALUS_COUNT_STEP: 15;
 
     // Time-management constants (ms, moves, and 1_000 = 1.0x fixed-point scale).
     u64, DEFAULT_MOVE_OVERHEAD_MS: 15;
