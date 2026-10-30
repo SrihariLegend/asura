@@ -2494,12 +2494,13 @@ mod tests {
         let tt_on = TranspositionTable::new(1);
         let mut hist_on = HistoryTables::default();
         let mut td_on = ThreadData::new(&pos, Some(&tt_on), Some(&mut hist_on));
-        let _ = search_node::<{ CFG_ALL_SELECTIVE & !CFG_RAZOR }, false>(&mut td_on, 600, 601, 1, false, 1, 0);
+        let _ =
+            search_node::<{ CFG_ALL_SELECTIVE & !(CFG_RAZOR | CFG_LQC) }, false>(&mut td_on, 600, 601, 1, false, 1, 0);
 
         let tt_off = TranspositionTable::new(1);
         let mut hist_off = HistoryTables::default();
         let mut td_off = ThreadData::new(&pos, Some(&tt_off), Some(&mut hist_off));
-        let _ = search_node::<{ CFG_ALL_SELECTIVE & !CFG_RAZOR & !CFG_MULTI_THREAT_CLOSURE }, false>(
+        let _ = search_node::<{ CFG_ALL_SELECTIVE & !(CFG_RAZOR | CFG_LQC | CFG_MULTI_THREAT_CLOSURE) }, false>(
             &mut td_off,
             600,
             601,
