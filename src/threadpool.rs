@@ -112,20 +112,22 @@ impl ThreadPool {
         }
     }
 
-    pub fn execute_searches(
-        &mut self, board: &Board, tt: &TranspositionTable, time_manager: TimeManager, multi_pv: usize,
-        shared: &Arc<SharedContext>,
-    ) {
+    pub fn prepare_search(&self, tt: &TranspositionTable, is_infinite: bool, shared: &Arc<SharedContext>) {
         tt.increment_age();
         shared.nodes.reset();
         shared.soft_stop_votes.store(0, Ordering::Release);
-        shared.infinite_search.store(matches!(time_manager.limits(), Limits::Infinite), Ordering::Release);
-        shared.status.set(Status::RUNNING);
+        shared.infinite_search.store(is_infinite, Ordering::Release);
         let init_stat = (self.vector[0].previous_best_score + 32_768).clamp(0, 65_535) as u32;
         for stat in &shared.best_stats {
             stat.store(init_stat, Ordering::Release);
         }
+        shared.status.set(Status::RUNNING);
+    }
 
+    pub fn execute_searches(
+        &mut self, board: &Board, tt: &TranspositionTable, time_manager: TimeManager, multi_pv: usize,
+        shared: &Arc<SharedContext>,
+    ) {
         let thread_count = self.vector.len();
         std::thread::scope(|scope| {
             let mut handlers = Vec::with_capacity(thread_count);

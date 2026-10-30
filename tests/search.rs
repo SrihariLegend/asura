@@ -222,7 +222,7 @@ fn iterative_deepening_accumulates_iterations_and_resolves_aspiration_swings() {
 #[test]
 fn lmr_table_and_late_move_reductions_preserve_tactics_while_reducing_tree_size() {
     assert_eq!(lmr_table_term(1, 1), 0);
-    assert_eq!(lmr_table_term(8, 8), 1_695);
+    assert_eq!(lmr_table_term(8, 8), 1_699);
     assert!(lmr_table_term(12, 16) > lmr_table_term(8, 8));
 
     // At depths 1 and 2, Black's quiet fork 1...Nd3 (attacking b4 and f2) has

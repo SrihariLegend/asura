@@ -192,23 +192,20 @@ pub fn message_loop(commands: VecDeque<String>, mut input: impl BufRead, mut out
                 },
                 ["go", tokens @ ..] => match parse_go(&board, tokens, move_overhead_ms) {
                     Ok(ParsedGo::FixedDepth(depth)) if threads.len() == 1 && multi_pv == 1 => {
-                        shared.infinite_search.store(false, Ordering::Release);
-                        shared.status.set(Status::RUNNING);
+                        threads.prepare_search(&tt, false, &shared);
                         let _ = ack_tx.send(());
                         acked = true;
                         go_fixed_depth(&board, &tt, &shared, &mut threads, depth, &mut output)?;
                     }
                     Ok(ParsedGo::FixedDepth(depth)) => {
                         let tm = TimeManager::new(Limits::Depth(depth), board.fullmove_number(), move_overhead_ms);
-                        shared.infinite_search.store(false, Ordering::Release);
-                        shared.status.set(Status::RUNNING);
+                        threads.prepare_search(&tt, false, &shared);
                         let _ = ack_tx.send(());
                         acked = true;
                         go_managed(&board, &tt, &shared, &mut threads, tm, multi_pv, depth, &mut output)?;
                     }
                     Ok(ParsedGo::Managed(tm, report_depth)) => {
-                        shared.infinite_search.store(matches!(tm.limits(), Limits::Infinite), Ordering::Release);
-                        shared.status.set(Status::RUNNING);
+                        threads.prepare_search(&tt, matches!(tm.limits(), Limits::Infinite), &shared);
                         let _ = ack_tx.send(());
                         acked = true;
                         go_managed(&board, &tt, &shared, &mut threads, tm, multi_pv, report_depth, &mut output)?;
