@@ -166,6 +166,11 @@ pub fn message_loop(commands: VecDeque<String>, mut input: impl BufRead, mut out
                     }
                     Err(_) => writeln!(output, "info string UCI_Chess960 requires true or false")?,
                 },
+                ["setoption", "name", name, "value", value] => {
+                    if !crate::parameters::set_parameter(name, value) {
+                        writeln!(output, "info string Unknown option {name}")?;
+                    }
+                }
                 ["perft", depth] => match depth.parse::<usize>() {
                     Ok(depth) => {
                         tools::divide(&mut board, depth, &mut output)?;

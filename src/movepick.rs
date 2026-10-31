@@ -138,7 +138,7 @@ impl MainMovePicker {
                                     board.type_on(mv.capture_sq()),
                                 )
                             });
-                            -hist / GOOD_NOISY_SEE_HIST_DIV
+                            (-hist / GOOD_NOISY_SEE_HIST_DIV).min(0)
                         };
                         if !board.see_ge(mv, threshold) {
                             if self.see_threshold.is_none() {
