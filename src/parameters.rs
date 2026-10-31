@@ -1,55 +1,6 @@
 macro_rules! define {
     {$($type:ty, $name:ident: $value:expr; )*} => {
-        $(#[allow(dead_code)] pub const $name: $type = $value;)*
-
-        #[allow(non_snake_case, dead_code)]
-        #[derive(Copy, Clone, Debug, PartialEq)]
-        pub struct SearchParams {
-            $(pub $name: $type,)*
-        }
-
-        #[allow(dead_code)]
-        impl SearchParams {
-            pub const DEFAULT: Self = Self {
-                $($name: $value,)*
-            };
-
-            pub fn current() -> Self {
-                *CURRENT_PARAMS.read().unwrap()
-            }
-
-            pub fn set(&mut self, name: &str, value: &str) -> bool {
-                let upper = name.to_ascii_uppercase();
-                match upper.as_str() {
-                    $(
-                        stringify!($name) => {
-                            if let Ok(v) = value.parse::<$type>() {
-                                self.$name = v;
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                    )*
-                    _ => false,
-                }
-            }
-        }
-
-        impl Default for SearchParams {
-            fn default() -> Self {
-                Self::DEFAULT
-            }
-        }
-
-        #[allow(dead_code)]
-        pub static CURRENT_PARAMS: std::sync::RwLock<SearchParams> = std::sync::RwLock::new(SearchParams::DEFAULT);
-
-        #[allow(dead_code)]
-        pub fn set_parameter(name: &str, value: &str) -> bool {
-            let mut p = CURRENT_PARAMS.write().unwrap();
-            p.set(name, value)
-        }
+        $(pub const $name: $type = $value;)*
     };
 }
 

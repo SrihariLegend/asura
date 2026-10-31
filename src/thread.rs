@@ -204,38 +204,30 @@ pub struct AspirationWindow {
 
 impl AspirationWindow {
     pub fn new(depth: u8, previous: RootScore, eval_stability: i32, pv_stability: i32) -> Self {
-        Self::with_params(depth, previous, eval_stability, pv_stability, &SearchParams::current())
-    }
-
-    pub fn with_params(depth: u8, previous: RootScore, eval_stability: i32, pv_stability: i32, p: &SearchParams) -> Self {
-        if depth < p.ASPIRATION_MIN_DEPTH || previous.average <= -MATE_SCORE {
+        if depth < ASPIRATION_MIN_DEPTH || previous.average <= -MATE_SCORE {
             return Self { alpha: -INFINITY, beta: INFINITY, delta: INFINITY };
         }
-        let stability_shrink = eval_stability.min(pv_stability).min(p.ASPIRATION_STABILITY_MAX);
-        let volatility = (previous.last - previous.average).abs() * p.ASPIRATION_VOLATILITY_NUM / p.ASPIRATION_RATIO_DEN;
-        let magnitude = previous.average * previous.average / p.ASPIRATION_QUADRATIC_DIV;
-        let delta = (p.ASPIRATION_BASE_DELTA - stability_shrink) + volatility + magnitude;
+        let stability_shrink = eval_stability.min(pv_stability).min(ASPIRATION_STABILITY_MAX);
+        let volatility = (previous.last - previous.average).abs() * ASPIRATION_VOLATILITY_NUM / ASPIRATION_RATIO_DEN;
+        let magnitude = previous.average * previous.average / ASPIRATION_QUADRATIC_DIV;
+        let delta = (ASPIRATION_BASE_DELTA - stability_shrink) + volatility + magnitude;
 
         let mut alpha = (previous.average - delta).max(-INFINITY);
         let mut beta = (previous.average + delta).min(INFINITY);
-        if alpha < -p.ASPIRATION_INFINITE_BOUND {
+        if alpha < -ASPIRATION_INFINITE_BOUND {
             alpha = -INFINITY;
         }
-        if beta > p.ASPIRATION_INFINITE_BOUND {
+        if beta > ASPIRATION_INFINITE_BOUND {
             beta = INFINITY;
         }
         Self { alpha, beta, delta }
     }
 
     pub fn on_result(&mut self, score: i32) -> AspirationKind {
-        self.on_result_with_params(score, &SearchParams::current())
-    }
-
-    pub fn on_result_with_params(&mut self, score: i32, p: &SearchParams) -> AspirationKind {
         if score >= self.beta {
             self.beta = (score + self.delta).min(INFINITY);
-            self.delta += self.delta * p.ASPIRATION_FAIL_HIGH_WIDEN_NUM / p.ASPIRATION_RATIO_DEN;
-            if self.beta > p.ASPIRATION_INFINITE_BOUND {
+            self.delta += self.delta * ASPIRATION_FAIL_HIGH_WIDEN_NUM / ASPIRATION_RATIO_DEN;
+            if self.beta > ASPIRATION_INFINITE_BOUND {
                 self.beta = INFINITY;
             }
             return AspirationKind::FailHigh;
@@ -244,11 +236,11 @@ impl AspirationWindow {
             let failed_alpha = self.alpha;
             self.alpha = (score - self.delta).max(-INFINITY);
             self.beta = (self.beta + failed_alpha) / 2;
-            self.delta += self.delta * p.ASPIRATION_FAIL_LOW_WIDEN_NUM / p.ASPIRATION_RATIO_DEN;
-            if self.alpha < -p.ASPIRATION_INFINITE_BOUND {
+            self.delta += self.delta * ASPIRATION_FAIL_LOW_WIDEN_NUM / ASPIRATION_RATIO_DEN;
+            if self.alpha < -ASPIRATION_INFINITE_BOUND {
                 self.alpha = -INFINITY;
             }
-            if self.beta > p.ASPIRATION_INFINITE_BOUND {
+            if self.beta > ASPIRATION_INFINITE_BOUND {
                 self.beta = INFINITY;
             }
             return AspirationKind::FailLow;
@@ -421,7 +413,6 @@ pub struct ThreadData<'a> {
     pub tt: Option<&'a TranspositionTable>,
     pub history: Option<&'a mut HistoryTables>,
     pub shared: Option<&'a SharedContext>,
-    pub params: SearchParams,
 }
 
 impl<'a> ThreadData<'a> {
@@ -462,13 +453,7 @@ impl<'a> ThreadData<'a> {
             tt,
             history,
             shared: None,
-            params: SearchParams::current(),
         }
-    }
-
-    pub fn with_params(mut self, params: SearchParams) -> Self {
-        self.params = params;
-        self
     }
 
     #[inline]
