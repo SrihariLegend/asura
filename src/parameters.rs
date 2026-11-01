@@ -11,8 +11,8 @@ define! {
     i32, ASPIRATION_STABILITY_MAX: 5;
     i32, ASPIRATION_VOLATILITY_NUM: 25;
     i32, ASPIRATION_QUADRATIC_DIV: 10_000;
-    i32, ASPIRATION_FAIL_LOW_WIDEN_NUM: 25;
-    i32, ASPIRATION_FAIL_HIGH_WIDEN_NUM: 50;
+    i32, ASPIRATION_FAIL_LOW_WIDEN_NUM: 24;
+    i32, ASPIRATION_FAIL_HIGH_WIDEN_NUM: 51;
     i32, ASPIRATION_RATIO_DEN: 100;
     i32, ASPIRATION_INFINITE_BOUND: 1_000;
     i32, EVAL_STABILITY_THRESHOLD: 10;
@@ -20,35 +20,35 @@ define! {
 
     // LMR and node-bias constants in 1_000 = 1 ply fixed-point units.
     i32, LMR_SCALE: 1_000;
-    i32, LMR_TABLE_SCALE: 393;
+    i32, LMR_TABLE_SCALE: 397;
     i32, LMR_HIST_DIV: 10;
-    i32, LMR_GOOD_NOISY_BASE: 201;
-    i32, LMR_BAD_NOISY_BASE: 2_500;
-    i32, LMR_PRIORITY_QUIET_BONUS: 1_000;
-    i32, LMR_CHECK_BONUS: 749;
-    i32, LMR_THREAT_BONUS: 751;
-    i32, LMR_EXACT_BOUND_PENALTY: 1_000;
-    i32, LMR_CHILD_CUTOFF_PENALTY: 1_000;
+    i32, LMR_GOOD_NOISY_BASE: 198;
+    i32, LMR_BAD_NOISY_BASE: 2_496;
+    i32, LMR_PRIORITY_QUIET_BONUS: 992;
+    i32, LMR_CHECK_BONUS: 748;
+    i32, LMR_THREAT_BONUS: 749;
+    i32, LMR_EXACT_BOUND_PENALTY: 982;
+    i32, LMR_CHILD_CUTOFF_PENALTY: 1_001;
 
-    i32, LMR_PV_BIAS: -500;
-    i32, LMR_CUT_BIAS: 2_000;
-    i32, LMR_TT_PV_BONUS: 1_000;
-    i32, LMR_IN_CHECK_BONUS: 1_000;
-    i32, LMR_NON_IMPROVING_PENALTY: 1_000;
-    i32, LMR_TT_CAPTURE_PENALTY: 501;
-    i32, LMR_PARENT_RED_WEIGHT: 200;
-    i32, LMR_CRIT_CHAIN_BONUS: 124;
+    i32, LMR_PV_BIAS: -512;
+    i32, LMR_CUT_BIAS: 1_997;
+    i32, LMR_TT_PV_BONUS: 994;
+    i32, LMR_IN_CHECK_BONUS: 994;
+    i32, LMR_NON_IMPROVING_PENALTY: 1_010;
+    i32, LMR_TT_CAPTURE_PENALTY: 496;
+    i32, LMR_PARENT_RED_WEIGHT: 196;
+    i32, LMR_CRIT_CHAIN_BONUS: 123;
     i32, LMR_LATERALITY_PENALTY: 31;
-    i32, SCOUT_RETRY_BASE_MARGIN: 60;
+    i32, SCOUT_RETRY_BASE_MARGIN: 59;
     i32, SCOUT_RETRY_DEPTH_SCALE: 8;
 
     // Null Move Pruning constants on the 100 = 1 pawn scale.
     u8,  NMP_MIN_DEPTH: 3;
     u8,  NMP_SHALLOW_DEPTH: 10;
     i32, NMP_SHALLOW_MARGIN: 0;
-    i32, NMP_DEEP_FLOOR: -100;
+    i32, NMP_DEEP_FLOOR: -98;
     u8,  NMP_TWO_PIECE_DEPTH: 12;
-    i32, NMP_TT_SEE_MARGIN: 200;
+    i32, NMP_TT_SEE_MARGIN: 201;
     i32, NMP_BASE_REDUCTION: 3;
     i32, NMP_EXTRA_DIV: 100;
     i32, NMP_EXTRA_CAP: 6;
@@ -56,36 +56,36 @@ define! {
 
     // Reverse Futility Pruning constants on the 100 = 1 pawn / 10_000 = MAX_HISTORY scale.
     u8,  RFP_MAX_DEPTH: 8;
-    i32, RFP_DEPTH_MARGIN: 82;
+    i32, RFP_DEPTH_MARGIN: 76;
     i32, RFP_IMPROVING_BONUS: 42;
-    i32, RFP_NO_THREATS_BONUS: 35;
+    i32, RFP_NO_THREATS_BONUS: 34;
     i32, RFP_STAT_DIVISOR: 200;
-    i32, RFP_MIN_MARGIN: 29;
+    i32, RFP_MIN_MARGIN: 28;
 
     // ProbCut constants on the 100 = 1 pawn scale.
     u8,  PROBCUT_MIN_DEPTH: 5;
-    i32, PROBCUT_BETA_MARGIN: 149;
+    i32, PROBCUT_BETA_MARGIN: 145;
     i32, PROBCUT_IMPROVING_BONUS: 41;
 
     // Main-loop SEE pruning constants on the 100 = 1 pawn / 10_000 = MAX_HISTORY scale.
     i32, SEE_QUIET_HIST_DIV: 5_000;
     i32, SEE_QUIET_QUAD_COEFF: -20;
-    i32, SEE_NOISY_DEPTH_COEFF: -91;
+    i32, SEE_NOISY_DEPTH_COEFF: -93;
     i32, SEE_NOISY_HIST_DIV: 100;
 
     // Main-loop Futility Pruning constants on the 100 = 1 pawn / 10_000 = MAX_HISTORY scale.
     i32, FP_MAX_DEPTH: 1;
-    i32, FP_BASE_MARGIN: 120;
-    i32, FP_DEPTH_MARGIN: 120;
+    i32, FP_BASE_MARGIN: 122;
+    i32, FP_DEPTH_MARGIN: 119;
     i32, FP_HIST_DIV: 200;
     i32, FP_HIST_MIN: -60;
     i32, FP_HIST_MAX: 150;
-    i32, FP_MIN_MARGIN: 50;
+    i32, FP_MIN_MARGIN: 49;
 
     // Quiet-History Pruning constants on the 10_000 = MAX_HISTORY scale.
     u8,  HP_MAX_DEPTH: 4;
-    i32, HP_DEPTH_SCALE: -400;
-    i32, HP_IMPROVING_OFFSET: -200;
+    i32, HP_DEPTH_SCALE: -399;
+    i32, HP_IMPROVING_OFFSET: -197;
 
     // Internal Iterative Reduction constants.
     u8,  IIR_MIN_DEPTH: 3;
@@ -96,7 +96,7 @@ define! {
     i32, SE_BETA_MARGIN: 30;
     i32, SE_DEPTH_MARGIN: 1;
     i32, SE_DOUBLE_GAP: 25;
-    i32, SE_TRIPLE_GAP: 100;
+    i32, SE_TRIPLE_GAP: 99;
     i32, SE_HINDSIGHT_MIN_REDUCTION: 3_000;
     u8,  LDSE_MIN_DEPTH: 5;
     u8,  LDSE_MAX_DEPTH: 7;
@@ -105,7 +105,7 @@ define! {
     // Razoring constants on the 100 = 1 pawn scale.
     u8,  RAZOR_MAX_DEPTH: 3;
     i32, RAZOR_BASE: 200;
-    i32, RAZOR_MARGIN: 250;
+    i32, RAZOR_MARGIN: 247;
     i32, RAZOR_MOVE_MARGIN: 175;
 
     // Checked TT-capture cutoff constants on the 100 = 1 pawn scale.
@@ -119,10 +119,10 @@ define! {
     i32, LATE_QUIET_DEPTH_MARGIN: 75;
 
     // Quiescence quiet-history pruning threshold on the 10_000 = MAX_HISTORY scale.
-    i32, QS_QUIET_HIST_THRESHOLD: -350;
+    i32, QS_QUIET_HIST_THRESHOLD: -342;
 
     // Quiescence capture-futility margins on the 100 = 1 pawn scale.
-    i32, QS_FUTILITY_MARGIN: 201;
+    i32, QS_FUTILITY_MARGIN: 199;
     i32, QS_SEE_FUTILITY_MARGIN: 300;
 
     // Quiescence late-capture limit (maximum legal move index for unrelated
@@ -130,18 +130,18 @@ define! {
     usize, QS_LATE_CAPTURE_LIMIT: 1;
 
     // Quiescence history-backed early fail-high margin on the 100 = 1 pawn scale.
-    i32, QS_EARLY_CUTOFF_MARGIN: 226;
+    i32, QS_EARLY_CUTOFF_MARGIN: 227;
 
     // Quiescence SEE pruning constants on the 100 = 1 pawn and 10_000 = MAX_HISTORY scales.
     i32, QS_SEE_QUIET_THRESHOLD: 0;
     i32, QS_SEE_NOISY_FLOOR: -10;
-    i32, QS_SEE_BASE: 75;
+    i32, QS_SEE_BASE: 74;
     i32, QS_SEE_EVAL_DIV: 8;
     i32, QS_SEE_HIST_DIV: 50;
 
     // Hindsight depth adjustment constants (1_000 = 1 ply, 100 = 1 pawn).
     i32, HINDSIGHT_EXT_MIN_REDUCTION: 2_000;
-    i32, HINDSIGHT_REDUCTION_MARGIN: 100;
+    i32, HINDSIGHT_REDUCTION_MARGIN: 99;
 
     // Correction history constants on the 100 = 1 pawn scale.
     i32, CORRHIST_MAX: 1_024;
