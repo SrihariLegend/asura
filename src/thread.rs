@@ -498,9 +498,6 @@ impl<'a> ThreadData<'a> {
     }
 
     pub fn make_move(&mut self, mv: Move) {
-        if let Some(t) = self.tt {
-            t.prefetch(self.board.key_after(mv));
-        }
         self.nodes += 1;
         if let Some(shared) = self.shared {
             shared.nodes.increment(self.id);

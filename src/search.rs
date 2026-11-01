@@ -1083,16 +1083,16 @@ fn search_node<const CFG: u32, const PV: bool>(
         && depth >= NMP_MIN_DEPTH
         && ply >= td.stack.nmp_min_ply
         && !is_decisive(beta)
-        && !is_decisive(raw_eval)
+        && !is_decisive(static_eval)
     {
         let stm = td.board.side_to_move();
         let non_pawn_count = td.board.non_pawn_count(stm);
         let tt_upper_fail_low =
             entry.is_some_and(|e| e.bound == Bound::Upper && e.score != TtDepth::NONE_SCORE && e.score < beta);
         let eval_margin_ok = if depth <= NMP_SHALLOW_DEPTH {
-            raw_eval >= beta + NMP_SHALLOW_MARGIN
+            static_eval >= beta + NMP_SHALLOW_MARGIN
         } else {
-            raw_eval >= beta + NMP_DEEP_FLOOR
+            static_eval >= beta + NMP_DEEP_FLOOR
         };
         let tt_tactical_win = tt_move.is_noisy() && td.board.see_ge(tt_move, NMP_TT_SEE_MARGIN);
 
@@ -1101,7 +1101,7 @@ fn search_node<const CFG: u32, const PV: bool>(
             && non_pawn_count > u32::from(depth > NMP_TWO_PIECE_DEPTH)
             && !tt_tactical_win
         {
-            let diff = raw_eval - beta;
+            let diff = static_eval - beta;
             let extra = if diff < NMP_DEEP_FLOOR { 0 } else { (diff.max(0) / NMP_EXTRA_DIV).min(NMP_EXTRA_CAP) };
             let reduction = NMP_BASE_REDUCTION + i32::from(improving) + depth as i32 / 4 + extra;
             let null_depth = (depth as i32 - reduction).max(0) as u8;
@@ -1257,7 +1257,7 @@ fn search_node<const CFG: u32, const PV: bool>(
         return (beta + CHECKED_TT_CAPTURE_MARGIN, None);
     }
 
-    let node_bias = compute_node_bias(
+    let mut node_bias = compute_node_bias(
         PV,
         in_check,
         cut_node,
@@ -1269,6 +1269,11 @@ fn search_node<const CFG: u32, const PV: bool>(
         last_critical_ply,
         parent_laterality,
     );
+    if !PV && cut_node && tt_move.is_null() {
+        node_bias += 600;
+    } else if tt_pv && entry.is_some_and(|e| e.depth >= depth as i32) {
+        node_bias -= 450;
+    }
 
     let (killers, countermove) = if let Some(h) = td.history.as_deref() {
         (h.killers(ply_idx), h.countermove(prior_move))
@@ -1512,11 +1517,11 @@ fn search_node<const CFG: u32, const PV: bool>(
 
                 quotient = raw_reduction / LMR_SCALE;
                 let reduction_plies = if quotient < 0 {
-                    if depth >= 3 { (quotient / 2).max(-1) } else { 0 }
+                    if depth >= 3 { (quotient / 2).max(-2) } else { 0 }
                 } else {
                     quotient.min(child_depth as i32 - 1)
                 };
-                reduced_depth = (child_depth as i32 - reduction_plies).clamp(1, child_depth as i32 + 1) as u8;
+                reduced_depth = (child_depth as i32 - reduction_plies).clamp(1, child_depth as i32 + 2) as u8;
             }
 
             let red = (child_depth as i32 - reduced_depth as i32) * LMR_SCALE;
