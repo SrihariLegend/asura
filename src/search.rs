@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    sync::atomic::Ordering,
+    sync::{OnceLock, atomic::Ordering},
 };
 
 pub use crate::thread::PvLine;
@@ -92,12 +92,19 @@ thread_local! {
     static LOCAL_HISTORY: RefCell<HistoryTables> = RefCell::new(HistoryTables::default());
 }
 
-/// Base LMR reduction term in 1_000 = 1 ply fixed-point units: round(400 * ln(depth) * ln(move_count)).
+/// Base LMR reduction term in 1_000 = 1 ply fixed-point units: round(LMR_TABLE_SCALE * ln(depth) * ln(move_count)).
 pub fn lmr_table_term(depth: u8, move_count: usize) -> i32 {
-    let scale = LMR_TABLE_SCALE as f64;
-    let d = (depth as f64).clamp(1.0, 127.0);
-    let m = (move_count as f64).clamp(1.0, 127.0);
-    (scale * d.ln() * m.ln()).round() as i32
+    static TABLE: OnceLock<[[i32; 128]; 128]> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [[0; 128]; 128];
+        for (d, row) in t.iter_mut().enumerate().skip(1) {
+            for (m, cell) in row.iter_mut().enumerate().skip(1) {
+                *cell = ((LMR_TABLE_SCALE as f64) * (d as f64).ln() * (m as f64).ln()).round() as i32;
+            }
+        }
+        t
+    });
+    table[(depth as usize).clamp(1, 127)][move_count.clamp(1, 127)]
 }
 
 #[allow(clippy::too_many_arguments)]
