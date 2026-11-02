@@ -413,6 +413,7 @@ pub struct ThreadData<'a> {
     pub tt: Option<&'a TranspositionTable>,
     pub history: Option<&'a mut HistoryTables>,
     pub shared: Option<&'a SharedContext>,
+    pub nnue: Option<crate::nnue::NetworkState>,
 }
 
 impl<'a> ThreadData<'a> {
@@ -430,7 +431,14 @@ impl<'a> ThreadData<'a> {
 
     pub fn with_time_manager(
         position: &Board, time_manager: TimeManager, tt: Option<&'a TranspositionTable>,
-        mut history: Option<&'a mut HistoryTables>,
+        history: Option<&'a mut HistoryTables>,
+    ) -> Self {
+        Self::with_time_manager_and_nnue(position, time_manager, tt, history, crate::nnue::take_tls_nnue())
+    }
+
+    pub fn with_time_manager_and_nnue(
+        position: &Board, time_manager: TimeManager, tt: Option<&'a TranspositionTable>,
+        mut history: Option<&'a mut HistoryTables>, nnue: Option<crate::nnue::NetworkState>,
     ) -> Self {
         let board = position.clone();
         if let Some(h) = history.as_deref_mut() {
@@ -453,7 +461,24 @@ impl<'a> ThreadData<'a> {
             tt,
             history,
             shared: None,
+            nnue,
         }
+    }
+
+    #[inline]
+    pub fn evaluate(&mut self) -> (i32, i32) {
+        if let Some(ref mut net) = self.nnue {
+            let (ev, psqt, _) = net.evaluate_with_components(&self.board, 0);
+            (ev, psqt)
+        } else {
+            let ev = crate::evaluation::evaluate(&self.board);
+            (ev, ev)
+        }
+    }
+
+    #[inline]
+    pub fn evaluate_psqt_only(&mut self) -> i32 {
+        crate::evaluation::evaluate(&self.board)
     }
 
     #[inline]
@@ -502,6 +527,9 @@ impl<'a> ThreadData<'a> {
         if let Some(shared) = self.shared {
             shared.nodes.increment(self.id);
         }
+        if let Some(ref mut net) = self.nnue {
+            net.on_make_move(&self.board);
+        }
         self.board.make_move(mv);
         if let Some(t) = self.tt {
             t.prefetch(self.board.hash());
@@ -513,6 +541,9 @@ impl<'a> ThreadData<'a> {
     }
 
     pub fn make_null_move(&mut self) {
+        if let Some(ref mut net) = self.nnue {
+            net.on_make_move(&self.board);
+        }
         self.board.make_null_move();
         if let Some(t) = self.tt {
             t.prefetch(self.board.hash());
@@ -521,5 +552,13 @@ impl<'a> ThreadData<'a> {
 
     pub fn undo_null_move(&mut self) {
         self.board.undo_null_move();
+    }
+}
+
+impl Drop for ThreadData<'_> {
+    fn drop(&mut self) {
+        if let Some(net) = self.nnue.take() {
+            crate::nnue::put_tls_nnue(net);
+        }
     }
 }

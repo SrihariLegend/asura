@@ -23,6 +23,7 @@ use crate::{
 pub struct WorkerData {
     pub id: usize,
     pub history: HistoryTables,
+    pub nnue: Option<crate::nnue::NetworkState>,
     pub root_moves: RootMoves,
     pub pv: PvLine,
     pub completed_depth: u8,
@@ -39,6 +40,7 @@ impl WorkerData {
         Self {
             id,
             history: HistoryTables::default(),
+            nnue: crate::nnue::global_model().map(crate::nnue::NetworkState::new),
             root_moves: RootMoves::default(),
             pv: PvLine::new(),
             completed_depth: 0,
@@ -53,6 +55,12 @@ impl WorkerData {
 
     pub fn clear(&mut self) {
         self.history.clear();
+        if let Some(ref mut net) = self.nnue {
+            net.cached_board = None;
+            net.history_cursor = 0;
+        } else {
+            self.nnue = crate::nnue::global_model().map(crate::nnue::NetworkState::new);
+        }
         self.root_moves = RootMoves::default();
         self.pv = PvLine::new();
         self.completed_depth = 0;
@@ -141,8 +149,17 @@ impl ThreadPool {
                     move || {
                         worker_data.id = index;
                         worker_data.multi_pv = worker_multi_pv;
-                        let mut td =
-                            ThreadData::with_time_manager(&position, tm, Some(tt), Some(&mut worker_data.history));
+                        let nnue = worker_data
+                            .nnue
+                            .take()
+                            .or_else(|| crate::nnue::global_model().map(crate::nnue::NetworkState::new));
+                        let mut td = ThreadData::with_time_manager_and_nnue(
+                            &position,
+                            tm,
+                            Some(tt),
+                            Some(&mut worker_data.history),
+                            nnue,
+                        );
                         td.id = index;
                         td.multi_pv = worker_multi_pv;
                         td.thread_count = thread_count;
@@ -154,7 +171,8 @@ impl ThreadPool {
                             shared_ref.status.set(Status::STOPPED);
                         }
 
-                        worker_data.root_moves = td.root_moves;
+                        worker_data.nnue = td.nnue.take();
+                        worker_data.root_moves = std::mem::take(&mut td.root_moves);
                         worker_data.pv = pv;
                         worker_data.completed_depth = td.completed_depth;
                         worker_data.sel_depth = td.sel_depth;

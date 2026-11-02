@@ -1,6 +1,57 @@
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+static SPSA_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[inline(always)]
+pub fn is_spsa_active() -> bool {
+    SPSA_ACTIVE.load(Ordering::Relaxed)
+}
+
+pub fn set_spsa_active(active: bool) {
+    SPSA_ACTIVE.store(active, Ordering::Relaxed);
+}
+
 macro_rules! define {
     {$($type:ty, $name:ident: $value:expr; )*} => {
         $(pub const $name: $type = $value;)*
+
+        #[allow(non_upper_case_globals)]
+        pub mod tunables {
+            use super::*;
+            $(pub static $name: AtomicI64 = AtomicI64::new($value as i64);)*
+
+            pub fn reset_all() {
+                $($name.store(super::$name as i64, Ordering::Relaxed);)*
+            }
+
+            pub fn set_by_name(name: &str, value: i64) -> bool {
+                match name {
+                    $(stringify!($name) => {
+                        $name.store(value, Ordering::Relaxed);
+                        true
+                    })*
+                    _ => false,
+                }
+            }
+
+            pub fn get_by_name(name: &str) -> Option<i64> {
+                match name {
+                    $(stringify!($name) => Some($name.load(Ordering::Relaxed)),)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! param {
+    ($name:ident) => {
+        if $crate::parameters::is_spsa_active() {
+            $crate::parameters::tunables::$name.load(std::sync::atomic::Ordering::Relaxed) as _
+        } else {
+            $crate::parameters::$name
+        }
     };
 }
 
@@ -29,6 +80,7 @@ define! {
     i32, LMR_THREAT_BONUS: 749;
     i32, LMR_EXACT_BOUND_PENALTY: 982;
     i32, LMR_CHILD_CUTOFF_PENALTY: 1_050;
+    i32, LMR_CAUSAL_RED_PENALTY: 250;
 
     i32, LMR_PV_BIAS: -560;
     i32, LMR_CUT_BIAS: 2_140;
@@ -72,6 +124,7 @@ define! {
     i32, SEE_QUIET_QUAD_COEFF: -18;
     i32, SEE_NOISY_DEPTH_COEFF: -96;
     i32, SEE_NOISY_HIST_DIV: 100;
+    i32, SEE_KING_RING_SAC_SHIELD: 180;
 
     // Main-loop Futility Pruning constants on the 100 = 1 pawn / 10_000 = MAX_HISTORY scale.
     i32, FP_MAX_DEPTH: 1;
@@ -125,8 +178,7 @@ define! {
     i32, QS_FUTILITY_MARGIN: 205;
     i32, QS_SEE_FUTILITY_MARGIN: 300;
 
-    // Quiescence late-capture limit (maximum legal move index for unrelated
-    // non-promotion, non-checking captures when not in check).
+    // Quiescence late-capture limit.
     usize, QS_LATE_CAPTURE_LIMIT: 1;
 
     // Quiescence history-backed early fail-high margin on the 100 = 1 pawn scale.
@@ -139,9 +191,15 @@ define! {
     i32, QS_SEE_EVAL_DIV: 8;
     i32, QS_SEE_HIST_DIV: 50;
 
-    // Hindsight depth adjustment constants (1_000 = 1 ply, 100 = 1 pawn).
+    // Hindsight depth adjustment and compensation constants (1_000 = 1 ply, 100 = 1 pawn).
     i32, HINDSIGHT_EXT_MIN_REDUCTION: 2_000;
     i32, HINDSIGHT_REDUCTION_MARGIN: 95;
+    i32, HINDSIGHT_SAC_COMP_MIN: 90;
+
+    // Evaluation and compensation post-scaling constants on the 100 = 1 pawn scale.
+    i32, EVAL_SACRIFICE_PSQT_THRESHOLD: -80;
+    i32, EVAL_SACRIFICE_BOOST_DIV: 16;
+    i32, EVAL_FORTRESS_DISAGREE_MIN: 80;
 
     // Correction history constants on the 100 = 1 pawn scale.
     i32, CORRHIST_MAX: 1_024;
@@ -149,7 +207,7 @@ define! {
     i32, CORRHIST_BONUS_DIV: 8;
     i32, CORRHIST_MAX_BONUS: 256;
 
-    // Post-alpha-raise effective depth reduction minimum depth (keeps child_depth >= 1).
+    // Post-alpha-raise effective depth reduction minimum depth.
     u8,  ALPHA_REDUCE_MIN_DEPTH: 8;
 
     // Clear-cutoff history depth bonus margin on the 100 = 1 pawn scale.
@@ -168,6 +226,10 @@ define! {
     i32, QUIET_THREATENED_DEST_PENALTY: 8_000;
     i32, QUIET_CREATE_THREAT_BONUS: 3_500;
     i32, QUIET_WALL_PAWN_PENALTY: 4_000;
+    i32, QUIET_GREEDOID_UNBLOCK_BONUS: 750;
+    i32, QUIET_PHYSARUM_ARTERY_BONUS: 660;
+    i32, QUIET_OUTPOST_HOLE_BONUS: 800;
+    i32, QUIET_PETRI_OVERLOAD_BONUS: 923;
 
     i32, NOISY_BONUS_SCALE: 100;
     i32, NOISY_BONUS_CAP: 900;

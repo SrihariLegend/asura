@@ -13,7 +13,7 @@ pub(crate) const fn material_value(piece: PieceType) -> i32 {
 }
 
 /// Temporary material-only evaluation, in centipawns for the side to move.
-pub(crate) fn evaluate(board: &Board) -> i32 {
+pub fn evaluate(board: &Board) -> i32 {
     let side = board.side_to_move();
     let mut score = 0;
     for piece in [PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {

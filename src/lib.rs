@@ -6,8 +6,11 @@
 use std::{collections::VecDeque, io};
 
 pub mod board;
+pub mod evaluation;
 pub mod history;
 pub mod movepick;
+pub mod nnue;
+pub mod parameters;
 pub mod search;
 pub mod thread;
 pub mod threadpool;
@@ -16,9 +19,7 @@ pub mod tools;
 pub mod transposition;
 pub mod types;
 
-mod evaluation;
 mod lookup;
-mod parameters;
 mod setwise;
 mod stack;
 mod uci;

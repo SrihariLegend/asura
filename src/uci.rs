@@ -121,7 +121,11 @@ pub fn message_loop(commands: VecDeque<String>, mut input: impl BufRead, mut out
                     writeln!(output, "uciok")?;
                     use_stdin.store(true, Ordering::Release);
                 }
-                ["isready"] => writeln!(output, "readyok")?,
+                ["isready"] => {
+                    let _ = crate::nnue::global_model();
+                    let _ = crate::nnue::accumulator::tables();
+                    writeln!(output, "readyok")?;
+                }
                 ["ucinewgame"] => {
                     board = Board::starting_position();
                     board.set_frc(frc);
@@ -175,7 +179,11 @@ pub fn message_loop(commands: VecDeque<String>, mut input: impl BufRead, mut out
                 ["perft", ..] => writeln!(output, "info string Usage: perft <depth>")?,
                 ["d"] => writeln!(output, "{board}")?,
                 ["eval"] => {
-                    let cp = evaluate(&board);
+                    let cp = if let Some(params) = crate::nnue::global_model() {
+                        crate::nnue::NetworkState::new(params).evaluate_incremental(&board, 0)
+                    } else {
+                        evaluate(&board)
+                    };
                     writeln!(output, "info string Static evaluation: {cp} cp (side to move)")?;
                 }
                 ["bench", args @ ..] => match args {

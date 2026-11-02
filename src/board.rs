@@ -73,6 +73,11 @@ impl Board {
         self.halfmove_number / 2
     }
 
+    #[inline(always)]
+    pub const fn halfmove_number(&self) -> usize {
+        self.halfmove_number
+    }
+
     pub fn side_to_move(&self) -> Color {
         Color::new((self.halfmove_number & 1) as u8)
     }
@@ -220,6 +225,21 @@ impl Board {
 
     pub fn occupancies(&self) -> Bitboard {
         self.colors(Color::White) | self.colors(Color::Black)
+    }
+
+    #[inline(always)]
+    pub const fn pieces_array(&self) -> &[Bitboard; PieceType::NUM] {
+        &self.pieces
+    }
+
+    #[inline(always)]
+    pub const fn colors_array(&self) -> &[Bitboard; Color::NUM] {
+        &self.colors
+    }
+
+    #[inline(always)]
+    pub const fn mailbox_array(&self) -> &[Piece; Square::NUM] {
+        &self.mailbox
     }
 
     pub fn colored_pieces(&self, side: Color, piece_type: PieceType) -> Bitboard {

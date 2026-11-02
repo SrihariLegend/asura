@@ -131,43 +131,35 @@ const fn verification_key(hash: u64) -> VerificationKey {
 impl Cluster {
     const KEY_BITS: usize = 21;
     const KEY_MASK: u64 = (1 << Self::KEY_BITS) - 1;
-    // Bit 63 of keys is unused by the three 21-bit keys (3 * 21 = 63 bits)
-    // and serves as a per-cluster writer lock bit.
-    const LOCK_BIT: u64 = 1 << 63;
 
-    fn lock(&self) -> u64 {
-        loop {
-            let prev = self.keys.fetch_or(Self::LOCK_BIT, Ordering::Acquire);
-            if (prev & Self::LOCK_BIT) == 0 {
-                return prev;
-            }
-            std::hint::spin_loop();
-        }
+    #[inline(always)]
+    fn load_keys(&self) -> u64 {
+        self.keys.load(Ordering::Relaxed)
     }
 
-    fn unlock_with_key(&self, keys: u64, index: usize, key: VerificationKey) {
+    #[inline(always)]
+    fn store_key(&self, keys: u64, index: usize, key: VerificationKey) {
         let shift = index * Self::KEY_BITS;
         let mask = Self::KEY_MASK << shift;
-        let next = (keys & !Self::LOCK_BIT & !mask) | ((key.0 as u64) << shift);
-        self.keys.store(next, Ordering::Release);
+        let next = (keys & !mask) | ((key.0 as u64) << shift);
+        self.keys.store(next, Ordering::Relaxed);
     }
 
-    fn unlock(&self, keys: u64) {
-        self.keys.store(keys & !Self::LOCK_BIT, Ordering::Release);
-    }
-
+    #[inline(always)]
     fn load_entry(&self, index: usize) -> InternalEntry {
-        InternalEntry::from_u64(self.entries[index].load(Ordering::Acquire))
+        InternalEntry::from_u64(self.entries[index].load(Ordering::Relaxed))
     }
 
+    #[inline(always)]
     fn store_entry(&self, index: usize, entry: InternalEntry) {
-        self.entries[index].store(entry.to_u64(), Ordering::Release);
+        self.entries[index].store(entry.to_u64(), Ordering::Relaxed);
     }
 
+    #[inline(always)]
     const fn lookup_in_keys(keys: u64, key: VerificationKey) -> usize {
         let bits = 1 | (1 << Self::KEY_BITS) | (1 << (Self::KEY_BITS * 2));
         let needle = key.0 as u64 * bits;
-        let zeros = (keys & !Self::LOCK_BIT) ^ needle;
+        let zeros = keys ^ needle;
         let matches = zeros.wrapping_sub(bits) & !zeros & (bits << (Self::KEY_BITS - 1));
         matches.trailing_zeros() as usize / Self::KEY_BITS
     }
@@ -232,18 +224,13 @@ impl TranspositionTable {
             unsafe { &*self.ptr().add(index) }
         };
 
-        let keys1 = cluster.keys.load(Ordering::Acquire);
-        if (keys1 & Cluster::LOCK_BIT) != 0 {
-            return None;
-        }
-
+        let keys = cluster.load_keys();
         let key = verification_key(hash);
-        let slot = Cluster::lookup_in_keys(keys1, key);
+        let slot = Cluster::lookup_in_keys(keys, key);
 
         if slot < ENTRIES_PER_CLUSTER {
             let entry = cluster.load_entry(slot);
-            let keys2 = cluster.keys.load(Ordering::Acquire);
-            if keys1 == keys2 && entry.depth() != TtDepth::NONE {
+            if entry.depth() != TtDepth::NONE {
                 return Some(Entry {
                     depth: entry.depth(),
                     score: score_from_tt(entry.score as i32, ply, halfmove_clock),
@@ -271,9 +258,9 @@ impl TranspositionTable {
 
         let key = verification_key(hash);
         let tt_age = self.age();
-        let locked_keys = cluster.lock();
+        let cur_keys = cluster.load_keys();
 
-        let lookup_index = Cluster::lookup_in_keys(locked_keys, key);
+        let lookup_index = Cluster::lookup_in_keys(cur_keys, key);
         let (replacement_index, matched_occupied) =
             if lookup_index < ENTRIES_PER_CLUSTER && cluster.load_entry(lookup_index).depth() != TtDepth::NONE {
                 (lookup_index, true)
@@ -309,7 +296,6 @@ impl TranspositionTable {
             && entry.flags.age() == tt_age
         {
             cluster.store_entry(replacement_index, entry);
-            cluster.unlock(locked_keys);
             return;
         }
 
@@ -322,7 +308,7 @@ impl TranspositionTable {
         entry.raw_eval = raw_eval as i16;
         entry.flags = Flags::new(bound, tt_pv, tt_age);
         cluster.store_entry(replacement_index, entry);
-        cluster.unlock_with_key(locked_keys, replacement_index, key);
+        cluster.store_key(cur_keys, replacement_index, key);
     }
 
     pub fn prefetch(&self, hash: u64) {

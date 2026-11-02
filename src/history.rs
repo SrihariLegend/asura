@@ -209,6 +209,7 @@ impl Default for ContinuationHistory {
 
 pub struct CorrectionHistory {
     pawn: Box<[[i16; Self::SIZE]; 2]>,
+    shield: Box<[[i16; Self::SIZE]; 2]>,
     non_pawn: Box<[[[i16; Self::SIZE]; 2]; 2]>,
     cont_tables: Box<[Option<Box<PieceToHistory<i16>>>; CONT_KEYS]>,
     active_keys: Vec<u16>,
@@ -220,9 +221,37 @@ impl CorrectionHistory {
     const SIZE: usize = 16_384;
     const MASK: usize = Self::SIZE - 1;
 
+    /// Spatial 3x4 King-Shield Pawn Key salted with `CorrPhase` Heavy-Piece Regime (`AsuraBox5Search.lean` Theorem 2B).
+    /// Invariant under distant flank pawn moves outside the 3x4 King shelters!
+    #[inline]
+    pub fn king_shield_key(board: &Board) -> usize {
+        use crate::lookup::king_attacks;
+        let wk = board.king_square(Color::White);
+        let bk = board.king_square(Color::Black);
+        let w_ring = king_attacks(wk).0 | ((king_attacks(wk).0 & !0xFF00_0000_0000_0000) << 8) | (1u64 << (wk as u8));
+        let b_ring = king_attacks(bk).0 | ((king_attacks(bk).0 & !0x0000_0000_0000_00FF) >> 8) | (1u64 << (bk as u8));
+        let shield_mask = w_ring | b_ring;
+        let wp_shield = board.colored_pieces(Color::White, PieceType::Pawn).0 & shield_mask;
+        let bp_shield = board.colored_pieces(Color::Black, PieceType::Pawn).0 & shield_mask;
+        let corr_phase = ((!board.pieces(PieceType::Queen).is_empty() as u64) << 1)
+            | (!board.pieces(PieceType::Rook).is_empty() as u64);
+        let h = wp_shield
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ bp_shield.wrapping_mul(0xbf58_476d_1ce4_e5b9)
+            ^ (((wk as u64) | ((bk as u64) << 6) | (corr_phase << 12)).wrapping_mul(0x94d0_49bb_1331_11eb));
+        (h as usize) & Self::MASK
+    }
+
     pub fn get(&self, board: &Board, cont_hist: &ContinuationHistory, ply: usize) -> i32 {
         let stm = board.side_to_move();
-        let mut total = self.pawn[stm][board.pawn_key() as usize & Self::MASK] as i32
+        let g_pawn = self.pawn[stm][board.pawn_key() as usize & Self::MASK] as i32;
+        let pawn_corr = if crate::nnue::is_nnue_active() {
+            let s_pawn = self.shield[stm][Self::king_shield_key(board)] as i32;
+            if g_pawn == 0 { s_pawn / 2 } else { (g_pawn + s_pawn) / 2 }
+        } else {
+            g_pawn
+        };
+        let mut total = pawn_corr
             + self.non_pawn[Color::White][stm][board.non_pawn_key(Color::White) as usize & Self::MASK] as i32
             + self.non_pawn[Color::Black][stm][board.non_pawn_key(Color::Black) as usize & Self::MASK] as i32;
 
@@ -250,6 +279,7 @@ impl CorrectionHistory {
     pub fn update(&mut self, board: &Board, cont_hist: &ContinuationHistory, ply: usize, bonus: i32) {
         let stm = board.side_to_move();
         apply_bonus::<{ Self::MAX_HISTORY }>(&mut self.pawn[stm][board.pawn_key() as usize & Self::MASK], bonus);
+        apply_bonus::<{ Self::MAX_HISTORY }>(&mut self.shield[stm][Self::king_shield_key(board)], bonus);
         apply_bonus::<{ Self::MAX_HISTORY }>(
             &mut self.non_pawn[Color::White][stm][board.non_pawn_key(Color::White) as usize & Self::MASK],
             bonus,
@@ -296,6 +326,7 @@ impl CorrectionHistory {
     pub fn clear(&mut self) {
         unsafe {
             std::ptr::write_bytes(self.pawn.as_mut() as *mut _, 0, 1);
+            std::ptr::write_bytes(self.shield.as_mut() as *mut _, 0, 1);
             std::ptr::write_bytes(self.non_pawn.as_mut() as *mut _, 0, 1);
         }
         for &key in &self.active_keys {
@@ -309,6 +340,7 @@ impl Default for CorrectionHistory {
     fn default() -> Self {
         Self {
             pawn: zeroed_box(),
+            shield: zeroed_box(),
             non_pawn: zeroed_box(),
             cont_tables: Box::new([const { None }; CONT_KEYS]),
             active_keys: Vec::with_capacity(256),

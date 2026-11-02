@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use crate::{
+    param,
     parameters::*,
     types::{MAX_PLY, Move, Score, is_decisive},
 };
@@ -159,28 +160,36 @@ impl TimeManager {
             return TM_SCALE_UNIT as u64;
         }
 
+        let node_base: i64 = param!(TM_NODE_BASE);
+        let node_slope: i64 = param!(TM_NODE_SLOPE);
+        let stab_base: i64 = param!(TM_STABILITY_BASE);
+        let pv_step: i64 = param!(TM_PV_STABILITY_STEP);
+        let ev_step: i64 = param!(TM_EVAL_STABILITY_STEP);
+        let stab_floor: i64 = param!(TM_STABILITY_FLOOR);
+        let turn_step: i64 = param!(TM_TURNOVER_STEP);
+        let trend_slope: i64 = param!(TM_TREND_SLOPE_PERMILLE);
+
         // 1. Root node concentration.
         let total = state.total_nodes.max(1);
         let best_nodes = state.best_move_nodes.min(total);
         let frac = (best_nodes.saturating_mul(TM_SCALE_UNIT as u64) / total) as i64;
-        let node_factor = TM_NODE_BASE + (TM_NODE_SLOPE * (TM_SCALE_UNIT - frac)) / TM_SCALE_UNIT;
+        let node_factor = node_base + (node_slope * (TM_SCALE_UNIT - frac)) / TM_SCALE_UNIT;
 
         // 2. Cross-depth PV and evaluation stability.
         let pv_s = i64::from(state.pv_stability.clamp(0, TM_PV_STABILITY_MAX as i32));
         let ev_s = i64::from(state.eval_stability.clamp(0, TM_EVAL_STABILITY_MAX as i32));
-        let stability_factor = (TM_STABILITY_BASE - TM_PV_STABILITY_STEP * pv_s - TM_EVAL_STABILITY_STEP * ev_s)
-            .clamp(TM_STABILITY_FLOOR, TM_STABILITY_BASE);
+        let stability_factor = (stab_base - pv_step * pv_s - ev_step * ev_s).clamp(stab_floor, stab_base);
 
         // 3. Intra-search best-move turnover.
         let changes = (state.best_move_changes as i64).min(TM_TURNOVER_MAX);
-        let turnover_factor = TM_SCALE_UNIT + TM_TURNOVER_STEP * changes;
+        let turnover_factor = TM_SCALE_UNIT + turn_step * changes;
 
         // 4. Evaluation drop / crisis trend.
         let trend_factor = if state.prev_score == Score::NONE || is_decisive(state.prev_score) {
             TM_SCALE_UNIT
         } else {
             let diff = i64::from(state.prev_score - state.cur_score).clamp(TM_TREND_MIN_DIFF, TM_TREND_MAX_DIFF);
-            TM_SCALE_UNIT + (TM_TREND_SLOPE_PERMILLE * diff) / TM_SCALE_UNIT
+            TM_SCALE_UNIT + (trend_slope * diff) / TM_SCALE_UNIT
         };
 
         let combined_a = (node_factor * stability_factor) / TM_SCALE_UNIT;
