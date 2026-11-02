@@ -409,6 +409,7 @@ pub struct ThreadData<'a> {
     pub sel_depth: u16,
     pub completed_depth: u8,
     pub root_depth: u8,
+    pub optimism: [i32; 2],
     pub stopped: bool,
     pub tt: Option<&'a TranspositionTable>,
     pub history: Option<&'a mut HistoryTables>,
@@ -457,6 +458,7 @@ impl<'a> ThreadData<'a> {
             sel_depth: 0,
             completed_depth: 0,
             root_depth: 0,
+            optimism: [0; 2],
             stopped: false,
             tt,
             history,
@@ -468,7 +470,8 @@ impl<'a> ThreadData<'a> {
     #[inline]
     pub fn evaluate(&mut self) -> (i32, i32) {
         if let Some(ref mut net) = self.nnue {
-            let (ev, psqt, _) = net.evaluate_with_components(&self.board, 0);
+            let opt = self.optimism[self.board.side_to_move() as usize];
+            let (ev, psqt, _) = net.evaluate_with_components(&self.board, opt);
             (ev, psqt)
         } else {
             let ev = crate::evaluation::evaluate(&self.board);

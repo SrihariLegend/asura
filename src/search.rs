@@ -396,6 +396,15 @@ fn run_iterative_search<const CFG: u32>(
 
         for pv_idx in 0..multi_pv {
             let prev_score = td.root_moves.aspiration_previous_score(pv_idx);
+            let root_stm = td.board.side_to_move() as usize;
+            if prev_score.average != -INFINITY {
+                let avg = prev_score.average;
+                let opt = (113 * avg) / (avg.abs() + 201);
+                td.optimism[root_stm] = opt;
+                td.optimism[root_stm ^ 1] = -opt;
+            } else {
+                td.optimism = [0; 2];
+            }
             let mut window = AspirationWindow::new(step, prev_score, eval_stability, pv_stability);
             let mut aspiration_depth = step;
             let mut root_pv_move = td.root_moves.at(pv_idx).mv;

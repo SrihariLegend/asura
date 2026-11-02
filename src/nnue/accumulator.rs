@@ -284,7 +284,7 @@ pub fn evaluate_pawn_king_subnet<'a>(
     let own_ksq = board.king_square(stm) as usize;
     let opp_ksq = board.king_square(!stm) as usize;
 
-    let mut active = [0usize; 64];
+    let mut active = [0usize; 128];
     let mut n_act = 0usize;
 
     let mut b = own_p;
