@@ -1,5 +1,5 @@
 fn main() -> std::io::Result<()> {
-    if asura::nnue::global_model().is_none() {
+    if std::env::var_os("ASURA_NNUE_PATH").is_none() && asura::nnue::global_model().is_none() {
         let exe_nnue = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("asura_atn1.nnue")));

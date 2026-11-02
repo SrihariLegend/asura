@@ -7,6 +7,7 @@ use std::{
 
 fn exchange(commands: &str) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_asura"))
+        .env("ASURA_NNUE_PATH", "")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
