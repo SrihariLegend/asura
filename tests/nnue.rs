@@ -76,23 +76,28 @@ fn gate1_nnperft_incremental_and_avx2_match_scalar_refresh_across_all_move_types
     }
 
     // Also test Chess960 castling (King on f1, Rook on g1 swapping squares!)
-    let mut frc_board = Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQK1RN w Gkq - 0 1").unwrap();
+    let mut frc_board = Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQ1KRN w Gkq - 0 1").unwrap();
+    assert!(
+        frc_board.generate_all_moves().iter().any(|mv| {
+            mv.is_castling() && mv.from() == asura::types::Square::F1 && mv.to() == asura::types::Square::G1
+        }),
+        "the fixture must actually exercise the king/rook swap"
+    );
     verify_nnperft_tree(&mut frc_board, 2, &mut inc_net, &mut ref_net, &mut total_checked);
 
     assert!(total_checked > 5_000, "Expected >5,000 verified nnperft nodes, got {total_checked}");
 }
 
+// This validates an external inference oracle, not the production trainer's
+// forward/gradient/export path. Missing fixtures must never count as a pass.
 #[test]
-fn gate2_trainer_to_engine_bit_identity_lock_across_10000_positions() {
+#[ignore = "requires ASURA_GATE2_MODEL, ASURA_GATE2_ORACLE and ASURA_GATE2_DATA; run explicitly with --ignored"]
+fn gate2_external_oracle_matches_engine_across_10000_positions() {
     use asura::nnue::PackedBoard;
-    use std::path::Path;
 
-    let nnue_path = Path::new("/tmp/gate2_oracle.nnue");
-    let oracle_path = Path::new("/tmp/gate2_oracle_10k.bin");
-    let data_path = Path::new("/home/tom/.cache/asura_spsa/nnue_lab/datasets/asura_bt4_64m.bin");
-    if !nnue_path.exists() || !oracle_path.exists() || !data_path.exists() {
-        return;
-    }
+    let nnue_path = std::env::var("ASURA_GATE2_MODEL").expect("set ASURA_GATE2_MODEL to the oracle checkpoint");
+    let oracle_path = std::env::var("ASURA_GATE2_ORACLE").expect("set ASURA_GATE2_ORACLE to 10,000 little-endian i32 evaluations");
+    let data_path = std::env::var("ASURA_GATE2_DATA").expect("set ASURA_GATE2_DATA to the corresponding PackedBoard records");
 
     let params = Arc::new(ModelParameters::load_from_file(nnue_path).expect("Load Gate 2 .nnue checkpoint"));
     let mut inc_net = NetworkState::new(params.clone());
@@ -130,12 +135,8 @@ fn gate2_trainer_to_engine_bit_identity_lock_across_10000_positions() {
 #[test]
 fn gate3_trained_atn1_network_sanity_and_compensation_audit() {
     use std::path::Path;
-    let nnue_path = Path::new("/home/tom/dev/personal/asura/asura_atn1.nnue");
-    if !nnue_path.exists() {
-        return;
-    }
-
-    let params = Arc::new(ModelParameters::load_from_file(nnue_path).expect("Load trained ATN-1 .nnue"));
+    let nnue_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("asura_atn1.nnue");
+    let params = Arc::new(ModelParameters::load_from_file(&nnue_path).expect("Load bundled ATN-1 .nnue"));
     let mut net = NetworkState::new(params);
 
     let start_b = Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();

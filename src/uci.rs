@@ -11,7 +11,7 @@ use crate::{
     board::Board,
     evaluation::evaluate,
     parameters::DEFAULT_MOVE_OVERHEAD_MS,
-    search::{MATE_SCORE, MATE_THRESHOLD, search_with_context},
+    search::{MATE_SCORE, MATE_THRESHOLD},
     thread::{SharedContext, Status},
     threadpool::ThreadPool,
     time::{Limits, TimeManager},
@@ -199,12 +199,6 @@ pub fn message_loop(commands: VecDeque<String>, mut input: impl BufRead, mut out
                     _ => writeln!(output, "info string Usage: bench [depth]")?,
                 },
                 ["go", tokens @ ..] => match parse_go(&board, tokens, move_overhead_ms) {
-                    Ok(ParsedGo::FixedDepth(depth)) if threads.len() == 1 && multi_pv == 1 => {
-                        threads.prepare_search(&tt, false, &shared);
-                        let _ = ack_tx.send(());
-                        acked = true;
-                        go_fixed_depth(&board, &tt, &shared, &mut threads, depth, &mut output)?;
-                    }
                     Ok(ParsedGo::FixedDepth(depth)) => {
                         let tm = TimeManager::new(Limits::Depth(depth), board.fullmove_number(), move_overhead_ms);
                         threads.prepare_search(&tt, false, &shared);
@@ -475,20 +469,6 @@ fn format_uci_score(score: i32) -> String {
     }
 }
 
-fn go_fixed_depth(
-    board: &Board, tt: &TranspositionTable, shared: &Arc<SharedContext>, threads: &mut ThreadPool, depth: u8,
-    output: &mut impl Write,
-) -> io::Result<()> {
-    tt.increment_age();
-    let result = search_with_context(board, depth, tt, &mut threads.main_thread().history);
-    shared.status.set(Status::STOPPED);
-    let score = format_uci_score(result.score);
-    writeln!(output, "info depth {depth} score {score} nodes {}", result.nodes)?;
-
-    let best_move = result.best_move.map(|mv| mv.to_uci(board)).unwrap_or_else(|| "0000".to_string());
-    writeln!(output, "bestmove {best_move}")
-}
-
 #[allow(clippy::too_many_arguments)]
 fn go_managed(
     board: &Board, tt: &TranspositionTable, shared: &Arc<SharedContext>, threads: &mut ThreadPool, tm: TimeManager,
@@ -499,7 +479,9 @@ fn go_managed(
     let best_idx = threads.select_best_thread(limits);
     let total_nodes = if threads.len() > 1 { shared.nodes.aggregate() } else { threads[best_idx].nodes };
     let worker = &threads[best_idx];
-    let depth = worker.completed_depth.max(report_depth);
+    // Terminal/drawn roots finish without an iteration. Otherwise report the
+    // completed iteration, not a requested depth that a limit/stop prevented.
+    let depth = if worker.nodes == 0 { report_depth } else { worker.completed_depth };
 
     if multi_pv > 1 && !worker.root_moves.is_empty() {
         let count = multi_pv.min(worker.root_moves.records.len());

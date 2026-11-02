@@ -8,6 +8,9 @@ pub use threats::{
     pawn_pair_row_index, tables, threat_row_index,
 };
 
+#[cfg(not(target_feature = "avx2"))]
+use crate::nnue::PK_HIDDEN;
+
 use crate::{
     board::Board,
     nnue::{Aligned, L1_SIZE, L2_SIZE, ModelParameters, PK_CACHE_SIZE, PSQT_BUCKETS},

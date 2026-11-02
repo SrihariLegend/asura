@@ -1,0 +1,2 @@
+# Unified diffs require a space on otherwise empty context lines.
+docs/trainer-contract.patch whitespace=-blank-at-eol

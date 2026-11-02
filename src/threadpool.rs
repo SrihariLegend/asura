@@ -1,12 +1,8 @@
 use std::{
     collections::HashMap,
     ops::{Index, IndexMut},
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::Ordering,
-        mpsc::{Receiver, SyncSender},
-    },
-    thread::Scope,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    sync::{Arc, Condvar, Mutex, atomic::Ordering, mpsc::SyncSender},
 };
 
 use crate::{
@@ -136,61 +132,69 @@ impl ThreadPool {
         shared: &Arc<SharedContext>,
     ) {
         let thread_count = self.vector.len();
-        std::thread::scope(|scope| {
-            let mut handlers = Vec::with_capacity(thread_count);
-            for (index, (worker_data, worker_thread)) in self.vector.iter_mut().zip(self.workers.iter()).enumerate() {
-                let tm = time_manager.clone();
-                let shared_ref = Arc::clone(shared);
-                let position = board.clone();
-                let worker_multi_pv = if index == 0 { multi_pv } else { 1 };
+        let mut handlers = Vec::with_capacity(thread_count);
+        // Declared AFTER handlers: on unwind, stop infinite searches before their
+        // handles wait. Each search also stops its siblings if it panics.
+        let _stop_on_unwind = StopSearchOnUnwind(shared);
+        for (index, (worker_data, worker_thread)) in self.vector.iter_mut().zip(self.workers.iter()).enumerate() {
+            let tm = time_manager.clone();
+            let shared_ref = Arc::clone(shared);
+            let position = board.clone();
+            let worker_multi_pv = if index == 0 { multi_pv } else { 1 };
 
-                handlers.push(scope.spawn_into(
-                    move || {
-                        worker_data.id = index;
-                        worker_data.multi_pv = worker_multi_pv;
-                        let mut nnue = worker_data
-                            .nnue
-                            .take()
-                            .or_else(|| crate::nnue::global_model().map(crate::nnue::NetworkState::new));
-                        if let Some(ref mut net) = nnue {
-                            net.clear_pending_snaps();
-                        }
-                        let mut td = ThreadData::with_time_manager_and_nnue(
-                            &position,
-                            tm,
-                            Some(tt),
-                            Some(&mut worker_data.history),
-                            nnue,
-                        );
-                        td.id = index;
-                        td.multi_pv = worker_multi_pv;
-                        td.thread_count = thread_count;
-                        td.shared = Some(&shared_ref);
+            // SAFETY: Every submitted task's handle is immediately owned by this
+            // preallocated vector; none is exposed, forgotten, or moved out. Both
+            // normal joins and Vec's unwind cleanup wait for ALL tasks. The stop
+            // guard runs before that cleanup. The borrowed tt and disjoint
+            // worker_data entries remain valid until execute_searches returns.
+            handlers.push(unsafe {
+                worker_thread.dispatch_borrowed(move || {
+                    let _stop_on_unwind = StopSearchOnUnwind(&shared_ref);
+                    worker_data.id = index;
+                    worker_data.multi_pv = worker_multi_pv;
+                    let mut nnue = worker_data
+                        .nnue
+                        .take()
+                        .or_else(|| crate::nnue::global_model().map(crate::nnue::NetworkState::new));
+                    if let Some(ref mut net) = nnue {
+                        net.clear_pending_snaps();
+                    }
+                    let mut td = ThreadData::with_time_manager_and_nnue(
+                        &position,
+                        tm,
+                        Some(tt),
+                        Some(&mut worker_data.history),
+                        nnue,
+                    );
+                    td.id = index;
+                    td.multi_pv = worker_multi_pv;
+                    td.thread_count = thread_count;
+                    td.shared = Some(&shared_ref);
 
-                        let mut pv = PvLine::new();
-                        let (score, best_move) = start_worker_search(&mut td, &mut pv);
-                        if index == 0 {
-                            shared_ref.status.set(Status::STOPPED);
-                        }
+                    let mut pv = PvLine::new();
+                    let (score, best_move) = start_worker_search(&mut td, &mut pv);
+                    if index == 0 {
+                        shared_ref.status.set(Status::STOPPED);
+                    }
 
-                        worker_data.nnue = td.nnue.take();
-                        worker_data.root_moves = std::mem::take(&mut td.root_moves);
-                        worker_data.pv = pv;
-                        worker_data.completed_depth = td.completed_depth;
-                        worker_data.sel_depth = td.sel_depth;
-                        worker_data.nodes = td.nodes;
-                        worker_data.score = score;
-                        worker_data.best_move = best_move;
-                        worker_data.previous_best_score = score;
-                    },
-                    worker_thread,
-                ));
-            }
+                    worker_data.nnue = td.nnue.take();
+                    worker_data.root_moves = std::mem::take(&mut td.root_moves);
+                    worker_data.pv = pv;
+                    worker_data.completed_depth = td.completed_depth;
+                    worker_data.sel_depth = td.sel_depth;
+                    worker_data.nodes = td.nodes;
+                    worker_data.score = score;
+                    worker_data.best_move = best_move;
+                    worker_data.previous_best_score = score;
+                })
+            });
+        }
 
-            for handler in handlers {
-                handler.join();
-            }
-        });
+        // Borrow the handles: a panicking join must leave the remaining handles
+        // in the vector, whose Drop waits after the stop guard runs.
+        for handler in &mut handlers {
+            handler.join();
+        }
         shared.status.set(Status::STOPPED);
         shared.infinite_search.store(false, Ordering::Release);
     }
@@ -277,11 +281,29 @@ impl IndexMut<usize> for ThreadPool {
     }
 }
 
+// Used at both the dispatch/join boundary and inside each search job. This
+// changes only panic cleanup; normal search stop conditions are unchanged.
+struct StopSearchOnUnwind<'a>(&'a SharedContext);
+
+impl Drop for StopSearchOnUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.infinite_search.store(false, Ordering::Release);
+            self.0.status.set(Status::STOPPED);
+        }
+    }
+}
+
 type WorkTask = Box<dyn FnOnce() + Send>;
+
+struct WorkItem {
+    task: WorkTask,
+    completion: Arc<JobCompletion>,
+}
 
 pub struct WorkerThread {
     handle: std::thread::JoinHandle<()>,
-    comms: WorkSender,
+    comms: SyncSender<WorkItem>,
 }
 
 impl WorkerThread {
@@ -289,86 +311,94 @@ impl WorkerThread {
         drop(self.comms);
         self.handle.join().expect("Worker thread panicked");
     }
-}
 
-struct WorkSender {
-    sender: SyncSender<WorkTask>,
-    completion_signal: Arc<(Mutex<bool>, Condvar)>,
-}
-
-struct WorkReceiver {
-    receiver: Receiver<WorkTask>,
-    completion_signal: Arc<(Mutex<bool>, Condvar)>,
-}
-
-fn make_work_channel() -> (WorkSender, WorkReceiver) {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(0);
-    let completion_signal = Arc::new((Mutex::new(false), Condvar::new()));
-    (
-        WorkSender { sender, completion_signal: Arc::clone(&completion_signal) },
-        WorkReceiver { receiver, completion_signal },
-    )
-}
-
-pub struct ReceiverHandle<'scope> {
-    completion_signal: &'scope Arc<(Mutex<bool>, Condvar)>,
-    received: bool,
-}
-
-impl ReceiverHandle<'_> {
-    pub fn join(mut self) {
-        let (lock, cvar) = &**self.completion_signal;
-        let mut completed = lock.lock().unwrap();
-        while !*completed {
-            completed = cvar.wait(completed).unwrap();
-        }
-        drop(completed);
-        self.received = true;
-    }
-}
-
-impl Drop for ReceiverHandle<'_> {
-    fn drop(&mut self) {
-        assert!(self.received, "ReceiverHandle was dropped without receiving a value");
-    }
-}
-
-pub trait ScopeExt<'scope, 'env> {
-    fn spawn_into<F>(&'scope self, f: F, comms: &'scope WorkerThread) -> ReceiverHandle<'scope>
+    /// Submit a borrowing job to a persistent OS worker.
+    ///
+    /// # Safety
+    /// The caller MUST join or drop the returned handle before ANY captured
+    /// borrow expires, including on unwind. It must never forget/leak the handle
+    /// or let it escape to user code. This is NOT registered with std::thread::Scope.
+    /// Only execute_searches calls this in production; its local, owned vector
+    /// of join-on-Drop handles enforces this contract on every return path.
+    unsafe fn dispatch_borrowed<'job, F>(&self, f: F) -> JobHandle
     where
-        F: FnOnce() + Send + 'scope;
-}
-
-impl<'scope, 'env> ScopeExt<'scope, 'env> for Scope<'scope, 'env> {
-    fn spawn_into<F>(&'scope self, f: F, thread: &'scope WorkerThread) -> ReceiverHandle<'scope>
-    where
-        F: FnOnce() + Send + 'scope,
+        F: FnOnce() + Send + 'job,
     {
-        // Safety: ReceiverHandle::join waits for completion before 'scope ends.
-        let f = unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + 'scope>, WorkTask>(Box::new(f)) };
-        {
-            let (lock, _) = &*thread.comms.completion_signal;
-            let mut completed = lock.lock().unwrap();
-            *completed = false;
+        let completion = Arc::new(JobCompletion::default());
+        // SAFETY: The caller's must-join contract, not a standard Scope, keeps
+        // the captures alive until the closure (including its captures) is gone.
+        let task = unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + 'job>, WorkTask>(Box::new(f)) };
+        let work = WorkItem { task, completion: Arc::clone(&completion) };
+        if let Err(unsent) = self.comms.send(work) {
+            // No task was accepted. Drop its captures here, without constructing
+            // a handle that would wait for a completion nobody can signal.
+            drop(unsent);
+            panic!("Failed to send task to worker thread");
         }
-        thread.comms.sender.send(f).expect("Failed to send task to worker thread");
-        ReceiverHandle {
-            completion_signal: &thread.comms.completion_signal,
-            received: false,
+        // No fallible operation between successful submission and guard ownership.
+        JobHandle { completion: Some(completion) }
+    }
+}
+
+#[derive(Default)]
+struct JobCompletion {
+    result: Mutex<Option<std::thread::Result<()>>>,
+    ready: Condvar,
+}
+
+impl JobCompletion {
+    fn finish(&self, result: std::thread::Result<()>) {
+        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+        self.ready.notify_one();
+    }
+
+    fn wait(&self) -> std::thread::Result<()> {
+        let mut result = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(result) = result.take() {
+                return result;
+            }
+            result = self.ready.wait(result).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+// Private and never handed to callers of a safe borrowing API. Each handle
+// owns one job's completion, not a worker-wide flag that another job can satisfy.
+struct JobHandle {
+    completion: Option<Arc<JobCompletion>>,
+}
+
+impl JobHandle {
+    fn join(&mut self) {
+        if let Some(completion) = self.completion.take()
+            && let Err(payload) = completion.wait()
+        {
+            resume_unwind(payload);
+        }
+    }
+}
+
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        if let Some(completion) = self.completion.take()
+            && let Err(payload) = completion.wait()
+        {
+            // Even dropping a user panic payload can panic. Implicit cleanup
+            // must finish waiting for all other jobs, never double-panic.
+            std::mem::forget(payload);
         }
     }
 }
 
 fn make_worker_thread() -> WorkerThread {
-    let (sender, receiver) = make_work_channel();
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<WorkItem>(0);
     let handle = std::thread::spawn(move || {
-        while let Ok(work) = receiver.receiver.recv() {
-            work();
-            let (lock, cvar) = &*receiver.completion_signal;
-            let mut completed = lock.lock().unwrap();
-            *completed = true;
-            drop(completed);
-            cvar.notify_one();
+        while let Ok(WorkItem { task, completion }) = receiver.recv() {
+            // Catch both task panics and capture-destructor panics. Publish only
+            // after the closure has been consumed; the OS worker stays reusable.
+            let result = catch_unwind(AssertUnwindSafe(task));
+            completion.finish(result);
         }
     });
     WorkerThread { handle, comms: sender }
@@ -421,3 +451,6 @@ mod tests {
         assert_eq!(pool.select_best_thread(Limits::Nodes(10_000)), 2);
     }
 }
+
+#[cfg(test)]
+mod worker_tests;

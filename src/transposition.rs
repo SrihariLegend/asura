@@ -131,18 +131,16 @@ const fn verification_key(hash: u64) -> VerificationKey {
 impl Cluster {
     const KEY_BITS: usize = 21;
     const KEY_MASK: u64 = (1 << Self::KEY_BITS) - 1;
+    const LOCK: u64 = 1 << 63;
 
     #[inline(always)]
-    fn load_keys(&self) -> u64 {
-        self.keys.load(Ordering::Relaxed)
-    }
-
-    #[inline(always)]
-    fn store_key(&self, keys: u64, index: usize, key: VerificationKey) {
-        let shift = index * Self::KEY_BITS;
-        let mask = Self::KEY_MASK << shift;
-        let next = (keys & !mask) | ((key.0 as u64) << shift);
-        self.keys.store(next, Ordering::Relaxed);
+    fn try_lock(&self) -> Option<LockedCluster<'_>> {
+        let keys = self.keys.load(Ordering::Relaxed);
+        if keys & Self::LOCK != 0 {
+            return None;
+        }
+        self.keys.compare_exchange(keys, keys | Self::LOCK, Ordering::Acquire, Ordering::Relaxed).ok()?;
+        Some(LockedCluster { cluster: self, keys })
     }
 
     #[inline(always)]
@@ -162,6 +160,28 @@ impl Cluster {
         let zeros = keys ^ needle;
         let matches = zeros.wrapping_sub(bits) & !zeros & (bits << (Self::KEY_BITS - 1));
         matches.trailing_zeros() as usize / Self::KEY_BITS
+    }
+}
+
+// A signature and its payload must be observed/published together. Serializing
+// writers also prevents one slot's packed-key update from reverting another's.
+// The cache may miss/drop a write on contention; readers and writers never spin.
+struct LockedCluster<'a> {
+    cluster: &'a Cluster,
+    keys: u64,
+}
+
+impl LockedCluster<'_> {
+    fn set_key(&mut self, index: usize, key: VerificationKey) {
+        let shift = index * Cluster::KEY_BITS;
+        let mask = Cluster::KEY_MASK << shift;
+        self.keys = (self.keys & !mask) | ((key.0 as u64) << shift);
+    }
+}
+
+impl Drop for LockedCluster<'_> {
+    fn drop(&mut self) {
+        self.cluster.keys.store(self.keys, Ordering::Release);
     }
 }
 
@@ -224,18 +244,19 @@ impl TranspositionTable {
             unsafe { &*self.ptr().add(index) }
         };
 
-        let keys = cluster.load_keys();
+        let locked = cluster.try_lock()?;
         let key = verification_key(hash);
-        let slot = Cluster::lookup_in_keys(keys, key);
+        let slot = Cluster::lookup_in_keys(locked.keys, key);
 
         if slot < ENTRIES_PER_CLUSTER {
             let entry = cluster.load_entry(slot);
             if entry.depth() != TtDepth::NONE {
+                let score = score_from_tt(entry.score as i32, ply, halfmove_clock);
                 return Some(Entry {
                     depth: entry.depth(),
-                    score: score_from_tt(entry.score as i32, ply, halfmove_clock),
+                    score,
                     raw_eval: entry.raw_eval as i32,
-                    bound: entry.flags.bound(),
+                    bound: if score == Score::NONE { Bound::None } else { entry.flags.bound() },
                     tt_pv: entry.flags.tt_pv(),
                     mv: entry.mv,
                 });
@@ -256,11 +277,11 @@ impl TranspositionTable {
             unsafe { &*self.ptr().add(index) }
         };
 
+        let Some(mut locked) = cluster.try_lock() else { return };
         let key = verification_key(hash);
         let tt_age = self.age();
-        let cur_keys = cluster.load_keys();
 
-        let lookup_index = Cluster::lookup_in_keys(cur_keys, key);
+        let lookup_index = Cluster::lookup_in_keys(locked.keys, key);
         let (replacement_index, matched_occupied) =
             if lookup_index < ENTRIES_PER_CLUSTER && cluster.load_entry(lookup_index).depth() != TtDepth::NONE {
                 (lookup_index, true)
@@ -308,7 +329,7 @@ impl TranspositionTable {
         entry.raw_eval = raw_eval as i16;
         entry.flags = Flags::new(bound, tt_pv, tt_age);
         cluster.store_entry(replacement_index, entry);
-        cluster.store_key(cur_keys, replacement_index, key);
+        locked.set_key(replacement_index, key);
     }
 
     pub fn prefetch(&self, hash: u64) {
@@ -353,14 +374,17 @@ const fn score_from_tt(score: i32, ply: isize, halfmove_clock: u8) -> i32 {
 
     if score >= Score::MATE_IN_MAX {
         if Score::MATE - score > 100 - halfmove_clock as i32 {
-            return Score::MATE_IN_MAX - 1;
+            // The line may contain a clock-resetting move, so it is not known
+            // lost; equally, a different clock may invalidate the cached mate.
+            // Neither case licenses inventing a new Exact/cutoff score.
+            return Score::NONE;
         }
         return score - ply as i32;
     }
 
     if score <= -Score::MATE_IN_MAX {
         if Score::MATE + score > 100 - halfmove_clock as i32 {
-            return -Score::MATE_IN_MAX + 1;
+            return Score::NONE;
         }
         return score + ply as i32;
     }

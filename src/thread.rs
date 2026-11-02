@@ -6,7 +6,7 @@ use crate::{
     parameters::*,
     stack::Stack,
     time::{Limits, TimeManager},
-    transposition::TranspositionTable,
+    transposition::{Entry, TranspositionTable},
     types::{MAX_MOVES, MAX_PLY, Move, Score},
 };
 
@@ -467,6 +467,18 @@ impl<'a> ThreadData<'a> {
         }
     }
 
+    pub(crate) fn tt_entry(&self, ply: u16) -> Option<Entry> {
+        let mut entry = self.tt?.read(self.board.hash(), self.board.fiftymove_clock(), ply as isize)?;
+        // The hash buckets several halfmove clocks together. NNUE raw_eval
+        // already includes rule-50 damping, but the entry has no exact clock.
+        // Only the first bucket is wholly before damping can start; otherwise
+        // keep the move/bound and refresh evaluation for the current position.
+        if self.nnue.is_some() && self.board.fiftymove_clock_bucket() != 0 {
+            entry.raw_eval = Score::NONE;
+        }
+        Some(entry)
+    }
+
     #[inline]
     pub fn evaluate(&mut self) -> (i32, i32) {
         if let Some(ref mut net) = self.nnue {
@@ -480,7 +492,11 @@ impl<'a> ThreadData<'a> {
 
     #[inline]
     pub fn evaluate_psqt_only(&mut self) -> i32 {
-        crate::evaluation::evaluate(&self.board)
+        if let Some(ref mut net) = self.nnue {
+            net.evaluate_psqt_only(&self.board)
+        } else {
+            crate::evaluation::evaluate(&self.board)
+        }
     }
 
     #[inline]

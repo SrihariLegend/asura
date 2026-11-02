@@ -4,6 +4,22 @@ use asura::{
 };
 
 #[test]
+fn a_reported_mate_pv_includes_the_quiescence_continuation() {
+    for fen in ["7k/8/5K2/8/8/8/3Q4/8 w - - 0 1", "8/3q4/8/8/8/5k2/8/7K b - - 0 1"] {
+        let board = Board::from_fen(fen).unwrap();
+        let result = search_with_zero_draws(&board, 1);
+        assert_eq!(result.score, 31_997);
+        assert_eq!(result.pv().len(), 3);
+        let mut child = board.clone();
+        for &mv in result.pv() {
+            assert!(child.is_legal(mv));
+            child.make_move(mv);
+        }
+        assert!(child.in_check() && !child.has_legal_moves());
+    }
+}
+
+#[test]
 fn checked_nodes_cannot_stand_pat_or_drop_their_only_evasion_type() {
     let board = Board::from_fen("6rk/8/8/8/8/8/8/6K1 w - - 0 1").unwrap();
     assert!(board.in_check());

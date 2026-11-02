@@ -1,7 +1,7 @@
 use asura::{
     board::Board,
-    search::{MATE_SCORE, MATE_THRESHOLD, search_with_tt},
-    transposition::{Bound, TranspositionTable, TtDepth},
+    search::{MATE_SCORE, search_with_tt},
+    transposition::{Bound, Entry, TranspositionTable, TtDepth},
     types::{Move, MoveKind, Square},
 };
 
@@ -63,7 +63,7 @@ fn stores_and_reads_entries_across_depth_tiers_while_preserving_incumbent_moves(
 }
 
 #[test]
-fn normalizes_mate_scores_by_ply_and_downgrades_fifty_move_invalidated_mates() {
+fn normalizes_mate_scores_by_ply_and_discards_clock_incompatible_bounds() {
     let tt = TranspositionTable::new(1);
     let board = Board::starting_position();
     let hash = board.hash();
@@ -77,10 +77,19 @@ fn normalizes_mate_scores_by_ply_and_downgrades_fifty_move_invalidated_mates() {
     assert_eq!(tt.read(hash, 0, 2).unwrap().score, MATE_SCORE - 6);
     assert_eq!(tt.read(hash, 0, 5).unwrap().score, MATE_SCORE - 9);
 
-    // When halfmove_clock = 97, only 3 plies remain before the 50-move draw,
-    // which is fewer than the 4 plies to mate stored in the entry: downgrade!
-    let downgraded = tt.read(hash, 97, 2).unwrap().score;
-    assert_eq!(downgraded, MATE_THRESHOLD - 1);
+    // Four plies still fit at clock 96, including a mate on the 100th halfmove.
+    assert_eq!(tt.read(hash, 96, 2).unwrap().score, node_score);
+    // At 97 the cached line may no longer fit. Without knowing its zeroing
+    // moves, discard the bound rather than manufacture a non-mate Exact score.
+    for sign in [-1, 1] {
+        tt.write(hash, 5, 12, sign * node_score, Bound::Exact, Move::NULL, 2, true, true);
+        for ply in [0, 2, 5] {
+            let incompatible = tt.read(hash, 97, ply).unwrap();
+            assert_eq!(incompatible.score, TtDepth::NONE_SCORE);
+            assert_eq!(incompatible.bound, Bound::None);
+            assert_eq!(incompatible.raw_eval, 12);
+        }
+    }
 }
 
 #[test]
@@ -97,6 +106,83 @@ fn warm_transposition_table_accelerates_repeated_search_without_changing_tactics
     assert_eq!(warm.score, 31_997);
     assert_eq!(warm.best_move.unwrap().to_uci(&board), "d2h6");
     assert!(warm.nodes < cold.nodes, "warm TT should reduce searched nodes ({} vs {})", warm.nodes, cold.nodes);
+}
+
+#[test]
+fn concurrent_cluster_replacement_never_returns_another_keys_payload() {
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    // Distinct verification signatures, all in cluster zero. Four keys compete
+    // for three slots, exercising replacement as well as concurrent updates.
+    let keys = [0x11111, 0x22222, 0x33333, 0x44444];
+    let expected: [Entry; 4] = std::array::from_fn(|i| Entry {
+        mv: Move::new(Square::new(i as u8 + 8), Square::new(i as u8 + 24), MoveKind::Normal),
+        score: 1000 + 100 * i as i32,
+        raw_eval: -1000 - 100 * i as i32,
+        depth: 10 + i as i32,
+        bound: [Bound::Exact, Bound::Lower, Bound::Upper, Bound::Exact][i],
+        tt_pv: i % 2 == 0,
+    });
+    let tt = TranspositionTable::new(1);
+    let barrier = Barrier::new(4);
+    let hits = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for thread in 0..4 {
+            let (tt, barrier, hits, expected, keys) = (&tt, &barrier, &hits, &expected, &keys);
+            scope.spawn(move || {
+                barrier.wait();
+                for iteration in 0..20_000 {
+                    let i = (iteration + thread) % keys.len();
+                    let e = expected[i];
+                    tt.write(keys[i], e.depth, e.raw_eval, e.score, e.bound, e.mv, 0, e.tt_pv, true);
+                    for j in 0..keys.len() {
+                        if let Some(entry) = tt.read(keys[j], 0, 0) {
+                            hits.fetch_add(1, Ordering::Relaxed);
+                            assert_eq!(entry, expected[j], "wrong payload for key {:x}", keys[j]);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    assert!(hits.load(Ordering::Relaxed) > 1000, "the stress test must actually read entries");
+}
+
+#[test]
+fn cross_clock_mates_and_zeroing_mates_never_become_fake_exact_scores() {
+    for zeroing in [false, true] {
+        let tt = TranspositionTable::new(1);
+        let (from, to) = if zeroing {
+            let fen = "7k/8/5K1p/8/8/8/3Q4/8 w - - 99 1";
+            (fen, fen)
+        } else {
+            ("7k/8/5K2/8/8/8/3Q4/8 w - - 96 1", "7k/8/5K2/8/8/8/3Q4/8 w - - 99 1")
+        };
+        let from = Board::from_fen(from).unwrap();
+        let to = Board::from_fen(to).unwrap();
+        assert_eq!(from.hash(), to.hash());
+        let proven = search_with_tt(&from, 3, &tt);
+        assert_eq!(proven.score, MATE_SCORE - 3);
+        let entry = tt.read(to.hash(), to.fiftymove_clock(), 0).unwrap();
+        if zeroing && entry.score != TtDepth::NONE_SCORE {
+            assert_eq!(entry.score, proven.score, "a zeroing move may preserve the proven mate");
+        } else {
+            assert_eq!(entry.score, TtDepth::NONE_SCORE);
+            assert_eq!(entry.bound, Bound::None);
+        }
+        if !zeroing {
+            for &mv in to.generate_all_moves().iter() {
+                let mut child = to.clone();
+                child.make_move(mv);
+                assert!(child.draw_by_fifty_move_rule());
+            }
+            // The warm QS must not turn the expired mate into a huge cutoff.
+            assert!(search_with_tt(&to, 0, &tt).score.abs() < 1000);
+        }
+    }
 }
 
 #[test]

@@ -110,6 +110,45 @@ fn go_depth_returns_a_legal_bestmove_without_changing_the_position() {
 }
 
 #[test]
+fn plain_fixed_depth_search_honors_stop() {
+    use std::{io::Read, sync::mpsc, time::Duration};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_asura"))
+        .env("ASURA_NNUE_PATH", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).unwrap();
+        let _ = tx.send(text);
+    });
+    child.stdin.take().unwrap().write_all(b"position startpos\ngo depth 255\nstop\nisready\nquit\n").unwrap();
+    let received = rx.recv_timeout(Duration::from_secs(3));
+    if received.is_err() {
+        child.kill().unwrap();
+    }
+    let status = child.wait().unwrap();
+    reader.join().unwrap();
+    let output = received.expect("plain go depth ignored stop");
+    assert!(status.success(), "{output}");
+    assert!(output.contains("bestmove ") && !output.contains("bestmove 0000"), "{output}");
+    assert!(!output.contains("info depth 255 "), "aborted search advertised the requested depth: {output}");
+    assert!(output.ends_with("readyok\n"), "{output}");
+}
+
+#[test]
+fn a_node_limited_search_reports_completed_not_requested_depth() {
+    let output = exchange("position startpos\ngo depth 255 nodes 1\nquit\n");
+    assert!(output.starts_with("info depth 1 "), "{output}");
+    assert!(output.contains("bestmove "));
+}
+
+#[test]
 fn eof_and_quit_exit_cleanly() {
     assert_eq!(exchange(""), "");
     assert_eq!(exchange("isready"), "readyok\n");

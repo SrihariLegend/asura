@@ -579,7 +579,7 @@ fn search_root<const CFG: u32>(
     let use_alpha_reduce = (CFG & CFG_ALPHA_REDUCE) != 0;
     let use_clear_cutoff_bonus = (CFG & CFG_CLEAR_CUTOFF_BONUS) != 0;
     let hash = td.board.hash();
-    let entry = td.tt.and_then(|t| t.read(hash, td.board.fiftymove_clock(), 0));
+    let entry = td.tt_entry(0);
     let tt_move = entry.map(|e| e.mv).filter(|&mv| mv.is_present() && td.board.is_legal(mv)).unwrap_or(Move::NULL);
     let work_item = if work_item.is_present() && td.board.is_legal(work_item) { work_item } else { Move::NULL };
     let priority_move = if work_item.is_present() { work_item } else { tt_move };
@@ -906,7 +906,7 @@ fn search_node<const CFG: u32, const PV: bool>(
 
     let hash = td.board.hash();
     let entry = if selective && !in_singular {
-        td.tt.and_then(|t| t.read(hash, td.board.fiftymove_clock(), ply as isize))
+        td.tt_entry(ply)
     } else {
         None
     };
@@ -987,8 +987,14 @@ fn search_node<const CFG: u32, const PV: bool>(
         ev
     };
 
-    let static_eval =
-        if in_check { TtDepth::NONE_SCORE } else { correct_eval(td, selective && use_corrhist, raw_eval, ply_idx) };
+    let static_eval = if in_check {
+        TtDepth::NONE_SCORE
+    } else if in_singular {
+        // Verification searches this same ply and reuses its corrected value.
+        raw_eval
+    } else {
+        correct_eval(td, selective && use_corrhist, raw_eval, ply_idx)
+    };
     td.stack[ply_idx].static_eval = static_eval;
     td.stack[ply_idx].psqt_eval = psqt_eval;
     td.stack[ply_idx].reduction = 0;
@@ -1956,6 +1962,9 @@ fn quiescence<const CFG: u32, const PV: bool>(
     let use_corrhist = (CFG & CFG_CORRHIST) != 0;
     debug_assert!(-INFINITY <= alpha && alpha < beta && beta <= INFINITY);
     debug_assert!(ply <= MAX_PLY && q_depth <= 0);
+    if PV {
+        td.pv_table.clear(ply as usize);
+    }
     if td.check_limits() {
         return (0, Move::NULL);
     }
@@ -1979,8 +1988,7 @@ fn quiescence<const CFG: u32, const PV: bool>(
 
     let hash = td.board.hash();
     let tt_depth = i32::from(q_depth.max(RECAPTURE_ONLY_DEPTH));
-    let entry =
-        if selective { td.tt.and_then(|t| t.read(hash, td.board.fiftymove_clock(), ply as isize)) } else { None };
+    let entry = if selective { td.tt_entry(ply) } else { None };
     let mut tt_move = Move::NULL;
     let mut tt_pv = PV;
 
@@ -2166,6 +2174,9 @@ fn quiescence<const CFG: u32, const PV: bool>(
             best_score = score;
             if score > alpha {
                 best_move = mv;
+                if PV {
+                    td.pv_table.update(ply as usize, mv);
+                }
                 if score >= beta {
                     break;
                 }
@@ -2498,6 +2509,47 @@ mod tests {
         td_red.make_move(quiet_mv);
         let _ = search_node::<CFG_ALL_SELECTIVE, false>(&mut td_red, 500, 501, 5, false, 1, 0);
         assert_eq!(tt_red.read(child_hash, 0, 1).unwrap().depth, 4);
+    }
+
+    #[test]
+    fn singular_verification_reuses_correction_once_without_changing_the_parent_eval() {
+        use crate::nnue::{ModelParameters, NetworkState};
+        use std::sync::Arc;
+
+        let pos = Board::from_fen("7k/8/8/8/8/2p5/p1p5/K7 w - - 0 1").unwrap();
+        let moves = pos.generate_all_moves();
+        assert_eq!(moves.len(), 1);
+        let mut params = ModelParameters::new_zeroed();
+        for stack in &mut params.stacks {
+            stack.fc3_biases[0] = -4096; // Exactly -150 cp before correction.
+        }
+        let net = NetworkState::new(Arc::new(params));
+        for nnue in [None, Some(net)] {
+            let tt = TranspositionTable::new(1);
+            let mut hist = HistoryTables::default();
+            hist.prepare_search(&pos);
+            for _ in 0..20 {
+                hist.update_correction_history(&pos, 1, 256);
+            }
+            let mut td = ThreadData::with_time_manager_and_nnue(
+                &pos,
+                TimeManager::new(Limits::Depth(6), 1, 0),
+                Some(&tt),
+                Some(&mut hist),
+                nnue,
+            );
+            let raw = td.evaluate().0;
+            let correction = td.history.as_deref().unwrap().eval_correction(&pos, 1);
+            assert!(correction > 0);
+            tt.write(pos.hash(), 5, raw, raw, Bound::Lower, moves[0], 1, false, false);
+
+            search_node::<CFG_ALL_SELECTIVE, false>(&mut td, 2000, 2001, 6, false, 1, 0);
+
+            assert!(td.board == pos);
+            assert_eq!(td.nodes, 2, "the node and its excluded-move verification must both run");
+            assert_eq!(td.stack[1].static_eval, raw + correction);
+            assert!(td.stack[1].excluded_move.is_null());
+        }
     }
 
     #[test]

@@ -1015,7 +1015,8 @@ impl NetworkState {
         let stm = board.side_to_move() as usize;
         let (psqt_b, _) = hybrid_stack_index(board);
         let acc = &self.history[slot].acc;
-        (acc[stm].psqt[psqt_b] - acc[stm ^ 1].psqt[psqt_b]) >> 5
+        // Match the full forward pass: signed division truncates toward zero.
+        (acc[stm].psqt[psqt_b] - acc[stm ^ 1].psqt[psqt_b]) / 32
     }
 
     pub fn evaluate_with_components(&mut self, board: &Board, optimism: i32) -> (i32, i32, i32) {
