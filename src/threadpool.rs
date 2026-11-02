@@ -56,8 +56,7 @@ impl WorkerData {
     pub fn clear(&mut self) {
         self.history.clear();
         if let Some(ref mut net) = self.nnue {
-            net.cached_board = None;
-            net.history_cursor = 0;
+            net.reset_history();
         } else {
             self.nnue = crate::nnue::global_model().map(crate::nnue::NetworkState::new);
         }
@@ -149,10 +148,13 @@ impl ThreadPool {
                     move || {
                         worker_data.id = index;
                         worker_data.multi_pv = worker_multi_pv;
-                        let nnue = worker_data
+                        let mut nnue = worker_data
                             .nnue
                             .take()
                             .or_else(|| crate::nnue::global_model().map(crate::nnue::NetworkState::new));
+                        if let Some(ref mut net) = nnue {
+                            net.clear_pending_snaps();
+                        }
                         let mut td = ThreadData::with_time_manager_and_nnue(
                             &position,
                             tm,
