@@ -502,21 +502,28 @@ pub fn check_invasion_percolation(board: &Board, att_side: Color) -> bool {
     (cluster & target_camp) != 0
 }
 
-#[inline]
-const fn center_manhattan_dist(sq: usize) -> i32 {
-    let r = (sq / 8) as i32;
-    let f = (sq % 8) as i32;
-    let dr = if r < 3 { 3 - r } else if r > 4 { r - 4 } else { 0 };
-    let df = if f < 3 { 3 - f } else if f > 4 { f - 4 } else { 0 };
-    dr + df
-}
-
 pub fn scale_atn1_evaluation(
-    board: &Board, psqt: i32, mut positional: i32, draw_logit: i32, optimism: i32, params: &ModelParameters,
+    board: &Board, psqt: i32, positional: i32, draw_logit: i32, optimism: i32, params: &ModelParameters,
 ) -> i32 {
     let sac_thresh: i32 = param!(EVAL_SACRIFICE_PSQT_THRESHOLD);
     let sac_div: i32 = param!(EVAL_SACRIFICE_BOOST_DIV).max(4);
     let fort_min: i32 = param!(EVAL_FORTRESS_DISAGREE_MIN).max(20);
+
+    let v_total = psqt + positional;
+    let mut v = if psqt <= sac_thresh && v_total > 0 {
+        v_total + positional / sac_div
+    } else if psqt >= -sac_thresh && v_total < 0 {
+        v_total + positional / sac_div
+    } else if psqt.abs() >= 200 && (psqt > 0) != (positional > 0) && positional.abs() >= fort_min {
+        let damp = positional.abs().min(256);
+        v_total - (v_total * damp) / 2048
+    } else {
+        v_total
+    };
+
+    let sharpness = (128 - draw_logit.clamp(-64, 96)) as i64;
+    let comp_boost = (positional.abs().min(400) as i64) + 256;
+    v += ((optimism as i64) * sharpness * comp_boost / (128 * 384)) as i32;
 
     let stm = board.side_to_move();
     let q_us = board.colored_pieces(stm, PieceType::Queen).popcount();
@@ -528,114 +535,6 @@ pub fn scale_atn1_evaluation(
     let n_us = board.colored_pieces(stm, PieceType::Knight).popcount();
     let n_th = board.colored_pieces(!stm, PieceType::Knight).popcount();
 
-    let pcs = board.occupancies().popcount();
-    // Theorem 51 & 53: Strictly inside the 6-man tablebase zone (`pcs <= 6`, where `|bt4_cp| > 1500` and `pcs < 4`
-    // were censored during dataset packing), uncensor draw-biased `positional` cancellation and apply 6-man conversion drive!
-    let mut tb6_bonus = 0i32;
-    if pcs <= 6 && params.phase_table[0] == 960 {
-        let p_us = board.colored_pieces(stm, PieceType::Pawn).popcount() as i32;
-        let p_th = board.colored_pieces(!stm, PieceType::Pawn).popcount() as i32;
-        let npm_us = 320 * (n_us as i32) + 330 * (b_us as i32) + 500 * (r_us as i32) + 900 * (q_us as i32);
-        let npm_th = 320 * (n_th as i32) + 330 * (b_th as i32) + 500 * (r_th as i32) + 900 * (q_th as i32);
-        let mat_us = 100 * p_us + npm_us;
-        let mat_th = 100 * p_th + npm_th;
-        let mat_diff = mat_us - mat_th;
-        let win_has_pawns_or_major = if mat_diff > 0 {
-            p_us > 0 || mat_diff >= 400
-        } else {
-            p_th > 0 || mat_diff <= -400
-        };
-        if mat_diff.abs() >= 100 && win_has_pawns_or_major && (mat_diff > 0) != (positional > 0) {
-            positional /= 4;
-        }
-        if mat_th == 0 && mat_us >= 350 {
-            let us_k = board.king_square(stm) as usize;
-            let th_k = board.king_square(!stm) as usize;
-            let k_dist = ((us_k / 8) as i32 - (th_k / 8) as i32)
-                .abs()
-                .max(((us_k % 8) as i32 - (th_k % 8) as i32).abs());
-            tb6_bonus += 80 + center_manhattan_dist(th_k) * 20 + (8 - k_dist) * 10;
-        } else if mat_us == 0 && mat_th >= 350 {
-            let us_k = board.king_square(stm) as usize;
-            let th_k = board.king_square(!stm) as usize;
-            let k_dist = ((us_k / 8) as i32 - (th_k / 8) as i32)
-                .abs()
-                .max(((us_k % 8) as i32 - (th_k % 8) as i32).abs());
-            tb6_bonus -= 80 + center_manhattan_dist(us_k) * 20 + (8 - k_dist) * 10;
-        }
-        let wp = board.colored_pieces(Color::White, PieceType::Pawn).0;
-        let bp = board.colored_pieces(Color::Black, PieceType::Pawn).0;
-        let (mut w_pass, mut b_pass) = accumulator::threats::passed_pawns_mask(wp, bp);
-        if (w_pass | b_pass) != 0 {
-            const RANK_BONUS: [i32; 8] = [0, 10, 25, 50, 90, 150, 230, 0];
-            let wk = board.king_square(Color::White) as usize;
-            let bk = board.king_square(Color::Black) as usize;
-            let wk_r = (wk / 8) as i32;
-            let wk_f = (wk % 8) as i32;
-            let bk_r = (bk / 8) as i32;
-            let bk_f = (bk % 8) as i32;
-            let npm_w = if stm == Color::White { npm_us } else { npm_th };
-            let npm_b = if stm == Color::White { npm_th } else { npm_us };
-
-            let mut w_pp = 0i32;
-            while w_pass != 0 {
-                let s = w_pass.trailing_zeros() as usize;
-                w_pass &= w_pass - 1;
-                let sr = (s / 8) as i32;
-                let sf = (s % 8) as i32;
-                w_pp += RANK_BONUS[sr as usize];
-                let d_wk = (sr + 1 - wk_r).abs().max((sf - wk_f).abs());
-                let d_bk = (sr + 1 - bk_r).abs().max((sf - bk_f).abs());
-                w_pp += (d_bk - d_wk) * 12;
-                if npm_b == 0 {
-                    let dist_p = 7 - sr;
-                    let dist_bk = (7 - bk_r).max((sf - bk_f).abs()) - i32::from(stm == Color::Black);
-                    let king_escort = wk_r > sr && (wk_f - sf).abs() <= 1 && (wk_r >= 5 || (d_wk <= 1 && d_bk >= 2));
-                    if dist_p < dist_bk || king_escort {
-                        w_pp += 240 + sr * 25;
-                    }
-                }
-            }
-            let mut b_pp = 0i32;
-            while b_pass != 0 {
-                let s = b_pass.trailing_zeros() as usize;
-                b_pass &= b_pass - 1;
-                let sr = (s / 8) as i32;
-                let sf = (s % 8) as i32;
-                let rel_r = 7 - sr;
-                b_pp += RANK_BONUS[rel_r as usize];
-                let d_bk = (sr - 1 - bk_r).abs().max((sf - bk_f).abs());
-                let d_wk = (sr - 1 - wk_r).abs().max((sf - wk_f).abs());
-                b_pp += (d_wk - d_bk) * 12;
-                if npm_w == 0 {
-                    let dist_p = sr;
-                    let dist_wk = wk_r.max((sf - wk_f).abs()) - i32::from(stm == Color::White);
-                    let king_escort = bk_r < sr && (bk_f - sf).abs() <= 1 && (bk_r <= 2 || (d_bk <= 1 && d_wk >= 2));
-                    if dist_p < dist_wk || king_escort {
-                        b_pp += 240 + rel_r * 25;
-                    }
-                }
-            }
-            tb6_bonus += if stm == Color::White { w_pp - b_pp } else { b_pp - w_pp };
-        }
-    }
-
-    let v_total = psqt + positional + tb6_bonus;
-    let mut v = if psqt <= sac_thresh && v_total > 0 {
-        v_total + positional / sac_div
-    } else if psqt >= -sac_thresh && v_total < 0 {
-        v_total + positional / sac_div
-    } else if pcs > 6 && psqt.abs() >= 200 && (psqt > 0) != (positional > 0) && positional.abs() >= fort_min {
-        let damp = positional.abs().min(256);
-        v_total - (v_total * damp) / 2048
-    } else {
-        v_total
-    };
-
-    let sharpness = (128 - draw_logit.clamp(-64, 96)) as i64;
-    let comp_boost = (positional.abs().min(400) as i64) + 256;
-    v += ((optimism as i64) * sharpness * comp_boost / (128 * 384)) as i32;
-
     let imbalance_idx = ((q_us > q_th) as usize)
         | (((r_us > r_th) as usize) << 1)
         | (((b_us > b_th) as usize) << 2)
@@ -643,13 +542,13 @@ pub fn scale_atn1_evaluation(
     v = ((v as i64) * (params.phase_table[imbalance_idx] as i64) / 1024) as i32;
 
     // Theorem 29: Only apply invasion percolation fortress damping on locked minor/pawn endgames
-    // (`q_us + q_th + r_us + r_th == 0` with zero pawn levers and zero passed pawns).
+    // (`q_us + q_th + r_us + r_th == 0` with zero pawn levers), preventing the losing side from
+    // trading Queens into a lost endgame just to collect an artificial `3/4` damping cliff.
     if (q_us + q_th + r_us + r_th) == 0 && v.abs() > 80 {
         let wp = board.colored_pieces(Color::White, PieceType::Pawn).0;
         let bp = board.colored_pieces(Color::Black, PieceType::Pawn).0;
         let w_levers = ((wp << 7) & 0x7f7f_7f7f_7f7f_7f7f) | ((wp << 9) & 0xfefe_fefe_fefe_fefe);
-        let (w_pass, b_pass) = accumulator::threats::passed_pawns_mask(wp, bp);
-        if (w_levers & bp) == 0 && (w_pass | b_pass) == 0 {
+        if (w_levers & bp) == 0 {
             let winning_side = if v > 0 { stm } else { !stm };
             if !check_invasion_percolation(board, winning_side) {
                 v = (v * 3) / 4;
