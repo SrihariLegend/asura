@@ -201,3 +201,8 @@ is whether cheap measurements predict real game improvements across candidate
 settings. Preparation, calibration games, failed candidates and final independent
 validation must all count toward the claimed cost. A faster mistaken scorecard is
 not success.
+
+A subsequent [game-audited tuning study](audited-tuning.md) proved an unbiased
+residual-correction estimator and completed a 128-game fidelity pilot. Its tested
+cheap inputs did not reduce held-out residual variance; no candidate was adopted
+and no compute-saving claim resulted. The goal remains open.

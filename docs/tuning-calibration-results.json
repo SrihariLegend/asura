@@ -1,0 +1,740 @@
+{
+  "status": "Completed negative calibration pilot. No audit-game savings demonstrated; no parameter adoption or strength claim.",
+  "archive": {
+    "file": "docs/tuning-calibration-artifacts.tar.gz",
+    "sha256": "f0279909c02b5ad592e44bc65d1139f47df9eb1aaa45a4dc78cdfb282db54e0a",
+    "bytes": 216767,
+    "files": 83
+  },
+  "preregistration": {
+    "time_utc": "2026-11-04T01:19:40.072215+00:00",
+    "commit": "6221d252ccb1ee911cfdf3a477ae1b943e37d244",
+    "purpose": "Fidelity/predictor pilot, NOT an optimizer comparison or candidate promotion.",
+    "pre_game_amendment": "Two administrative setup failures before ANY game: optional UCI pv was assumed (fixed to play().move), then fastchess -config discard=true cleared the earlier engine/book arguments (removed; isolated working directories already protect repo config). Engine/model/profile/opening/budget/analysis unchanged. Both registrations, logs and failures preserved in setup-attempt-{1,2}; no game discarded.",
+    "failed_setup_child_cpu_seconds": 2.812244,
+    "model_sha256": "1402eeb715752a7ec4c85f72ea2d0042c819157588643525f6bb432d727cc807",
+    "binary_sha256": "8c637c32e1acdfa775f9746eb7accbdbfb22cdd190d425cdd572d68f5786c255",
+    "runner_sha256": "db93552efc67edb3fc40dc7609d832840a50ae283fdba30d1ac57b45fe253ee3",
+    "source_sha256": {
+      ".cargo/config.toml": "8ea425180afe0e2fc0cd930d9a5dbd4da07aebe14263eeec4d6df9c7ab996a20",
+      "Cargo.lock": "c70addbcbebc683f73a2113ac271e8ab2c8c4e6caacda8a91a8551ac74d66f40",
+      "Cargo.toml": "e2d01c3f8f065c04d33bc515e2c49ac7fa5b052f38f586ccdff8d9a52974f839",
+      "build/attacks.rs": "b6e78ac578e5b738f3ce999c3e05c1415db1d95bc7782b748a1403fe77370f15",
+      "build/build.rs": "acf0c889ae1831a7a8c16cc88415f585283d49e25c8dd7162ca899ff38e3dd31",
+      "build/magics.rs": "39ff4819fb3b148478c9d9f515d868a8c59c1dfffe6d7545adbc2140b50b0cf5",
+      "build/maps.rs": "3b0d41bbc35abecd51582ab3062a9de92ae5aa3a56de0bc3915b2410d40acb40",
+      "src/bin/hyper_spsa.rs": "93ad8a7f850443b321bc91f6b78b0dce1942b8a8bd6d5763a3731cb5a1081cbb",
+      "src/bin/hyper_spsa/config.rs": "911cadfcc6f67eeb306cbc34b3e2e9dc8468d477be3361a6f7824b200779978e",
+      "src/bin/hyper_spsa/evaluator.rs": "05ddc27fda5412729130a4b39c855e8aa8d44a47bc46e907ec37824635a88b14",
+      "src/bin/hyper_spsa/evaluator/tests.rs": "04e3da1a1fddac9940148adb30a06018067256fedbe714e7c822900bece7d946",
+      "src/bin/hyper_spsa/legacy.rs": "2136f8dea2273ff9bee87467d4ba205736cf42887ee3efaf12af85eae928184b",
+      "src/bin/hyper_spsa/math_bench.rs": "fd18bdaefebe11ad685b21e72d7e5e30a10e8f07d26c82392eeae1fbcbc890b5",
+      "src/board.rs": "b7fe240b9373248b604f003cb80a3002264f4b63b1ba151282ca70a157afed16",
+      "src/board/makemove.rs": "1405e6a6a36d045388cac1c069491b5ee655f1e954fcdd25d89f81cb0f8633e8",
+      "src/board/movegen.rs": "bfc7ef6e385557aa58698c1b61b0a2b67312d63d780ba40f0c62f8f262855d40",
+      "src/board/parser.rs": "997f7840c2bfbe4c7436feaf5a1d76e0bfe9caa2eb9995ead4389a6cfaed6245",
+      "src/board/see.rs": "8804dc2bd6e93ef93af0848eb3a9c7bb00cdf8aad302e6e13143cf93265702ab",
+      "src/board/tests.rs": "13691500c95d106bbf37667be3a45c22cff488a5585cf7fcf6c691aba8ca1a85",
+      "src/evaluation.rs": "ac97fda45badd237f12c4e50949ee4e099fd3af600644cae61e8f398fc723a45",
+      "src/history.rs": "5f0986be67a7b7818d616476050863fea9cbc80483b94ce28ae138d4cb3bef34",
+      "src/lib.rs": "1bcd18bdfd6a8d598fd542e9a964714ae9735734db5e3e6208acc7c61f7f2e73",
+      "src/lookup.rs": "7d533a16fb7c5924c25fe605ccc574cb855480d607ca735ff72f8a8256e092ed",
+      "src/main.rs": "8bc1e5795c1a8a8d1c81b8e07aa18c1f3c0147824e3cfc402ea18ecedb235a60",
+      "src/movepick.rs": "2f01b49e3b6fb92c6d63089361ea538970d8e25833d86a29892a615de686e04a",
+      "src/nnue.rs": "692f228f5d08ea5a94c34ffdd5a30b4eeb453784cc44734f64c3e3eb072f10ad",
+      "src/nnue/accumulator.rs": "dfcbd02567ba252660d4f53be5053249a89e12707ba15e232ee51b205a19d4d8",
+      "src/nnue/accumulator/psq.rs": "e9a3711b8208b05d0588939923f30502afb06e36e96b7b96cce469cc35168094",
+      "src/nnue/accumulator/threats.rs": "18d5e1811e0698e4eaccd613dde5e361957301aa8db49942c622d289e5d073cb",
+      "src/nnue/forward/scalar.rs": "b9f189b306bf11a6c7578b022e0c6347c6d65f263ba458589775c9da596e624c",
+      "src/nnue/forward/vectorized.rs": "d0ac6bab680d5c5ab07d45a1f0c0fdbf92937299bb319dc90de44225d50f1d87",
+      "src/nnue/simd/avx2.rs": "df6b2c55d7f43c58fc3faf03d82bc3f8375f1671895c6b33041711e36094e38f",
+      "src/parameters.rs": "ea19a7accb88a880622be05442ca591d18d54f9c41c6f2f73fa785520546231a",
+      "src/search.rs": "7bd9b6dad8c1c248186785abf825fc592a206df0cdc3c0fd662b9dc4fe208565",
+      "src/setwise.rs": "9a1572fbf7e82aa5030a2d50fa880af0eb40a5c9504ea02f161691e343b0602d",
+      "src/stack.rs": "7f77a38ef211f396ed02f289c7a178758ba8886b7be23cf49da54466ff7680f7",
+      "src/thread.rs": "427baebeb2e876fd124fdff1b82ec669ef50081bfa5d37508b71681de7021361",
+      "src/threadpool.rs": "f2098e905a02a9aa8688d4284b0840b63f1ebbb8c975235521ede1561aa339e5",
+      "src/threadpool/worker_tests.rs": "0fb6060c43210ef21c7059b503e29570bd9a395a5a1219a9b1f5325386d42102",
+      "src/time.rs": "20b6925b5179a05a74b89a021f92764d3f520b7f2e5d644b60261384563834ea",
+      "src/tools/bench.rs": "d8968885ef8fef919359cead9360129a1e59512aa17b95ea3dce0082abb81c62",
+      "src/tools/mod.rs": "c55ce2f0c98968934850fd818cd8b83e83e45efdae7658e2bf2eb5a64bbb231c",
+      "src/tools/perft.rs": "160d9b7f25ae8acaa01803fd5cd9961ae3355be66b9feb80681a75fd51fa11e4",
+      "src/transposition.rs": "aee8e862b4803cdd28ca94e7d786c5f4ae76c75feea17770125eae199dd626ca",
+      "src/tuning.rs": "20abf077ea1e4606c3cfa8c92974d7e2709a793e80daec1959005a0c92e8604a",
+      "src/types/arrayvec.rs": "69ed17c4b82311cf7e060e89aa118ffc45b469a4955965d9da9a5a10e90b386c",
+      "src/types/bitboard.rs": "73162e834d5b43de1a7e35dd0da9318d8baff8aa88b197c3dd802495dba29d1a",
+      "src/types/castling.rs": "ec94681c404609af074dafd2aae4f04f30e7adb2305f44081c1562e6d678212b",
+      "src/types/color.rs": "ae90d9b6b96a7b5349285c30bb95de80735c58ffba18b38fc113cb8a1e705aa1",
+      "src/types/keys.rs": "46f438766b2fe37ac456233970e6b60e0f29a15ad7a50acf291e8c7b3a0a48fb",
+      "src/types/mod.rs": "ac3c5a6d09785f3fa6f50a1bac0b987dc30042011b887b03fc7971a599af8c7f",
+      "src/types/movelist.rs": "8668a530c7d20b14f120e90ba576fb54f62a7bc7be2871d5c37889992241858f",
+      "src/types/moves.rs": "c211d32b323203dc4cf4da00e7da6d9b6417688619358307504b981806f38776",
+      "src/types/piece.rs": "20c8dd4a8e9b821cce5d127985e8243339624138c0983828fa85d20a0606f8ff",
+      "src/types/score.rs": "22bd0c8482ee06f80615368cadf5877289b96a5a439e98ef3c175364a9371984",
+      "src/types/square.rs": "f85023178eff17338ad04277d5283eaa289d5ab8e6fc66552e65095818fbf1f2",
+      "src/types/zobrist.rs": "dd402e734a5b1472c49ab61461d2e5a6c945262cb2cc9d50bc4262eb6266125b",
+      "src/uci.rs": "c572955afa51594d80d4be49233e09ec980f315ad4350fc5a67520b569ef3aa9",
+      "tools/tuning_calibration_probe.rs": "a7b16e0f753a79a20cab3d9deb699619b5faf5c53a6de9b865db334b6d8c35da"
+    },
+    "fastchess_sha256": "9de94e790de69f5b0648ecdd66cdeefb51cbf33d3c43ba7a6a853ec0f138af6e",
+    "openings_sha256": "01fcc33ebbc7804b43b02e14629235a8c16e796ba58082b372ac36fe99162d96",
+    "profiles": [
+      "PROFILE\tbase\tLMR_TABLE_SCALE=418\tSE_BETA_MARGIN=26",
+      "PROFILE\tll\tLMR_TABLE_SCALE=404\tSE_BETA_MARGIN=22",
+      "PROFILE\tlh\tLMR_TABLE_SCALE=404\tSE_BETA_MARGIN=30",
+      "PROFILE\thl\tLMR_TABLE_SCALE=432\tSE_BETA_MARGIN=22",
+      "PROFILE\thh\tLMR_TABLE_SCALE=432\tSE_BETA_MARGIN=30"
+    ],
+    "opening_scope": "First eight published frozen audit openings, reused without examining candidate outcomes. Not unseen engine-training data. Only early neutral positions; not a representative phase/style corpus.",
+    "shared_historical_preparation": "Earlier opening checks were 8 x approximately 500k reference nodes. Reused, not timed anew; not claimed free in any campaign comparison.",
+    "budget": {
+      "hard_wall_seconds": 1800,
+      "max_games": 128,
+      "game_concurrency": 8,
+      "threads_per_engine": 1,
+      "hash_mib_per_engine": 16,
+      "cpu_affinity": [
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "cheap_nodes": 5000,
+      "target_nodes": 500000,
+      "scorecard_nodes": [
+        500,
+        1500,
+        4500
+      ],
+      "label_nodes": 6000
+    },
+    "adjudication": "No score-based resign/draw/maxmoves. Natural checkmate/stalemate/repetition/rule-50/material endings only; any failure/incomplete pair invalidates cohort.",
+    "stopping": "Complete all predeclared games unless hard timeout or mechanical failure. No score-dependent early stop, replacement games, candidate reselection or adoption.",
+    "analysis": {
+      "unit": "color-reversed opening pair; signed score = candidate total points in two games minus one",
+      "calibration_openings": [
+        "open-01",
+        "open-02",
+        "open-03",
+        "open-04"
+      ],
+      "heldout_openings": [
+        "open-05",
+        "open-06",
+        "open-07",
+        "open-08"
+      ],
+      "predictors": [
+        "native position utility(candidate)-utility(base)",
+        "5000-node paired-game signed score"
+      ],
+      "fit": "One affine predictor per cheap source, OLS on first four opening families (16 records); clip game predictions to [-1,1]. No fitting or model choice on held-out families.",
+      "measure": "On other four families report centered-within-candidate residual sum of squares / outcome sum of squares; also mean-squared prediction error and candidate-mean ordering. All ties and zero variances explicit.",
+      "optimistic_diagnostic": "Also show best hindsight single linear slope on held-out centered vectors, labeled in-sample oracle NOT a deployable predictor or validated saving.",
+      "uncertainty": "Only 4 held-out opening families. Descriptive finite-cohort diagnostics, no robust population correlation/Elo inference and no significance-based promotion.",
+      "compute": "New preparation, all cheap and target games, failed work and analysis are charged. Cached build/historical opening-generation work is separately disclosed; no equal-compute SPSA claim."
+    }
+  },
+  "proof_check": {
+    "proof_sha256": "6f89752babbd9379b8e5fe25b8a94621ca0320c3383018a05769304b1218e86f",
+    "theorems": 55,
+    "audited": 55,
+    "axioms": [
+      "Classical.choice",
+      "Quot.sound",
+      "propext"
+    ],
+    "cohort_rows_matched": 24,
+    "wall_seconds": 1.719709529003012,
+    "analysis_sha256": "241beb958f84be15dff73d4c3e0c7ed3758a94614ae394207d15762f1f2168ac",
+    "scope": "Finite exact probability design and optional frozen-cohort arithmetic only; not RNG, game execution, adaptive selection, unseen openings, SPSA campaign efficiency or Elo."
+  },
+  "analysis": {
+    "scope": "Small, shared-opening descriptive calibration pilot. Not Elo, promotion, or equal-compute SPSA evidence.",
+    "registered_sha256": "bbdaace1abf8d5b89c0ca8f11b405cb9d6c887dea2a0fc1d2b794ea836ba3a5e",
+    "predictors": {
+      "scorecard": {
+        "calibration_rows": 16,
+        "heldout_rows": 16,
+        "heldout_opening_families": 4,
+        "intercept": {
+          "exact": "-3/32",
+          "value": -0.09375
+        },
+        "slope": {
+          "exact": "0",
+          "value": 0
+        },
+        "clipped_to_signed_score_range": true,
+        "heldout_mse": {
+          "exact": "93/1024",
+          "value": 0.0908203125
+        },
+        "heldout_bias_prediction_minus_y": {
+          "exact": "-1/32",
+          "value": -0.03125
+        },
+        "within_candidate_y_ss": {
+          "exact": "9/8",
+          "value": 1.125
+        },
+        "within_candidate_residual_ss": {
+          "exact": "9/8",
+          "value": 1.125
+        },
+        "within_candidate_residual_variance_ratio": {
+          "exact": "1",
+          "value": 1
+        },
+        "necessary_100x_residual_condition_on_this_cohort": false,
+        "necessary_1000x_residual_condition_on_this_cohort": false,
+        "hindsight_within_candidate_linear_rho_squared": null,
+        "hindsight_free_cheap_linear_sample_saving_ceiling": null,
+        "hindsight_scope": "Best single LINEAR slope after seeing held-out outcomes; optimistic algebraic diagnostic only, not a held-out fit or a limit on richer/nonlinear predictors.",
+        "zero_variance": {
+          "y": false,
+          "x": true
+        },
+        "frozen_cohorts": [
+          {
+            "profile": "ll",
+            "y": [
+              "0",
+              "1/2",
+              "0",
+              "0"
+            ],
+            "prediction": [
+              "-3/32",
+              "-3/32",
+              "-3/32",
+              "-3/32"
+            ],
+            "opening_ids": [
+              "open-05",
+              "open-06",
+              "open-07",
+              "open-08"
+            ]
+          },
+          {
+            "profile": "lh",
+            "y": [
+              "0",
+              "0",
+              "-1/2",
+              "-1/2"
+            ],
+            "prediction": [
+              "-3/32",
+              "-3/32",
+              "-3/32",
+              "-3/32"
+            ],
+            "opening_ids": [
+              "open-05",
+              "open-06",
+              "open-07",
+              "open-08"
+            ]
+          },
+          {
+            "profile": "hl",
+            "y": [
+              "0",
+              "0",
+              "-1/2",
+              "0"
+            ],
+            "prediction": [
+              "-3/32",
+              "-3/32",
+              "-3/32",
+              "-3/32"
+            ],
+            "opening_ids": [
+              "open-05",
+              "open-06",
+              "open-07",
+              "open-08"
+            ]
+          },
+          {
+            "profile": "hh",
+            "y": [
+              "0",
+              "-1/2",
+              "0",
+              "1/2"
+            ],
+            "prediction": [
+              "-3/32",
+              "-3/32",
+              "-3/32",
+              "-3/32"
+            ],
+            "opening_ids": [
+              "open-05",
+              "open-06",
+              "open-07",
+              "open-08"
+            ]
+          }
+        ]
+      },
+      "cheap_game": {
+        "calibration_rows": 16,
+        "heldout_rows": 16,
+        "heldout_opening_families": 4,
+        "intercept": {
+          "exact": "-67/734",
+          "value": -0.09128065395095368
+        },
+        "slope": {
+          "exact": "-29/367",
+          "value": -0.07901907356948229
+        },
+        "clipped_to_signed_score_range": true,
+        "heldout_mse": {
+          "exact": "396833/4310048",
+          "value": 0.09207159641841575
+        },
+        "heldout_bias_prediction_minus_y": {
+          "exact": "-53/5872",
+          "value": -0.009025885558583106
+        },
+        "within_candidate_y_ss": {
+          "exact": "9/8",
+          "value": 1.125
+        },
+        "within_candidate_residual_ss": {
+          "exact": "1234357/1077512",
+          "value": 1.1455621839942385
+        },
+        "within_candidate_residual_variance_ratio": {
+          "exact": "1234357/1212201",
+          "value": 1.0182774968837676
+        },
+        "necessary_100x_residual_condition_on_this_cohort": false,
+        "necessary_1000x_residual_condition_on_this_cohort": false,
+        "hindsight_within_candidate_linear_rho_squared": {
+          "exact": "1/1404",
+          "value": 0.0007122507122507123
+        },
+        "hindsight_free_cheap_linear_sample_saving_ceiling": {
+          "exact": "1404/1403",
+          "value": 1.000712758374911
+        },
+        "hindsight_scope": "Best single LINEAR slope after seeing held-out outcomes; optimistic algebraic diagnostic only, not a held-out fit or a limit on richer/nonlinear predictors.",
+        "zero_variance": {
+          "y": false,
+          "x": false
+        },
+        "frozen_cohorts": [
+          {
+            "profile": "ll",
+            "y": [
+              "0",
+              "1/2",
+              "0",
+              "0"
+            ],
+            "prediction": [
+              "-67/734",
+              "-48/367",
+              "-9/734",
+              "-9/734"
+            ],
+            "opening_ids": [
+              "open-05",
+              "open-06",
+              "open-07",
+              "open-08"
+            ]
+          },
+          {
+            "profile": "lh",
+            "y": [
+              "0",
+              "0",
+              "-1/2",
+              "-1/2"
+            ],
+            "prediction": [
+              "-19/367",
+              "-9/734",
+              "-19/367",
+              "-67/734"
+            ],
+            "opening_ids": [
+              "open-05",
+              "open-06",
+              "open-07",
+              "open-08"
+            ]
+          },
+          {
+            "profile": "hl",
+            "y": [
+              "0",
+              "0",
+              "-1/2",
+              "0"
+            ],
+            "prediction": [
+              "-125/734",
+              "-67/734",
+              "-19/367",
+              "-19/367"
+            ],
+            "opening_ids": [
+              "open-05",
+              "open-06",
+              "open-07",
+              "open-08"
+            ]
+          },
+          {
+            "profile": "hh",
+            "y": [
+              "0",
+              "-1/2",
+              "0",
+              "1/2"
+            ],
+            "prediction": [
+              "-48/367",
+              "-67/734",
+              "-67/734",
+              "-9/734"
+            ],
+            "opening_ids": [
+              "open-05",
+              "open-06",
+              "open-07",
+              "open-08"
+            ]
+          }
+        ]
+      }
+    },
+    "candidate_means": {
+      "ll": {
+        "y": {
+          "exact": "1/8",
+          "value": 0.125
+        },
+        "cheap_game": {
+          "exact": "-3/8",
+          "value": -0.375
+        },
+        "scorecard": {
+          "exact": "0",
+          "value": 0
+        }
+      },
+      "lh": {
+        "y": {
+          "exact": "-1/4",
+          "value": -0.25
+        },
+        "cheap_game": {
+          "exact": "-1/2",
+          "value": -0.5
+        },
+        "scorecard": {
+          "exact": "0",
+          "value": 0
+        }
+      },
+      "hl": {
+        "y": {
+          "exact": "-1/8",
+          "value": -0.125
+        },
+        "cheap_game": {
+          "exact": "0",
+          "value": 0
+        },
+        "scorecard": {
+          "exact": "0",
+          "value": 0
+        }
+      },
+      "hh": {
+        "y": {
+          "exact": "0",
+          "value": 0
+        },
+        "cheap_game": {
+          "exact": "-1/8",
+          "value": -0.125
+        },
+        "scorecard": {
+          "exact": "0",
+          "value": 0
+        }
+      }
+    },
+    "cost": {
+      "run_wall_seconds": 654.3565601309965,
+      "metered_run_child_cpu_seconds": 4687.453898,
+      "failed_setup_child_cpu_seconds": 2.812244,
+      "excluded_not_free": "Historical opening construction, cached build and interactive development/debug/proof costs are not completely instrumented. No all-in saving is claimed.",
+      "cheap_games_child_cpu_seconds": 50.088707,
+      "target_games_child_cpu_seconds": 4634.7452809999995
+    },
+    "observations": [
+      {
+        "profile": "ll",
+        "opening": "open-01",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "0"
+      },
+      {
+        "profile": "ll",
+        "opening": "open-02",
+        "y": "-1/2",
+        "scorecard": "0",
+        "cheap_game": "1"
+      },
+      {
+        "profile": "ll",
+        "opening": "open-03",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "0"
+      },
+      {
+        "profile": "ll",
+        "opening": "open-04",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "0"
+      },
+      {
+        "profile": "ll",
+        "opening": "open-05",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "0"
+      },
+      {
+        "profile": "ll",
+        "opening": "open-06",
+        "y": "1/2",
+        "scorecard": "0",
+        "cheap_game": "1/2"
+      },
+      {
+        "profile": "ll",
+        "opening": "open-07",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "-1"
+      },
+      {
+        "profile": "ll",
+        "opening": "open-08",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "-1"
+      },
+      {
+        "profile": "lh",
+        "opening": "open-01",
+        "y": "1/2",
+        "scorecard": "0",
+        "cheap_game": "0"
+      },
+      {
+        "profile": "lh",
+        "opening": "open-02",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "0"
+      },
+      {
+        "profile": "lh",
+        "opening": "open-03",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "0"
+      },
+      {
+        "profile": "lh",
+        "opening": "open-04",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "-1"
+      },
+      {
+        "profile": "lh",
+        "opening": "open-05",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "-1/2"
+      },
+      {
+        "profile": "lh",
+        "opening": "open-06",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "-1"
+      },
+      {
+        "profile": "lh",
+        "opening": "open-07",
+        "y": "-1/2",
+        "scorecard": "0",
+        "cheap_game": "-1/2"
+      },
+      {
+        "profile": "lh",
+        "opening": "open-08",
+        "y": "-1/2",
+        "scorecard": "0",
+        "cheap_game": "0"
+      },
+      {
+        "profile": "hl",
+        "opening": "open-01",
+        "y": "-1/2",
+        "scorecard": "0",
+        "cheap_game": "0"
+      },
+      {
+        "profile": "hl",
+        "opening": "open-02",
+        "y": "-1/2",
+        "scorecard": "0",
+        "cheap_game": "1/2"
+      },
+      {
+        "profile": "hl",
+        "opening": "open-03",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "-1"
+      },
+      {
+        "profile": "hl",
+        "opening": "open-04",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "1"
+      },
+      {
+        "profile": "hl",
+        "opening": "open-05",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "1"
+      },
+      {
+        "profile": "hl",
+        "opening": "open-06",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "0"
+      },
+      {
+        "profile": "hl",
+        "opening": "open-07",
+        "y": "-1/2",
+        "scorecard": "0",
+        "cheap_game": "-1/2"
+      },
+      {
+        "profile": "hl",
+        "opening": "open-08",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "-1/2"
+      },
+      {
+        "profile": "hh",
+        "opening": "open-01",
+        "y": "-1/2",
+        "scorecard": "0",
+        "cheap_game": "-1/2"
+      },
+      {
+        "profile": "hh",
+        "opening": "open-02",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "1"
+      },
+      {
+        "profile": "hh",
+        "opening": "open-03",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "0"
+      },
+      {
+        "profile": "hh",
+        "opening": "open-04",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "-1/2"
+      },
+      {
+        "profile": "hh",
+        "opening": "open-05",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "1/2"
+      },
+      {
+        "profile": "hh",
+        "opening": "open-06",
+        "y": "-1/2",
+        "scorecard": "0",
+        "cheap_game": "0"
+      },
+      {
+        "profile": "hh",
+        "opening": "open-07",
+        "y": "0",
+        "scorecard": "0",
+        "cheap_game": "0"
+      },
+      {
+        "profile": "hh",
+        "opening": "open-08",
+        "y": "1/2",
+        "scorecard": "0",
+        "cheap_game": "-1"
+      }
+    ],
+    "analysis_cpu_seconds": 0.0015042100000000024
+  },
+  "game_verification": {
+    "games": 128,
+    "color_reversed_pairs": 64,
+    "all_legal_and_natural_results": true,
+    "cheap": {
+      "games": 64,
+      "reported_nodes": 47915154,
+      "checkmates": 43,
+      "draws": 21
+    },
+    "target": {
+      "games": 64,
+      "reported_nodes": 3873510619,
+      "checkmates": 13,
+      "draws": 51
+    }
+  }
+}
