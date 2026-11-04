@@ -17,6 +17,7 @@ pub mod threadpool;
 pub mod time;
 pub mod tools;
 pub mod transposition;
+pub mod tuning;
 pub mod types;
 
 mod lookup;
@@ -24,9 +25,15 @@ mod setwise;
 mod stack;
 mod uci;
 
+/// Initialize the engine's runtime lookup tables for direct library searches.
+/// Idempotent; does not load a model, start workers, or change search parameters.
+pub fn initialize() {
+    lookup::initialize();
+}
+
 /// Execute queued commands, or read UCI commands from stdin if the queue is empty.
 /// Each queued string is one complete command. Sending `uci` enables stdin mode.
 pub fn run(commands: VecDeque<String>) -> io::Result<()> {
-    lookup::initialize();
+    initialize();
     uci::message_loop(commands, io::stdin().lock(), io::stdout().lock())
 }

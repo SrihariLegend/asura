@@ -1,0 +1,8 @@
+# Mechanical native-NNUE fixtures, not a strength suite or trusted chess labels.
+# root_cp only selects the existing handcrafted proxy regime.
+600	7k/8/6K1/8/8/8/8/R7 w - - 0 1
+600	r7/8/8/8/8/6k1/8/7K b - - 0 1
+0	8/5pk1/8/6P1/8/5K2/8/8 w - - 0 1
+0	8/8/5k2/8/6p1/8/5PK1/8 b - - 0 1
+200	7k/6n1/8/5K2/8/8/8/R7 w - - 0 1
+800	7k/8/5K2/8/8/8/3Q4/8 w - - 24 1
