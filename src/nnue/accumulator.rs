@@ -264,10 +264,13 @@ pub fn evaluate_pawn_king_subnet<'a>(
         return (&cache[prev_i].beta[s_idx], &cache[prev_i].gamma[s_idx]);
     }
 
-    let hash = (wp.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+    let mut hash = (wp.wrapping_mul(0x9e37_79b9_7f4a_7c15))
         ^ (bp.wrapping_mul(0xbf58_476d_1ce4_e5b9))
         ^ ((kk as u64).wrapping_mul(0x94d0_49bb_1331_11eb));
-    let idx = (hash as usize) & (PK_CACHE_SIZE - 1);
+    hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= hash >> 31;
+    let idx = ((hash >> 52) as usize) & (PK_CACHE_SIZE - 1);
     *last_idx = idx;
     let slot = &mut cache[idx];
     if slot.wp == wp && slot.bp == bp && slot.kk == kk {
@@ -337,7 +340,7 @@ pub fn evaluate_pawn_king_subnet<'a>(
     let rammed = ((wp << 8) & bp).count_ones().min(3) as usize;
     active[n_act] = 360 + rammed;
     n_act += 1;
-    let light_mask = 0x55AA_55AA_55AA_55AAu64;
+    let light_mask = if stm == Color::White { 0x55AA_55AA_55AA_55AAu64 } else { !0x55AA_55AA_55AA_55AAu64 };
     if (own_p & light_mask).count_ones() > (own_p & !light_mask).count_ones() {
         active[n_act] = 364;
         n_act += 1;

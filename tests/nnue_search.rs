@@ -111,3 +111,55 @@ fn search_psqt_matches_the_network_component_in_both_perspectives() {
     assert_eq!(material_only.evaluate(), (500, 500));
     assert_eq!(material_only.evaluate_psqt_only(), 500);
 }
+
+fn flip_fen_colors(fen: &str) -> String {
+    let parts: Vec<&str> = fen.split_whitespace().collect();
+    let ranks: Vec<&str> = parts[0].split('/').collect();
+    let flipped_board: Vec<String> = ranks
+        .into_iter()
+        .rev()
+        .map(|rank| {
+            rank.chars()
+                .map(|c| {
+                    if c.is_ascii_lowercase() {
+                        c.to_ascii_uppercase()
+                    } else if c.is_ascii_uppercase() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let stm = if parts[1] == "w" { "b" } else { "w" };
+    format!("{} {} - - {} {}", flipped_board.join("/"), stm, parts[4], parts[5])
+}
+
+#[test]
+fn atn1_evaluation_is_symmetric_under_color_inversion_with_unequal_square_complex_pawns() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("asura_atn1.nnue");
+    let params = Arc::new(ModelParameters::load_from_file(path).expect("load bundled ATN-1"));
+    let mut net = NetworkState::new(params);
+
+    for fen in [
+        "r1bq1rk1/pp2ppbp/2np1np1/8/2PNP3/2N1BP2/PP2B1PP/R2Q1RK1 w - - 0 9",
+        "r2q1rk1/ppp1bppp/2np1n2/4p1B1/2B1P1b1/2NP1N2/PPP2PPP/R2Q1RK1 w - - 4 7",
+        "8/5pk1/4p1p1/3pP1P1/3P1P2/6K1/8/8 w - - 0 40",
+        "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+    ] {
+        let mirrored = flip_fen_colors(fen);
+        let b1 = Board::from_fen(fen).unwrap();
+        let b2 = Board::from_fen(&mirrored).unwrap();
+        assert_eq!(
+            net.evaluate_incremental(&b1, 0),
+            net.evaluate_incremental(&b2, 0),
+            "Color-inversion asymmetry between {fen} and {mirrored}"
+        );
+        assert_eq!(
+            net.evaluate_full_refresh_scalar(&b1, 0),
+            net.evaluate_full_refresh_scalar(&b2, 0),
+            "Scalar color-inversion asymmetry between {fen} and {mirrored}"
+        );
+    }
+}

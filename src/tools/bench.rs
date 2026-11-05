@@ -16,21 +16,27 @@ const POSITIONS: &[&str] = &[
 ];
 
 pub fn bench(depth: u8, output: &mut impl Write) -> io::Result<u64> {
-    let start = Instant::now();
     let mut tt = TranspositionTable::default();
     let mut history = HistoryTables::default();
     let mut total_nodes = 0u64;
+    let mut elapsed_secs = 0.0f64;
+
+    // Warm up thread-local NNUE state and attack/threat lookup tables before timing.
+    if let Some(net) = crate::nnue::take_tls_nnue() {
+        crate::nnue::put_tls_nnue(net);
+    }
 
     for &fen in POSITIONS {
         let board = Board::from_fen(fen).unwrap();
         tt.clear(1);
         history.clear();
+        let start = Instant::now();
         let res = search_with_context(&board, depth, &tt, &mut history);
+        elapsed_secs += start.elapsed().as_secs_f64();
         total_nodes += res.nodes;
     }
 
-    let elapsed_secs = start.elapsed().as_secs_f64().max(1e-6);
-    let nps = (total_nodes as f64 / elapsed_secs) as u64;
+    let nps = (total_nodes as f64 / elapsed_secs.max(1e-6)) as u64;
     writeln!(output, "{total_nodes} nodes {nps} nps")?;
     Ok(total_nodes)
 }

@@ -609,6 +609,7 @@ fn search_root<const CFG: u32>(
     td.stack[0].psqt_eval = psqt_eval;
     td.stack[0].reduction = 0;
     td.stack[0].laterality = 0;
+    td.stack[0].tt_pv = true;
     td.stack[2].cutoff_count = 0;
     if let Some(h) = td.history.as_deref_mut() {
         h.clear_child_killers(0);
@@ -636,9 +637,6 @@ fn search_root<const CFG: u32>(
             continue;
         }
         move_count += 1;
-        if move_count == 2 && !in_check && td.nnue.is_some() && td.stack[0].psqt_eval == TtDepth::NONE_SCORE {
-            td.stack[0].psqt_eval = td.evaluate_psqt_only();
-        }
         let child_depth = root_effective_depth - 1;
         let nodes_before = td.nodes;
         td.sel_depth = 1;
@@ -663,6 +661,7 @@ fn search_root<const CFG: u32>(
         td.stack[0].mv = mv;
         td.stack[0].move_count = move_count as u16;
         td.stack[0].stat_score = hist;
+        td.stack[0].creates_threat = creates_threat;
         td.stack[0].laterality = if move_count > 1 { (move_count.ilog2() as i32 - 1).max(0) } else { 0 };
         td.make_move(mv);
         let gives_check = td.board.in_check();
@@ -676,7 +675,11 @@ fn search_root<const CFG: u32>(
             let mut reduced_depth = child_depth;
             let mut quotient = 0;
             if use_lmr && is_quiet && root_effective_depth >= 2 && child_depth >= 1 {
-                let mut raw_reduction = lmr_table_term(root_effective_depth, move_count) + node_bias
+                let pv_relief = if td.nnue.is_some() { 1_000 } else { 0 };
+                let tbl_scale: i32 = param!(LMR_TABLE_SCALE);
+                let mut raw_reduction = lmr_table_term(root_effective_depth, move_count) * tbl_scale / LMR_TABLE_SCALE
+                    + node_bias
+                    - pv_relief
                     - hist / LMR_HIST_DIV
                     - LMR_CHECK_BONUS * gives_check as i32
                     - LMR_THREAT_BONUS * creates_threat as i32
@@ -998,9 +1001,12 @@ fn search_node<const CFG: u32, const PV: bool>(
     td.stack[ply_idx].static_eval = static_eval;
     td.stack[ply_idx].psqt_eval = psqt_eval;
     td.stack[ply_idx].reduction = 0;
+    td.stack[ply_idx].tt_pv = tt_pv;
     if ply_idx + 2 < td.stack.len() {
         td.stack[ply_idx + 2].cutoff_count = 0;
     }
+
+    let parent_creates_threat = if ply_idx > 0 { td.stack[ply_idx - 1].creates_threat } else { false };
 
     // Parent-move quiet history update from static-eval surprise.
     if selective
@@ -1015,7 +1021,13 @@ fn search_node<const CFG: u32, const PV: bool>(
         let eval_delta = -(static_eval + parent_eval);
         if eval_delta != 0 {
             let bonus = (eval_delta * 6).clamp(-150, 300);
-            h.quiet_history.update(td.board.prior_threats(), false, !td.board.side_to_move(), prior_move, bonus);
+            h.quiet_history.update(
+                td.board.prior_threats(),
+                parent_creates_threat,
+                !td.board.side_to_move(),
+                prior_move,
+                bonus,
+            );
         }
     }
 
@@ -1028,7 +1040,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let parent_cut_node = if ply_idx > 0 { td.stack[ply_idx - 1].cut_node } else { false };
     let parent_laterality = if ply_idx > 0 { td.stack[ply_idx - 1].laterality } else { 0 };
 
-    // Hindsight depth adjustment from parent LMR reduction (including Box 5 Sacrifice LMR Refund)
+    // Hindsight depth adjustment from parent LMR reduction
     if selective
         && use_hindsight
         && !in_singular
@@ -1038,38 +1050,9 @@ fn search_node<const CFG: u32, const PV: bool>(
         && parent_reduction > 0
     {
         let eval_delta = static_eval + parent_eval;
-        let parent_psqt = td.stack[ply_idx - 1].psqt_eval;
-        if td.nnue.is_some() && psqt_eval == TtDepth::NONE_SCORE && parent_psqt != TtDepth::NONE_SCORE {
-            psqt_eval = td.evaluate_psqt_only();
-            td.stack[ply_idx].psqt_eval = psqt_eval;
-        }
-        let sacrifice_comp_refund = td.nnue.is_some()
-            && eval_delta < 0
-            && psqt_eval != TtDepth::NONE_SCORE
-            && parent_psqt != TtDepth::NONE_SCORE
-            && {
-                let delta_psqt = (-psqt_eval) - parent_psqt;
-                let parent_comp = parent_eval - parent_psqt;
-                let child_comp = (-static_eval) - (-psqt_eval);
-                let delta_comp = child_comp - parent_comp;
-                let comp_min: i32 = param!(HINDSIGHT_SAC_COMP_MIN);
-                let sac_thresh: i32 = param!(EVAL_SACRIFICE_PSQT_THRESHOLD);
-                let immediate_sac = delta_psqt <= sac_thresh && delta_comp >= comp_min;
-                let persistent_sac = ply_idx >= 2
-                    && td.stack[ply_idx - 2].static_eval != TtDepth::NONE_SCORE
-                    && td.stack[ply_idx - 2].psqt_eval != TtDepth::NONE_SCORE
-                    && parent_psqt <= -100
-                    && parent_comp >= comp_min
-                    && child_comp >= comp_min
-                    && (td.stack[ply_idx - 2].static_eval - td.stack[ply_idx - 2].psqt_eval) >= comp_min;
-                immediate_sac || persistent_sac
-            };
-
         let h_ext_min: i32 = param!(HINDSIGHT_EXT_MIN_REDUCTION);
         let h_red_margin: i32 = param!(HINDSIGHT_REDUCTION_MARGIN);
-        if sacrifice_comp_refund && (depth as usize) < MAX_PLY_USIZE - 1 {
-            depth += 1;
-        } else if parent_reduction >= h_ext_min
+        if parent_reduction >= h_ext_min
             && prior_move.is_quiet()
             && eval_delta < 0
             && static_eval < alpha
@@ -1184,6 +1167,7 @@ fn search_node<const CFG: u32, const PV: bool>(
             td.stack[ply_idx].move_count = 0;
             td.stack[ply_idx].stat_score = 0;
             td.stack[ply_idx].reduction = 0;
+            td.stack[ply_idx].creates_threat = false;
             td.stack[ply_idx].laterality = parent_laterality;
 
             td.make_null_move();
@@ -1252,6 +1236,7 @@ fn search_node<const CFG: u32, const PV: bool>(
                 td.stack[ply_idx].move_count = 1;
                 td.stack[ply_idx].stat_score = hist;
                 td.stack[ply_idx].reduction = 0;
+                td.stack[ply_idx].creates_threat = false;
                 td.stack[ply_idx].laterality = parent_laterality;
 
                 td.make_move(mv);
@@ -1363,7 +1348,7 @@ fn search_node<const CFG: u32, const PV: bool>(
     let mut noisy_moves = [Move::NULL; 32];
     let mut noisy_len = 0usize;
     let mut skip_quiets = false;
-    let mut failed_quiet_mask = 0u64;
+
 
     let mut picker = MainMovePicker::new(if selective { tt_move } else { Move::NULL }, false, killers, countermove);
     while let Some(mv) = picker.next(&td.board, td.history.as_deref(), skip_quiets, ply_idx) {
@@ -1372,9 +1357,6 @@ fn search_node<const CFG: u32, const PV: bool>(
         }
         let emitted_stage = picker.emitted_stage();
         move_count += 1;
-        if move_count == 2 && !in_check && td.nnue.is_some() && td.stack[ply_idx].psqt_eval == TtDepth::NONE_SCORE {
-            td.stack[ply_idx].psqt_eval = td.evaluate_psqt_only();
-        }
         if ply == 0 && td.board.is_draw(0) {
             return (draw, Some(mv));
         }
@@ -1471,33 +1453,18 @@ fn search_node<const CFG: u32, const PV: bool>(
             }
         }
 
-        // Main-loop SEE pruning (with Box 5 Idea #27 King-Ring Sacrifice SEE Shield, AsuraBox5Search.lean Theorem 1)
+        // Main-loop SEE pruning
         if selective && use_see && ply > 0 && !in_check && best_score > -MATE_THRESHOLD {
             let cut_shift = usize::from(!PV && cut_node);
             let see_q_coeff: i32 = param!(SEE_QUIET_QUAD_COEFF);
             let see_n_coeff: i32 = param!(SEE_NOISY_DEPTH_COEFF);
-            let mut threshold = if is_quiet {
+            let threshold = if is_quiet {
                 let lmr_plies = lmr_table_term(depth, move_count) / LMR_SCALE;
                 let rank = (depth as i32 + hist / SEE_QUIET_HIST_DIV - lmr_plies).max(1);
                 (see_q_coeff * rank * rank) >> cut_shift
             } else {
                 ((see_n_coeff * depth as i32 - hist / SEE_NOISY_HIST_DIV) >> cut_shift).min(0)
             };
-            if !is_quiet && td.nnue.is_some() {
-                let opp_k = td.board.king_square(!td.board.side_to_move());
-                if crate::lookup::king_attacks(opp_k).contains(mv.to()) {
-                    if td.stack[ply_idx].psqt_eval == TtDepth::NONE_SCORE {
-                        td.stack[ply_idx].psqt_eval = td.evaluate_psqt_only();
-                    }
-                    let psqt_here = td.stack[ply_idx].psqt_eval;
-                    // Theorem 26 (Compensation-Gated King-Ring SEE Shield):
-                    let has_comp = (psqt_here != TtDepth::NONE_SCORE && static_eval - psqt_here >= 0) || hist > 0;
-                    if has_comp {
-                        let shield: i32 = param!(SEE_KING_RING_SAC_SHIELD);
-                        threshold -= shield;
-                    }
-                }
-            }
             if !td.board.see_ge(mv, threshold) {
                 continue;
             }
@@ -1512,7 +1479,8 @@ fn search_node<const CFG: u32, const PV: bool>(
             let se_bm: i32 = param!(SE_BETA_MARGIN);
             let se_dbl: i32 = param!(SE_DOUBLE_GAP);
             let se_trp: i32 = param!(SE_TRIPLE_GAP);
-            let s_beta = (e.score.min(beta + se_bm) - depth as i32 * SE_DEPTH_MARGIN).max(-MATE_THRESHOLD + 1);
+            let score_cap = if td.nnue.is_some() { e.score } else { e.score.min(beta + se_bm) };
+            let s_beta = (score_cap - depth as i32 * SE_DEPTH_MARGIN).max(-MATE_THRESHOLD + 1);
             let s_depth = ((9 * (depth as i32 - 1)) / 16).max(1) as u8;
 
             td.stack[ply_idx].excluded_move = mv;
@@ -1540,12 +1508,10 @@ fn search_node<const CFG: u32, const PV: bool>(
                 }
             } else if verify >= beta && !is_decisive(verify) {
                 return (verify, None);
-            } else if PV {
-                if e.score >= beta {
-                    extension = -1;
-                }
-            } else {
-                extension = if cut_node { -2 } else { -1 };
+            } else if e.score >= beta {
+                extension = if PV { -1 } else if cut_node { -2 } else { -1 };
+            } else if !PV && cut_node {
+                extension = -2;
             }
         } else if selective
             && use_ldse
@@ -1566,6 +1532,7 @@ fn search_node<const CFG: u32, const PV: bool>(
         td.stack[ply_idx].mv = mv;
         td.stack[ply_idx].move_count = move_count as u16;
         td.stack[ply_idx].stat_score = hist;
+        td.stack[ply_idx].creates_threat = creates_threat;
         td.stack[ply_idx].laterality =
             parent_laterality + if move_count > 1 { (move_count.ilog2() as i32 - 1).max(0) } else { 0 };
         td.stack[ply_idx].cut_node = false;
@@ -1608,23 +1575,19 @@ fn search_node<const CFG: u32, const PV: bool>(
                     param!(LMR_GOOD_NOISY_BASE)
                 };
 
-                let mv_mask = (1u64 << (mv.from() as u8)) | (1u64 << (mv.to() as u8));
-                let causal_commutes =
-                    td.nnue.is_some() && is_quiet && move_count > 3 && failed_quiet_mask != 0 && (failed_quiet_mask & mv_mask) == 0;
-
-                let causal_pen: i32 = param!(LMR_CAUSAL_RED_PENALTY);
                 let lmr_prio_b: i32 = param!(LMR_PRIORITY_QUIET_BONUS);
                 let lmr_chk_b: i32 = param!(LMR_CHECK_BONUS);
                 let lmr_thr_b: i32 = param!(LMR_THREAT_BONUS);
                 let lmr_ex_p: i32 = param!(LMR_EXACT_BOUND_PENALTY);
                 let lmr_cut_p: i32 = param!(LMR_CHILD_CUTOFF_PENALTY);
+                let pv_relief = if PV && td.nnue.is_some() { 1_000 } else { 0 };
                 let raw_reduction = base_term + node_bias
+                    - pv_relief
                     - hist / LMR_HIST_DIV
                     - lmr_prio_b * (emitted_stage == MainStage::PriorityQuiet) as i32
                     - lmr_chk_b * gives_check as i32
                     - lmr_thr_b * creates_threat as i32
                     + lmr_ex_p * (bound == Bound::Exact) as i32
-                    + causal_pen * causal_commutes as i32
                     + lmr_cut_p
                         * (ply_idx + 1 < td.stack.len() && td.stack[ply_idx + 1].cutoff_count > 2) as i32;
 
@@ -1704,6 +1667,7 @@ fn search_node<const CFG: u32, const PV: bool>(
         let lq_dm: i32 = param!(LATE_QUIET_DEPTH_MARGIN);
         if selective
             && use_lqc
+            && (!PV || td.nnue.is_none())
             && ply > 0
             && !in_check
             && !gives_check
@@ -1752,10 +1716,6 @@ fn search_node<const CFG: u32, const PV: bool>(
             } else if move_count == 1 && PV {
                 td.pv_table.update(ply_idx, mv);
             }
-        }
-
-        if mv.is_quiet() && score <= alpha {
-            failed_quiet_mask |= (1u64 << (mv.from() as u8)) | (1u64 << (mv.to() as u8));
         }
 
         if mv.is_quiet() && quiet_len < 32 {
@@ -1809,7 +1769,13 @@ fn search_node<const CFG: u32, const PV: bool>(
                     + 140 * (!in_check && best_score <= raw_eval - 50) as i32
                     + 300 * (parent_eval != TtDepth::NONE_SCORE && best_score <= -parent_eval - 70) as i32;
                 let scaled_bonus = factor * (180 * d - 40).min(2_400) / 128;
-                h.quiet_history.update(prior_threats, false, !td.board.side_to_move(), prior_move, scaled_bonus);
+                h.quiet_history.update(
+                    prior_threats,
+                    parent_creates_threat,
+                    !td.board.side_to_move(),
+                    prior_move,
+                    scaled_bonus,
+                );
                 if ply >= 2 {
                     let bonus = (150 * d - 45).min(1_350);
                     h.continuation_history.update(
@@ -1834,7 +1800,8 @@ fn search_node<const CFG: u32, const PV: bool>(
         }
     }
 
-    tt_pv |= ply > 0 && bound == Bound::Upper && move_count > 2;
+    let parent_tt_pv = if ply_idx > 0 { td.stack[ply_idx - 1].tt_pv } else { true };
+    tt_pv |= ply > 0 && bound == Bound::Upper && move_count > 2 && (td.nnue.is_none() || parent_tt_pv);
 
     if selective
         && !in_singular

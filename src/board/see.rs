@@ -4,6 +4,43 @@ use crate::{
 };
 
 impl super::Board {
+    /// Estimate the net material a side can win by capturing a piece already on `target`.
+    /// This is an exchange estimate, not a legal-move generator or tactical search.
+    pub(crate) fn see_capture_gain(&self, target: Square, attacker: Color) -> i32 {
+        let victim = self.type_on(target);
+        if matches!(victim, PieceType::King | PieceType::None) {
+            return 0;
+        }
+        let mut occupied = self.occupancies();
+        let Some((from, first_piece)) = self.exchange_attacker(target, occupied, attacker) else {
+            return 0;
+        };
+        let first_promotion = first_piece == PieceType::Pawn && target.rank() == PROMO_RANK[attacker];
+        let mut current_victim = if first_promotion { PieceType::Queen } else { first_piece };
+        let mut gains = [0; Square::NUM];
+        gains[0] = material_value(victim)
+            + if first_promotion { material_value(PieceType::Queen) - material_value(PieceType::Pawn) } else { 0 };
+        occupied.clear(from);
+        let mut side = !attacker;
+        let mut depth = 0;
+        while current_victim != PieceType::King {
+            let Some((from, piece)) = self.exchange_attacker(target, occupied, side) else { break };
+            depth += 1;
+            let promotion = piece == PieceType::Pawn && target.rank() == PROMO_RANK[side];
+            let placed = if promotion { PieceType::Queen } else { piece };
+            let promotion_gain = material_value(placed) - material_value(piece);
+            gains[depth] = material_value(current_victim) + promotion_gain - gains[depth - 1];
+            occupied.clear(from);
+            current_victim = placed;
+            side = !side;
+        }
+        while depth > 0 {
+            gains[depth - 1] = -(-gains[depth - 1]).max(gains[depth]);
+            depth -= 1;
+        }
+        gains[0].max(0)
+    }
+
     /// Estimate the material gain of a legal move by alternating least-valuable
     /// legal recaptures on its destination. Either side may decline an exchange.
     /// Pins and king safety are rechecked as occupancy changes; later pawn

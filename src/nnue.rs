@@ -1,4 +1,6 @@
 pub mod accumulator;
+pub mod synthesis;
+pub mod wsp;
 
 pub mod forward {
     pub mod scalar;
@@ -23,9 +25,9 @@ pub use accumulator::{
     diff_pawn_rows_one, diff_threat_rows_both, diff_threat_rows_one, evaluate_pawn_king_subnet, heavy_regime,
     orient_flip, passed_pawn_row_index, pawn_pair_row_index, psq_row_index, threat_row_index,
 };
-pub use forward::forward_scalar;
 #[cfg(target_feature = "avx2")]
 pub use forward::forward_avx2;
+pub use forward::forward_scalar;
 
 use std::sync::{
     Arc, OnceLock, RwLock,
@@ -34,7 +36,6 @@ use std::sync::{
 
 use crate::{
     board::Board,
-    param,
     types::{Color, PieceType},
 };
 
@@ -108,7 +109,11 @@ pub struct FeatureRow {
 
 impl Default for FeatureRow {
     fn default() -> Self {
-        Self { weights: [0; L1_SIZE], psqt: [0; PSQT_BUCKETS], _pad: [0; 32] }
+        Self {
+            weights: [0; L1_SIZE],
+            psqt: [0; PSQT_BUCKETS],
+            _pad: [0; 32],
+        }
     }
 }
 
@@ -221,8 +226,12 @@ pub struct ModelParameters {
     pub pk_gamma_biases: [i32; L2_SIZE],
     pub pk_beta_weights: [[i8; PK_HIDDEN]; L2_SIZE],
     pub pk_gamma_weights: [[i8; PK_HIDDEN]; L2_SIZE],
-    pub stacks: [LayerStack; HYBRID_STACKS],
+    pub stacks: Box<[LayerStack]>,
     pub phase_table: [i32; 16],
+    /// Explicitly loaded experimental branch; part of the model Arc identity.
+    pub synthesis: Option<synthesis::SynthesisParameters>,
+    /// Complete from-scratch WSP evaluator, mutually exclusive with the ATN1 path.
+    pub wsp: Option<wsp::WspNetwork>,
 }
 
 impl ModelParameters {
@@ -237,8 +246,10 @@ impl ModelParameters {
             pk_gamma_biases: [0; L2_SIZE],
             pk_beta_weights: [[0; PK_HIDDEN]; L2_SIZE],
             pk_gamma_weights: [[0; PK_HIDDEN]; L2_SIZE],
-            stacks: [LayerStack::default(); HYBRID_STACKS],
+            stacks: vec![LayerStack::default(); HYBRID_STACKS].into_boxed_slice(),
             phase_table: [1024; 16],
+            synthesis: None,
+            wsp: None,
         }
     }
 
@@ -313,7 +324,17 @@ impl ModelParameters {
         use std::io::{BufWriter, Write};
         let file = std::fs::File::create(path)?;
         let mut w = BufWriter::new(file);
+        if let Some(network) = &self.wsp {
+            network.write_checkpoint(&mut w)?;
+        } else if self.synthesis.is_some() {
+            synthesis::write_checkpoint(self, &mut w)?;
+        } else {
+            self.write_atn1(&mut w)?;
+        }
+        w.flush()
+    }
 
+    fn write_atn1(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         w.write_all(Self::MAGIC)?;
         for &b in self.ft_biases.iter() {
             w.write_all(&b.to_le_bytes())?;
@@ -377,10 +398,26 @@ impl ModelParameters {
     }
 
     pub fn load_from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        use std::io::{BufReader, Error, ErrorKind, Read};
+        use std::io::{BufReader, Read};
         let file = std::fs::File::open(path)?;
         let mut r = BufReader::new(file);
+        let mut magic = [0u8; 16];
+        r.read_exact(&mut magic)?;
+        if &magic == wsp::MAGIC {
+            let network = wsp::WspNetwork::read_checkpoint(&magic, &mut r)?;
+            let mut params = Self::new_zeroed();
+            params.wsp = Some(network);
+            return Ok(params);
+        }
+        if &magic == synthesis::MAGIC {
+            return synthesis::read_checkpoint(&mut r);
+        }
+        // Replay the inspected prefix without requiring a seekable ATN-1 input.
+        Self::read_atn1(&mut magic.as_slice().chain(r), false)
+    }
 
+    fn read_atn1(r: &mut impl std::io::Read, canonical: bool) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind};
         let mut magic = [0u8; 16];
         r.read_exact(&mut magic)?;
         if &magic != Self::MAGIC {
@@ -404,6 +441,9 @@ impl ModelParameters {
                 *psq = i32::from_le_bytes(buf4);
             }
             r.read_exact(&mut pad32)?;
+            if canonical && pad32 != [0; 32] {
+                return Err(Error::new(ErrorKind::InvalidData, "Noncanonical ATN-1 padding in SYN-1"));
+            }
         }
         for b in p.pk_biases_1.iter_mut() {
             r.read_exact(&mut buf2)?;
@@ -505,55 +545,13 @@ pub fn check_invasion_percolation(board: &Board, att_side: Color) -> bool {
 pub fn scale_atn1_evaluation(
     board: &Board, psqt: i32, positional: i32, draw_logit: i32, optimism: i32, params: &ModelParameters,
 ) -> i32 {
-    let sac_thresh: i32 = param!(EVAL_SACRIFICE_PSQT_THRESHOLD);
-    let sac_div: i32 = param!(EVAL_SACRIFICE_BOOST_DIV).max(4);
-    let fort_min: i32 = param!(EVAL_FORTRESS_DISAGREE_MIN).max(20);
+    let positional = positional + params.synthesis.as_ref().map_or(0, |syn| syn.positional_delta(board));
+    let mut v = psqt + positional;
 
-    let v_total = psqt + positional;
-    let mut v = if psqt <= sac_thresh && v_total > 0 {
-        v_total + positional / sac_div
-    } else if psqt >= -sac_thresh && v_total < 0 {
-        v_total + positional / sac_div
-    } else if psqt.abs() >= 200 && (psqt > 0) != (positional > 0) && positional.abs() >= fort_min {
-        let damp = positional.abs().min(256);
-        v_total - (v_total * damp) / 2048
-    } else {
-        v_total
-    };
-
-    let sharpness = (128 - draw_logit.clamp(-64, 96)) as i64;
-    let comp_boost = (positional.abs().min(400) as i64) + 256;
-    v += ((optimism as i64) * sharpness * comp_boost / (128 * 384)) as i32;
-
-    let stm = board.side_to_move();
-    let q_us = board.colored_pieces(stm, PieceType::Queen).popcount();
-    let q_th = board.colored_pieces(!stm, PieceType::Queen).popcount();
-    let r_us = board.colored_pieces(stm, PieceType::Rook).popcount();
-    let r_th = board.colored_pieces(!stm, PieceType::Rook).popcount();
-    let b_us = board.colored_pieces(stm, PieceType::Bishop).popcount();
-    let b_th = board.colored_pieces(!stm, PieceType::Bishop).popcount();
-    let n_us = board.colored_pieces(stm, PieceType::Knight).popcount();
-    let n_th = board.colored_pieces(!stm, PieceType::Knight).popcount();
-
-    let imbalance_idx = ((q_us > q_th) as usize)
-        | (((r_us > r_th) as usize) << 1)
-        | (((b_us > b_th) as usize) << 2)
-        | (((n_us > n_th) as usize) << 3);
-    v = ((v as i64) * (params.phase_table[imbalance_idx] as i64) / 1024) as i32;
-
-    // Theorem 29: Only apply invasion percolation fortress damping on locked minor/pawn endgames
-    // (`q_us + q_th + r_us + r_th == 0` with zero pawn levers), preventing the losing side from
-    // trading Queens into a lost endgame just to collect an artificial `3/4` damping cliff.
-    if (q_us + q_th + r_us + r_th) == 0 && v.abs() > 80 {
-        let wp = board.colored_pieces(Color::White, PieceType::Pawn).0;
-        let bp = board.colored_pieces(Color::Black, PieceType::Pawn).0;
-        let w_levers = ((wp << 7) & 0x7f7f_7f7f_7f7f_7f7f) | ((wp << 9) & 0xfefe_fefe_fefe_fefe);
-        if (w_levers & bp) == 0 {
-            let winning_side = if v > 0 { stm } else { !stm };
-            if !check_invasion_percolation(board, winning_side) {
-                v = (v * 3) / 4;
-            }
-        }
+    if optimism != 0 {
+        let sharpness = (128 - draw_logit.clamp(-64, 96)) as i64;
+        let comp_boost = (positional.abs().min(400) as i64) + 256;
+        v += ((optimism as i64) * sharpness * comp_boost / (128 * 384)) as i32;
     }
 
     let r50 = board.fiftymove_clock().min(100) as i32;
@@ -607,7 +605,11 @@ impl NetworkState {
         }
         Self {
             acc: [AccumulatorSide::new(&params), AccumulatorSide::new(&params)],
-            pk_cache: Box::new([PkCacheEntry::default(); PK_CACHE_SIZE]),
+            // Construct the large cache on the heap, including on small worker/test stacks.
+            pk_cache: vec![PkCacheEntry::default(); PK_CACHE_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("fixed PK cache length")),
             params,
             cached_board: None,
             history,
@@ -654,6 +656,9 @@ impl NetworkState {
     }
 
     pub fn evaluate_full_refresh_scalar(&mut self, board: &Board, optimism: i32) -> i32 {
+        if let Some(network) = &self.params.wsp {
+            return network.evaluate(board, optimism);
+        }
         let mut rows = Vec::with_capacity(128);
         for pov in [Color::White, Color::Black] {
             let mut side_acc = AccumulatorSide::new(&self.params);
@@ -664,21 +669,29 @@ impl NetworkState {
             self.acc[pov as usize] = side_acc;
         }
         let stm = board.side_to_move() as usize;
-        let (pk_beta, pk_gamma) = evaluate_pawn_king_subnet(board, &self.params, &mut self.pk_cache, &mut self.last_pk_idx);
+        let (pk_beta, pk_gamma) =
+            evaluate_pawn_king_subnet(board, &self.params, &mut self.pk_cache, &mut self.last_pk_idx);
         let (psqt_b, stack_b) = hybrid_stack_index(board);
-        let (psqt, pos, draw_l) = forward_scalar(
-            &self.acc[stm],
-            &self.acc[stm ^ 1],
-            pk_beta,
-            pk_gamma,
-            psqt_b,
-            stack_b,
-            &self.params,
-        );
+        let (psqt, pos, draw_l) =
+            forward_scalar(&self.acc[stm], &self.acc[stm ^ 1], pk_beta, pk_gamma, psqt_b, stack_b, &self.params);
         scale_atn1_evaluation(board, psqt, pos, draw_l, optimism, &self.params)
     }
 
+    /// Mechanism analysis of this position, using the ordinary evaluation path.
+    /// Diagnostics extract the branch even for a zero head; ATN-1 reports zeros.
+    pub fn evaluate_with_synthesis_trace(
+        &mut self, board: &Board, optimism: i32,
+    ) -> synthesis::PositionEvaluationTrace {
+        let eval = self.evaluate_incremental(board, optimism);
+        let mut trace = self.params.synthesis.as_ref().map_or_else(Default::default, |syn| syn.trace(board));
+        trace.eval = eval;
+        trace
+    }
+
     pub fn evaluate_incremental(&mut self, board: &Board, optimism: i32) -> i32 {
+        if let Some(network) = &self.params.wsp {
+            return network.evaluate(board, optimism);
+        }
         let ev = self.evaluate_with_components(board, optimism).0;
         self.acc = self.history[self.last_slot].acc;
         ev
@@ -861,12 +874,26 @@ impl NetworkState {
             for sq in changed_sq & prev_occ {
                 let old_pc = prev_snap.piece_on(sq);
                 subs.push(psq_row_index(old_pc.color(), old_pc.piece_type(), sq, curr_ksq_w, curr_reg_w, Color::White));
-                prev_rows.push(psq_row_index(old_pc.color(), old_pc.piece_type(), sq, curr_ksq_b, curr_reg_b, Color::Black));
+                prev_rows.push(psq_row_index(
+                    old_pc.color(),
+                    old_pc.piece_type(),
+                    sq,
+                    curr_ksq_b,
+                    curr_reg_b,
+                    Color::Black,
+                ));
             }
             for sq in changed_sq & b_occ {
                 let new_pc = board.piece_on(sq);
                 adds.push(psq_row_index(new_pc.color(), new_pc.piece_type(), sq, curr_ksq_w, curr_reg_w, Color::White));
-                curr_rows.push(psq_row_index(new_pc.color(), new_pc.piece_type(), sq, curr_ksq_b, curr_reg_b, Color::Black));
+                curr_rows.push(psq_row_index(
+                    new_pc.color(),
+                    new_pc.piece_type(),
+                    sq,
+                    curr_ksq_b,
+                    curr_reg_b,
+                    Color::Black,
+                ));
             }
 
             #[cfg(target_feature = "avx2")]
@@ -995,7 +1022,8 @@ impl NetworkState {
         self.history[slot].valid = true;
         self.bucket_last_slot[0][b_id_w] = slot as u8;
         self.bucket_last_slot[1][b_id_b] = slot as u8;
-        if shared_idx == usize::MAX || shared_diff > 6 || !self.history[b_slot_w].valid || !self.history[b_slot_b].valid {
+        if shared_idx == usize::MAX || shared_diff > 6 || !self.history[b_slot_w].valid || !self.history[b_slot_b].valid
+        {
             self.history[b_slot_w] = self.history[slot];
             self.history[b_slot_b] = self.history[slot];
         }
@@ -1011,6 +1039,9 @@ impl NetworkState {
     }
 
     pub fn evaluate_psqt_only(&mut self, board: &Board) -> i32 {
+        if let Some(network) = &self.params.wsp {
+            return network.piece_square_component(board);
+        }
         let slot = self.update_accumulator(board);
         let stm = board.side_to_move() as usize;
         let (psqt_b, _) = hybrid_stack_index(board);
@@ -1020,17 +1051,20 @@ impl NetworkState {
     }
 
     pub fn evaluate_with_components(&mut self, board: &Board, optimism: i32) -> (i32, i32, i32) {
+        if let Some(network) = &self.params.wsp {
+            return (network.evaluate(board, optimism), network.piece_square_component(board), 0);
+        }
         let slot = self.update_accumulator(board);
 
         let stm = board.side_to_move() as usize;
-        let (pk_beta, pk_gamma) = evaluate_pawn_king_subnet(board, &self.params, &mut self.pk_cache, &mut self.last_pk_idx);
+        let (pk_beta, pk_gamma) =
+            evaluate_pawn_king_subnet(board, &self.params, &mut self.pk_cache, &mut self.last_pk_idx);
         let (psqt_b, stack_b) = hybrid_stack_index(board);
         let acc = &self.history[slot].acc;
 
         #[cfg(target_feature = "avx2")]
-        let (psqt, pos, draw_l) = unsafe {
-            forward_avx2(&acc[stm], &acc[stm ^ 1], pk_beta, pk_gamma, psqt_b, stack_b, &self.params)
-        };
+        let (psqt, pos, draw_l) =
+            unsafe { forward_avx2(&acc[stm], &acc[stm ^ 1], pk_beta, pk_gamma, psqt_b, stack_b, &self.params) };
         #[cfg(not(target_feature = "avx2"))]
         let (psqt, pos, draw_l) =
             forward_scalar(&acc[stm], &acc[stm ^ 1], pk_beta, pk_gamma, psqt_b, stack_b, &self.params);

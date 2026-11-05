@@ -240,13 +240,18 @@ impl TimeManager {
 
     #[inline]
     pub fn check_hard_limit(&self, completed_depth: u8, nodes: u64) -> bool {
+        self.check_hard_limit_with_poll(completed_depth, nodes, (nodes & TIME_CHECK_NODE_MASK) == 0)
+    }
+
+    #[inline]
+    pub fn check_hard_limit_with_poll(&self, completed_depth: u8, nodes: u64, poll_clock: bool) -> bool {
         if !self.has_hard_budget || completed_depth == 0 {
             return false;
         }
         if nodes >= self.hard_nodes {
             return true;
         }
-        if self.hard_bound_us != u64::MAX && (nodes & TIME_CHECK_NODE_MASK) == 0 {
+        if self.hard_bound_us != u64::MAX && poll_clock {
             return self.elapsed_us() >= self.hard_bound_us;
         }
         false

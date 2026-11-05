@@ -14,6 +14,8 @@ pub struct StackEntry {
     pub cutoff_count: i32,
     pub move_count: u16,
     pub cut_node: bool,
+    pub creates_threat: bool,
+    pub tt_pv: bool,
 }
 
 impl Default for StackEntry {
@@ -29,6 +31,8 @@ impl Default for StackEntry {
             cutoff_count: 0,
             move_count: 0,
             cut_node: false,
+            creates_threat: false,
+            tt_pv: false,
         }
     }
 }

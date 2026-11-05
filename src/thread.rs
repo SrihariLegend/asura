@@ -524,12 +524,13 @@ impl<'a> ThreadData<'a> {
             return true;
         }
         if self.id == 0 {
-            let check_nodes = if self.thread_count > 1 && (self.nodes & TIME_CHECK_NODE_MASK) == 0 {
+            let poll_clock = (self.nodes & TIME_CHECK_NODE_MASK) == 0;
+            let check_nodes = if self.thread_count > 1 && poll_clock {
                 self.total_nodes()
             } else {
                 self.nodes
             };
-            if self.time_manager.check_hard_limit(self.completed_depth, check_nodes) {
+            if self.time_manager.check_hard_limit_with_poll(self.completed_depth, check_nodes, poll_clock) {
                 self.stopped = true;
                 if let Some(shared) = self.shared {
                     shared.status.set(Status::STOPPED);

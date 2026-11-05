@@ -342,7 +342,6 @@ impl MainMovePicker {
             return;
         };
         let ctx = self.quiet_ctx.get_or_insert_with(|| QuietScoringContext::new(board));
-        ctx.ensure_priors(board);
         for (index, &mv) in self.moves.iter().enumerate() {
             if self.scores[index] == i32::MIN {
                 continue;
@@ -372,11 +371,6 @@ pub(crate) struct QuietScoringContext {
     threatened: [Bitboard; 6],
     offense: [Bitboard; 6],
     wall_pawns: Bitboard,
-    greedoid_unblock: Bitboard,
-    physarum_artery: [Bitboard; 6],
-    outpost_holes: Bitboard,
-    petri_overload_att: [Bitboard; 6],
-    priors_ready: bool,
 }
 
 impl QuietScoringContext {
@@ -428,117 +422,7 @@ impl QuietScoringContext {
             threatened,
             offense,
             wall_pawns,
-            greedoid_unblock: Bitboard(0),
-            physarum_artery: [Bitboard(0); 6],
-            outpost_holes: Bitboard(0),
-            petri_overload_att: [Bitboard(0); 6],
-            priors_ready: false,
         }
-    }
-
-    pub(crate) fn ensure_priors(&mut self, board: &Board) {
-        if self.priors_ready {
-            return;
-        }
-        self.priors_ready = true;
-        if !crate::nnue::is_nnue_active() {
-            return;
-        }
-        use crate::lookup::{attacks, between};
-        let threats = self.threats;
-        let side = board.side_to_move();
-        let occupancies = board.occupancies();
-        let pawn_threats = self.threatened[1];
-        let minor_threats = self.threatened[3];
-        let rook_threats = self.threatened[4];
-
-        // Idea #29a: Greedoid 2-Step Prerequisite Ray Unblock (`AsuraBox5Search.lean` Theorem 3 + Theorem 39 Ray Reversal)
-        use crate::lookup::{bishop_attacks, rook_attacks};
-        let opp_king = board.king_square(!side);
-        let opp_royals = opp_king.to_bb() | board.colored_pieces(!side, PieceType::Queen);
-        let own_b_q = board.colored_pieces(side, PieceType::Bishop) | board.colored_pieces(side, PieceType::Queen);
-        let own_r_q = board.colored_pieces(side, PieceType::Rook) | board.colored_pieces(side, PieceType::Queen);
-        let own_colors = board.colors(side);
-        let mut greedoid_unblock = Bitboard(0);
-        for tgt in opp_royals {
-            let aligned_sliders = (bishop_attacks(tgt, Bitboard(0)) & own_b_q)
-                | (rook_attacks(tgt, Bitboard(0)) & own_r_q);
-            for s_sl in aligned_sliders {
-                let seg = between(s_sl, tgt) & occupancies;
-                if seg.popcount() == 1 && !(seg & own_colors).is_empty() {
-                    greedoid_unblock |= seg;
-                }
-            }
-        }
-
-        // Idea #29b: Physarum King-Ring Artery (`to` squares feeding an active King-ring attack)
-        let opp_kring = king_attacks(opp_king);
-        let mut physarum_artery = [Bitboard(0); 6];
-        if !(opp_kring & threats).is_empty() && occupancies.popcount() < 32 {
-            let b_kr = bishop_attacks_setwise(opp_kring, occupancies);
-            let r_kr = rook_attacks_setwise(opp_kring, occupancies);
-            physarum_artery[PieceType::Knight as usize] = knight_attacks_setwise(opp_kring) & !pawn_threats;
-            physarum_artery[PieceType::Bishop as usize] = b_kr & !pawn_threats;
-            physarum_artery[PieceType::Rook as usize] = r_kr & !minor_threats;
-            physarum_artery[PieceType::Queen as usize] = (b_kr | r_kr) & !rook_threats;
-        }
-
-        // Idea #29c: Morphological Black Top-Hat Outpost Holes defended by friendly pawns
-        let opp_pawns = board.colored_pieces(!side, PieceType::Pawn).0;
-        let own_pawns = board.colored_pieces(side, PieceType::Pawn);
-        let own_pawn_att = pawn_attacks_setwise(own_pawns, side);
-        let dilate = |x: u64| -> u64 {
-            let l = (x >> 1) & 0x7f7f_7f7f_7f7f_7f7f;
-            let r = (x << 1) & 0xfefe_fefe_fefe_fefe;
-            let h = x | l | r;
-            h | (h << 8) | (h >> 8)
-        };
-        let d1 = dilate(opp_pawns);
-        let morph_holes = Bitboard((!dilate(!d1)) & !opp_pawns);
-        let outpost_ranks = if side as usize == 0 {
-            Bitboard(0x0000_FFFF_FF00_0000)
-        } else {
-            Bitboard(0x0000_00FF_FFFF_0000)
-        };
-        let outpost_holes = morph_holes & outpost_ranks & own_pawn_att & !pawn_threats;
-
-        // Idea #30: Petri-Net Deadlock Overload Target Bonus
-        let mut petri_overload_att = [Bitboard(0); 6];
-        let attacked_enemies = board.colors(!side) & threats;
-        if attacked_enemies.popcount() >= 2 {
-            let enemy_defenders =
-                board.colors(!side) & !board.pieces(PieceType::Pawn) & !board.pieces(PieceType::King);
-            let mut overloaded_targets = Bitboard(0);
-            for def_sq in enemy_defenders {
-                let def_pc = board.piece_on(def_sq);
-                let guarded = attacks(def_pc, def_sq, occupancies) & attacked_enemies;
-                if guarded.popcount() >= 2 {
-                    let s1 = crate::types::Square::new(guarded.0.trailing_zeros() as u8);
-                    let s2 = crate::types::Square::new((guarded.0 & (guarded.0 - 1)).trailing_zeros() as u8);
-                    if !attacks(def_pc, s1, occupancies).contains(s2) {
-                        overloaded_targets |= guarded | def_sq.to_bb();
-                    }
-                }
-            }
-            if !overloaded_targets.is_empty() {
-                use crate::lookup::{bishop_attacks, rook_attacks};
-                let mut b_ov = Bitboard(0);
-                let mut r_ov = Bitboard(0);
-                for sq in overloaded_targets {
-                    b_ov |= bishop_attacks(sq, occupancies);
-                    r_ov |= rook_attacks(sq, occupancies);
-                }
-                petri_overload_att[PieceType::Knight as usize] =
-                    knight_attacks_setwise(overloaded_targets) & !pawn_threats;
-                petri_overload_att[PieceType::Bishop as usize] = b_ov & !pawn_threats;
-                petri_overload_att[PieceType::Rook as usize] = r_ov & !minor_threats;
-            }
-        }
-
-        self.greedoid_unblock = greedoid_unblock;
-        self.physarum_artery = physarum_artery;
-        self.outpost_holes = outpost_holes;
-        self.petri_overload_att = petri_overload_att;
     }
 
     pub(crate) fn creates_threat(&self, pt: PieceType, mv: Move) -> bool {
@@ -571,29 +455,12 @@ impl QuietScoringContext {
             + c4_w * history.conthist(ply, 4, piece, mv.to()) / 1_000
             + c6_w * history.conthist(ply, 6, piece, mv.to()) / 1_000;
 
-        // Theorem 25 (Bayesian Prior Shrinkage): only apply static geometric priors when empirical history is non-negative (`base_hist >= 0`).
-        let nnue_on = crate::nnue::is_nnue_active();
-        let is_minor = matches!(pt, PieceType::Knight | PieceType::Bishop);
-        let tactical_bonus = if nnue_on && base_hist >= 0 {
-            let w_greed: i32 = param!(QUIET_GREEDOID_UNBLOCK_BONUS);
-            let w_phys: i32 = param!(QUIET_PHYSARUM_ARTERY_BONUS);
-            let w_outp: i32 = param!(QUIET_OUTPOST_HOLE_BONUS);
-            let w_petri: i32 = param!(QUIET_PETRI_OVERLOAD_BONUS);
-            w_greed * self.greedoid_unblock.contains(mv.from()) as i32
-                + w_phys * ((pt as usize) < 6 && self.physarum_artery[pt].contains(mv.to())) as i32
-                + w_outp * (is_minor && self.outpost_holes.contains(mv.to())) as i32
-                + w_petri * ((pt as usize) < 6 && self.petri_overload_att[pt].contains(mv.to())) as i32
-        } else {
-            0
-        };
-
         base_hist
             + ESCAPE[pt] * self.threatened[pt].contains(mv.from()) as i32
             + QUIET_CHECK_SCORE_BONUS * board.checking_squares(pt).contains(mv.to()) as i32
             - dest_pen * self.threatened[pt].contains(mv.to()) as i32
             + thr_bon * creates_threat as i32
             - wall_pen * self.wall_pawns.contains(mv.from()) as i32
-            + tactical_bonus
     }
 }
 

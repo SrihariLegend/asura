@@ -180,4 +180,19 @@ fn correction_history_updates_structural_and_continuation_tables_and_converges()
 
     tables.clear();
     assert_eq!(tables.eval_correction(&board, 0), 0);
+
+    // High-bit pawn shelter changes (g2-g3 for White and g7-g6 for Black) must produce distinct shield keys.
+    let castled_base = Board::from_fen("r4rk1/ppp2ppp/8/8/8/8/PPP2PPP/R4RK1 w - - 0 1").unwrap();
+    let castled_g3 = Board::from_fen("r4rk1/ppp2ppp/8/8/8/6P1/PPP2P1P/R4RK1 w - - 0 1").unwrap();
+    let castled_g6 = Board::from_fen("r4rk1/ppp2p1p/6p1/8/8/8/PPP2PPP/R4RK1 w - - 0 1").unwrap();
+    assert_ne!(
+        asura::history::CorrectionHistory::king_shield_key(&castled_base),
+        asura::history::CorrectionHistory::king_shield_key(&castled_g3),
+        "White g2-g3 shelter push must change king_shield_key"
+    );
+    assert_ne!(
+        asura::history::CorrectionHistory::king_shield_key(&castled_base),
+        asura::history::CorrectionHistory::king_shield_key(&castled_g6),
+        "Black g7-g6 shelter push must change king_shield_key"
+    );
 }

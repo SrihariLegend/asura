@@ -235,11 +235,14 @@ impl CorrectionHistory {
         let bp_shield = board.colored_pieces(Color::Black, PieceType::Pawn).0 & shield_mask;
         let corr_phase = ((!board.pieces(PieceType::Queen).is_empty() as u64) << 1)
             | (!board.pieces(PieceType::Rook).is_empty() as u64);
-        let h = wp_shield
+        let mut h = wp_shield
             .wrapping_mul(0x9e37_79b9_7f4a_7c15)
             ^ bp_shield.wrapping_mul(0xbf58_476d_1ce4_e5b9)
             ^ (((wk as u64) | ((bk as u64) << 6) | (corr_phase << 12)).wrapping_mul(0x94d0_49bb_1331_11eb));
-        (h as usize) & Self::MASK
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^= h >> 31;
+        ((h >> 50) as usize) & Self::MASK
     }
 
     pub fn get(&self, board: &Board, cont_hist: &ContinuationHistory, ply: usize) -> i32 {
