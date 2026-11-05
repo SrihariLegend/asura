@@ -2189,14 +2189,18 @@ fn quiescence<const CFG: u32, const PV: bool>(
 
 #[inline]
 fn correct_eval(td: &ThreadData<'_>, use_corrhist: bool, raw_eval: i32, ply: usize) -> i32 {
-    if !use_corrhist {
-        return raw_eval;
-    }
-    let Some(h) = td.history.as_deref() else {
-        return raw_eval;
+    let mut eval = if td.nnue.is_some() {
+        raw_eval * (200 - td.board.fiftymove_clock().min(100) as i32) / 200
+    } else {
+        raw_eval
     };
-    let corr = h.eval_correction(&td.board, ply);
-    if corr == 0 { raw_eval } else { (raw_eval + corr).clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1) }
+    if !use_corrhist {
+        return eval;
+    }
+    if let Some(h) = td.history.as_deref() {
+        eval += h.eval_correction(&td.board, ply);
+    }
+    eval.clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1)
 }
 
 #[allow(clippy::too_many_arguments)]

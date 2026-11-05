@@ -554,9 +554,11 @@ pub fn scale_atn1_evaluation(
         v += ((optimism as i64) * sharpness * comp_boost / (128 * 384)) as i32;
     }
 
-    let r50 = board.fiftymove_clock().min(100) as i32;
-    if r50 > 20 {
-        v = ((v as i64) * ((100 - r50) as i64) / 80) as i32;
+    if params.synthesis.is_some() {
+        let r50 = board.fiftymove_clock().min(100) as i32;
+        if r50 > 20 {
+            v = ((v as i64) * ((100 - r50) as i64) / 80) as i32;
+        }
     }
 
     v.clamp(-30_000, 30_000)

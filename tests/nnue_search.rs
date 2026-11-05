@@ -45,14 +45,14 @@ fn tt_hits_do_not_reuse_rule50_scaled_evals_from_another_clock() {
         stack.fc3_biases[0] = 16384; // 600 cp before rule-50 scaling.
     }
     let params = Arc::new(params);
-    // Include both directions across the damping threshold, within one hash bucket.
-    for (old_clock, clock, cached_eval, expected) in [(24, 31, 570, 517), (23, 16, 577, 600), (16, 23, 600, 577)] {
+    // TT stores undamped raw_eval (600 cp) and correct_eval applies (200 - clock) / 200 for the current clock.
+    for (old_clock, clock, cached_eval, expected) in [(24, 31, 600, 507), (23, 16, 600, 552), (16, 23, 600, 531)] {
         let old = Board::from_fen(&format!("7k/8/8/8/8/8/8/R3K3 w - - {old_clock} 1")).unwrap();
         let board = Board::from_fen(&format!("7k/8/8/8/8/8/8/R3K3 w - - {clock} 1")).unwrap();
         assert_eq!(old.hash(), board.hash());
         let mut net = NetworkState::new(Arc::clone(&params));
         assert_eq!(net.evaluate_incremental(&old, 0), cached_eval);
-        assert_eq!(net.evaluate_incremental(&board, 0), expected);
+        assert_eq!(net.evaluate_incremental(&board, 0), cached_eval);
         let tt = TranspositionTable::new(1);
         tt.write(
             old.hash(),
